@@ -586,26 +586,60 @@ def list_external(root: Path | None) -> dict:
     return result
 
 
+def convert_netflix(
+    files: list[tuple[Path, str]], build: Path, tools: Toolchain, runner: Runner
+) -> tuple[list[tuple[Path, str]], dict[str, str]]:
+    """Netflix Games installs the same game as com.netflix.NGP.Kamo: copy every APK with the Rockstar
+    package name in its manifest. The signer is read from the original files first."""
+    packages = set()
+    for path, name in files:
+        try:
+            packages.add(xrmanifest.read_package_info(read_entry(path, "AndroidManifest.xml")).package)
+        except xrmanifest.ManifestError as error:
+            raise KitError(f"{name} has an unreadable manifest: {error}") from error
+    if packages != {xrmanifest.NETFLIX_PACKAGE}:
+        return files, {}
+    step("converting the Netflix Games package to the Rockstar package name")
+    out = clean_directory(build / "netflix", build)
+    converted, signers = [], {}
+    for path, name in files:
+        signers[name] = apk_signer(runner, tools, path, name)
+        try:
+            manifest = xrmanifest.rename_package(
+                read_entry(path, "AndroidManifest.xml"), xrmanifest.NETFLIX_PACKAGE, PACKAGE_NAME
+            )
+            with zipfile.ZipFile(path) as archive:
+                method = archive.getinfo("AndroidManifest.xml").compress_type
+            apkzip.write_apk(path, out / name, {"AndroidManifest.xml": (manifest, method)})
+        except (OSError, zipfile.BadZipFile, KeyError, apkzip.ApkZipError, xrmanifest.ManifestError) as error:
+            raise KitError(f"cannot convert {name} from the Netflix package: {error}") from error
+        converted.append((out / name, name))
+    return converted, signers
+
+
 def validate_package(
     options: Options, build: Path, tools: Toolchain, runner: Runner, expected: Expected
 ) -> GamePackage:
     kind, files, external = select_inputs(options.game_package, build)
+    files, netflix_signers = convert_netflix(files, build, tools, runner)
+    netflix = bool(netflix_signers)
     apks = [open_apk(path, name) for path, name in files]
     for apk in apks:
         if apk.info.package != PACKAGE_NAME:
-            raise KitError(f"{apk.name} belongs to {apk.info.package}, not {PACKAGE_NAME}")
-        if apk.info.version_code != VERSION_CODE:
+            raise KitError(f"{apk.name} belongs to {apk.info.package}, not {PACKAGE_NAME} or {xrmanifest.NETFLIX_PACKAGE}")
+        # Netflix Games numbers its builds differently; the engine hash below proves the game version.
+        if apk.info.version_code != VERSION_CODE and not netflix:
             raise KitError(
                 f"{apk.name} is version code {apk.info.version_code}; "
                 f"this kit supports {VERSION_NAME} ({VERSION_CODE})"
             )
-        if apk.info.version_name not in (None, VERSION_NAME):
+        if apk.info.version_name not in (None, VERSION_NAME) and not netflix:
             raise KitError(f"{apk.name} is version {apk.info.version_name}; this kit supports {VERSION_NAME}")
     bases = [apk for apk in apks if apk.info.split is None]
     if len(bases) != 1 or bases[0].name != "base.apk":
         raise KitError(f"expected one base APK named base.apk, found {len(bases)} base APKs")
     base = bases[0]
-    if base.info.version_name != VERSION_NAME:
+    if base.info.version_name != VERSION_NAME and not netflix:
         raise KitError(f"base.apk is not version {VERSION_NAME}")
     splits = [apk.info.split for apk in apks if apk.info.split is not None]
     if len(splits) != len(set(splits)):
@@ -654,14 +688,14 @@ def validate_package(
         check_application_class(base, names, base_info.application_class)
 
     values = badging(runner, tools, base.path, "base.apk")
-    if (values.get("name"), values.get("versionCode"), values.get("versionName")) != (
-        PACKAGE_NAME, VERSION_CODE, VERSION_NAME,
-    ) or values.get("split"):
+    if values.get("name") != PACKAGE_NAME or values.get("split") or (
+        (values.get("versionCode"), values.get("versionName")) != (VERSION_CODE, VERSION_NAME) and not netflix
+    ):
         raise KitError("aapt2 reports a different identity for base.apk")
 
     step("checking the APK signatures")
     for apk in apks:
-        apk.signer = apk_signer(runner, tools, apk.path, apk.name)
+        apk.signer = netflix_signers.get(apk.name) or apk_signer(runner, tools, apk.path, apk.name)
         if apk.signer == expected.third_party_signer_sha256:
             raise KitError(THIRD_PARTY_MESSAGE)
     signers = {apk.signer for apk in apks}

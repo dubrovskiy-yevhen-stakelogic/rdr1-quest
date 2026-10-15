@@ -611,7 +611,7 @@ for name, nested in (("obb", package), ("assetpacks", "assetpacks")):
     entries = list(content.iterdir())
     # The exporter pulls a device folder into external/<name>, which can add
     # one level named like the device folder.
-    if len(entries) == 1 and entries[0].is_dir() and entries[0].name == nested:
+    if len(entries) == 1 and entries[0].is_dir() and entries[0].name in (nested, "com.netflix.NGP.Kamo"):
         content = entries[0]
     local_files = sorted(p for p in content.rglob("*") if p.is_file())
     if len(local_files) != len(records):
