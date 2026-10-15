@@ -31,9 +31,6 @@ APPLICATION_CLASS = "org.rdrvr.bootstrap.RdrVrApplication"
 PREFLIGHT_ACTIVITY = "org.rdrvr.bootstrap.PreflightActivity"
 NATIVE_ACTIVITY = "com.rockstargames.rdr.NativeGameActivity"
 NETFLIX_PACKAGE = "com.netflix.NGP.Kamo"
-_COMPONENT_TAGS = ("application", "activity", "activity-alias", "service", "receiver", "provider", "instrumentation")
-_PERMISSION_TAGS = ("permission", "permission-group", "permission-tree", "uses-permission", "uses-permission-sdk-23")
-_PERMISSION_ATTRIBUTES = ("permission", "readPermission", "writePermission")
 LIB_NAME_META = "android.app.lib_name"
 ORIGINAL_LIBRARY = "rdr"
 MOD_LIBRARY = "rdrvr"
@@ -127,50 +124,6 @@ def _string(element: Element, name: str) -> str | None:
     if attr.type != TYPE_STRING:
         raise ManifestError(f"android:{name} on <{element.tag}> is not a literal string")
     return attr.string
-
-
-def rename_package(data: bytes, old: str, new: str) -> bytes:
-    """Give a manifest (base or split) the package name `new`.
-
-    Netflix Games ships the same game under its own package name. Component class names keep pointing at
-    the same classes (relative names are written out in full first); authorities, permissions, task
-    affinities and process names that start with the old package move to the new one.
-    """
-    doc = _document(data)
-    root = _tree(doc)
-
-    def moved(value: str) -> str:
-        return new + value[len(old):] if value == old or value.startswith(old + ".") else value
-
-    def write(element: Element, attribute, value: str) -> None:
-        if value == attribute.string:
-            return
-        index = doc.string(value)
-        raw = NO_INDEX if attribute.raw == NO_INDEX else index
-        struct.pack_into("<I", doc.parts[element.start][1], attribute.offset + 8, raw)
-        struct.pack_into("<I", doc.parts[element.start][1], attribute.offset + 16, index)
-
-    package = [a for a in root.attributes if a.namespace is None and a.name == "package"]
-    if len(package) != 1 or package[0].type != TYPE_STRING or package[0].string != old:
-        raise ManifestError(f"the manifest package is not {old}")
-    write(root, package[0], new)
-    for element in root.walk():
-        for attribute in element.attributes:
-            if attribute.type != TYPE_STRING or attribute.string is None or attribute.namespace != ANDROID_NS:
-                continue
-            name, value = attribute.name, attribute.string
-            if element.tag in _COMPONENT_TAGS and name in ("name", "targetActivity"):
-                write(element, attribute, qualify(value, old))
-            elif element.tag in _PERMISSION_TAGS and name == "name":
-                write(element, attribute, moved(value))
-            elif name == "authorities":
-                write(element, attribute, ";".join(moved(part) for part in value.split(";")))
-            elif name in _PERMISSION_ATTRIBUTES or name in ("taskAffinity", "process"):
-                write(element, attribute, moved(value))
-    result = doc.to_bytes()
-    if read_package_info(result).package != new:
-        raise ManifestError("the renamed manifest lost its identity")
-    return result
 
 
 def read_package_info(data: bytes) -> PackageInfo:

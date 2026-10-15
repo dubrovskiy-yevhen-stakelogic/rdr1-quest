@@ -7,9 +7,8 @@ standalone on Meta Quest 3 and Quest 3S, without a PC or Quest Link.
 
 ## Requirements
 
-- Red Dead Redemption for Android, version `1.58.63226194` (arm64), from
-  Google Play or Netflix Games, exported from an Android phone or tablet with
-  `EXPORT_RDR_APKS.bat`.
+- Red Dead Redemption for Android from Google Play, version `1.58.63226194`
+  (arm64), exported from an Android phone or tablet with `EXPORT_RDR_APKS.bat`.
 - Meta Quest 3 or Quest 3S with Developer Mode enabled and a USB-C data cable.
 - Windows 10/11, Linux x86_64 or macOS, an internet connection for the build
   tools, and about 20 GB of free disk space.

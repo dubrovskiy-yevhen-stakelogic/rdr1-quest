@@ -1013,7 +1013,7 @@ function Get-ExternalPlan {
         # one level named like the device folder.
         $contentRoot = $treeRoot
         $entries = @(Get-ChildItem -LiteralPath $treeRoot -Force)
-        if ($entries.Count -eq 1 -and $entries[0].PSIsContainer -and $entries[0].Name -in @($tree.NestedLeaf, 'com.netflix.NGP.Kamo')) {
+        if ($entries.Count -eq 1 -and $entries[0].PSIsContainer -and $entries[0].Name -eq $tree.NestedLeaf) {
             $contentRoot = $entries[0].FullName
         }
         $localFiles = @(Get-ChildItem -LiteralPath $contentRoot -File -Recurse -Force)

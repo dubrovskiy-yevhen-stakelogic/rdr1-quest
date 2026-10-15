@@ -16,7 +16,7 @@ echo  RED DEAD REDEMPTION - EXPORT YOUR GAME FROM AN ANDROID PHONE
 echo ================================================================
 echo.
 echo Connect the Android phone or tablet where Red Dead Redemption
-echo (Google Play or Netflix version) is installed and has been launched
+echo (Google Play version) is installed and has been launched
 echo once, then approve USB debugging on the phone.
 echo Seeing the phone in Windows File Explorer is not enough by itself.
 echo.

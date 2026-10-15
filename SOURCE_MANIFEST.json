@@ -7,12 +7,12 @@
     "BUILD_AND_INSTALL.bat": "2c61bbf00d16758d79858158917920bf3af3f5a26e5c7a7199abcb44d151d808",
     "BUILD_AND_INSTALL.sh": "3464cd068f2b7aac7fad56aa1550c8e2167cc0866d8d55c00e3c6dc1ccf79100",
     "COLLECT_REPORT.bat": "e1e05f446f47299695b8ed92e9ac439358ce3584b93f7202a8d982bac4cb54bb",
-    "EXPORT_RDR_APKS.bat": "651307e3f5b053a101169d788c412c4c2efc91fde2b43e52fa7895793940a5cb",
+    "EXPORT_RDR_APKS.bat": "92ee2775b8c20a0ae368181254f0102331d71af3f0cb0aa5ae2b3c0b006d8b4f",
     "GPU_BOOST.bat": "0449770a9d4d966313258bdee6a18b25ea421a79e85de4546a734f64e5849115",
     "GPU_BOOST.sh": "fc1907668121b1f62de89ebfe143a359c1022dfaa2a305e26ab963cae08c1e83",
     "LICENSE": "9faa4b5ea48ce2006205406b3b472fdf842a9ed78a441f482759332d09824037",
     "NOTICE.md": "233bb5b161cdec2976b48e0e2d986e83861f3bc2c20530941e80f8c6994e6fb3",
-    "README.md": "f7c1320d275c0bfc1b1ccd3d1c30d8bb1aae87c1dbb84eab96e1f6d7464784f8",
+    "README.md": "9e2f11dd15cd68f6d17f3e2b5214dcb7d89049260bce293898f61ba6ba7beb7a",
     "RESET_VR_SETTINGS.bat": "fa1d57d7b50ccf9b5f641790f129342bdaae43a21b66eb61eadf5e33dae58261",
     "RESET_VR_SETTINGS.sh": "10f357ab02834348b7955d7d48d39f1aba00a4e37158a53384d93955e51f2842",
     "TRANSFER_SAVES.bat": "7625513b869fba459ef0b4dee4b32a4ed6307541d1d88abc85cd9dee7ad386c9",
@@ -631,9 +631,9 @@
     "native/vendor/openxr/include/openxr/openxr_platform_defines.h": "47738e2088a63051ab586fd44da1e0c556aa6f78ccc841bb5eeb29b13e3704c3",
     "tools/apkzip.py": "1bad19f260f7e4ebd8d99970e0a39281f65f3ddd1cd35fdf356fb704b039f862",
     "tools/axml.py": "914b551bf3d89887fffa4e41823fdbe0ea6fc4a34f80cd5d2e9fe24c8ce16034",
-    "tools/build-and-install.ps1": "91b906f7c7c1b80951a3851e1b28a2f391acae0d9d2cc415c28ed7005c0bceae",
-    "tools/build-and-install.sh": "b67468c46556f1da95fa6b26da956601a686847c3a61dd306d630cc847a8d292",
-    "tools/build.py": "9f2e2cedf3df0274e35ff7587e34f4882b8ded696191d528489d089169ae0a62",
+    "tools/build-and-install.ps1": "8c62c69e78b12570df6533214b402375682b2b5e531c56673b4de6d5febf6087",
+    "tools/build-and-install.sh": "c49cb18aecf310551e74e94497405a00405ed6561328c49e3f1a162e0cafe75d",
+    "tools/build.py": "00463a1f6a6b9c7d23b087904b9ef6a394ff49ba1f6a783c75fe695064c58e59",
     "tools/collect-report.ps1": "193bdf2a4bfb2b5c0ca1e4bf3f9682a06501b723e4b8f1e0a6c8a5f903400509",
     "tools/compile_shaders.py": "6e1bf2cfad514335fe7eac8bff28b20f56f58a6af03e9341fdaff88d573de326",
     "tools/dexpatch.py": "265017b03b806b21b65fe6a8c0a6da35df2471825406772e3955b079b8da05cf",
@@ -649,6 +649,6 @@
     "tools/test-apk-tools.py": "f1e98aae3b8817b914094f52e004088fc5387bd9081c126e464965a4cc91bbc9",
     "tools/transfer-saves.ps1": "8e7e71e5ac800b8cb256d36338c34795543b93ad37d86b79a8c15d8c5f68088b",
     "tools/transfer-saves.sh": "fc367e0bd9b4ced16766d830324be5c6fb2f24ddd0d1e23292cde175340032a6",
-    "tools/xrmanifest.py": "b9e50dc377c10e296138b710b13d23501ed4834c065b7479a457f9d84ba56677"
+    "tools/xrmanifest.py": "415766c3bceacef849cc6d6f98f025935988927bb768ca408d61c3673a336806"
   }
 }
