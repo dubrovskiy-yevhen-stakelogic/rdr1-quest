@@ -1139,7 +1139,10 @@ public class NativeGameActivity extends android.app.NativeActivity {
             archive.writestr("classes.dex", dex, zipfile.ZIP_DEFLATED)
             if single:
                 for path, data in {**library_entries, **data_entries}.items():
-                    archive.writestr(path, data, zipfile.ZIP_STORED)
+                    entry = zipfile.ZipInfo(path)
+                    if path == build.ENGINE_ENTRY:
+                        entry.extra = struct.pack("<HHH", 0xD935, 2, 4096)
+                    archive.writestr(entry, data, zipfile.ZIP_STORED)
         target = folder / ("game.apk" if single else "base.apk")
         shutil.move(str(base), str(target))
         signer = self.sign_input(target)
@@ -1149,7 +1152,10 @@ public class NativeGameActivity extends android.app.NativeActivity {
             apk = self.link_manifest(SPLIT_XML.format(split=split), f"{name}-{split}")
             with zipfile.ZipFile(apk, "a") as archive:
                 for path, data in entries.items():
-                    archive.writestr(path, data, zipfile.ZIP_STORED)
+                    entry = zipfile.ZipInfo(path)
+                    if path == build.ENGINE_ENTRY:
+                        entry.extra = struct.pack("<HHH", 0xD935, 2, 4096)
+                    archive.writestr(entry, data, zipfile.ZIP_STORED)
             target = folder / f"split_{split}.apk"
             shutil.move(str(apk), str(target))
             self.sign_input(target)

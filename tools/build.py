@@ -999,7 +999,8 @@ def sign_apk(tools: Toolchain, runner: Runner, keystore: Path, aligned: Path, si
         [tools.java, "-jar", tools.apksigner, "sign", "--ks", keystore, "--ks-key-alias", KEY_ALIAS,
          "--ks-pass", f"pass:{KEY_PASSWORD}", "--key-pass", f"pass:{KEY_PASSWORD}",
          "--min-sdk-version", MIN_SDK, "--v1-signing-enabled", "false", "--v2-signing-enabled", "true",
-         "--v3-signing-enabled", "true", "--v4-signing-enabled", "false", "--out", signed, aligned],
+         "--v3-signing-enabled", "true", "--v4-signing-enabled", "false",
+         "--alignment-preserved", "true", "--out", signed, aligned],
         f"signing {signed.name} failed",
     )
 
