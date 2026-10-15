@@ -224,7 +224,7 @@ download_verified() {
   [ ! -L "$partial" ] || die "$name partial path must not be a symlink: $partial"
   echo "Downloading $name" >&2
   echo "  Source: $url" >&2
-  curl -fL --retry 5 --retry-delay 2 -A "$USER_AGENT" -C - -o "$partial" "$url" >&2 ||
+  curl -fL --retry 30 --retry-all-errors --retry-delay 3 -A "$USER_AGENT" -C - -o "$partial" "$url" >&2 ||
     die "$name download failed. Check the internet connection and run the builder again."
   observed="$(sha256_file "$partial")"
   if [ "$observed" != "$expected" ]; then

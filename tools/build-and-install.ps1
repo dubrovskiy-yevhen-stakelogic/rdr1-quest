@@ -142,112 +142,137 @@ function Invoke-DownloadWithProgress {
         [Parameter(Mandatory = $true)][string]$Uri,
         [Parameter(Mandatory = $true)][string]$OutFile,
         [Parameter(Mandatory = $true)][string]$DisplayName,
-        [ValidateRange(15, 600)][int]$StallTimeoutSeconds = 90
+        [ValidateRange(15, 600)][int]$StallTimeoutSeconds = 90,
+        [ValidateRange(1, 100)][int]$MaxAttempts = 30
     )
 
+    # Slow or unstable connections drop long downloads ("unexpected EOF", resets, stalls). Every failure is
+    # retried and the download continues where it stopped (HTTP Range) instead of starting over.
     Add-Type -AssemblyName System.Net.Http
     $handler = [System.Net.Http.HttpClientHandler]::new()
     $handler.AllowAutoRedirect = $true
     $client = [System.Net.Http.HttpClient]::new($handler)
     $client.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan
     $client.DefaultRequestHeaders.UserAgent.ParseAdd("RDRVR-SourceKit/$($script:ModVersion)")
-
-    $response = $null
-    $source = $null
-    $target = $null
-    $headerTimeout = [System.Threading.CancellationTokenSource]::new()
-    $headerTimeout.CancelAfter([TimeSpan]::FromSeconds(60))
     $progressId = 1701
+    [long]$written = 0
+    $total = $null
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    [long]$sessionStart = 0
+    $nextTextReport = 5.0
+    $lastError = $null
+    if (Test-Path -LiteralPath $OutFile) { Remove-Item -LiteralPath $OutFile -Force }
     try {
         Write-Host "Downloading $DisplayName"
         Write-Host "  Source: $Uri"
-        Write-Host "  If no bytes arrive for $StallTimeoutSeconds seconds, the download fails instead of hanging forever."
-
-        try {
-            $response = $client.GetAsync(
-                $Uri,
-                [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead,
-                $headerTimeout.Token).GetAwaiter().GetResult()
-        }
-        catch [System.OperationCanceledException] {
-            throw "Timed out while connecting to $Uri"
-        }
-        $response.EnsureSuccessStatusCode() | Out-Null
-        $source = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-        $target = [System.IO.File]::Open(
-            $OutFile,
-            [System.IO.FileMode]::Create,
-            [System.IO.FileAccess]::Write,
-            [System.IO.FileShare]::None)
-
-        $total = $response.Content.Headers.ContentLength
-        $buffer = New-Object byte[] (1MB)
-        [long]$written = 0
-        $timer = [System.Diagnostics.Stopwatch]::StartNew()
-        $nextTextReport = 5.0
-
-        while ($true) {
-            $readTimeout = [System.Threading.CancellationTokenSource]::new()
-            $readTimeout.CancelAfter([TimeSpan]::FromSeconds($StallTimeoutSeconds))
+        Write-Host "  A dropped or stalled connection ($StallTimeoutSeconds s without data) is retried and resumed automatically."
+        for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+            $response = $null; $source = $null; $target = $null
+            $headerTimeout = [System.Threading.CancellationTokenSource]::new()
+            $headerTimeout.CancelAfter([TimeSpan]::FromSeconds(60))
             try {
+                $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Uri)
+                if ($written -gt 0) {
+                    $request.Headers.Range = [System.Net.Http.Headers.RangeHeaderValue]::new($written, $null)
+                }
                 try {
-                    $read = $source.ReadAsync(
-                        $buffer, 0, $buffer.Length,
-                        $readTimeout.Token).GetAwaiter().GetResult()
+                    $response = $client.SendAsync(
+                        $request,
+                        [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+                        $headerTimeout.Token).GetAwaiter().GetResult()
                 }
                 catch [System.OperationCanceledException] {
-                    throw "Download stalled: no data received for $StallTimeoutSeconds seconds while downloading $DisplayName. Run BUILD_AND_INSTALL again to retry."
+                    throw "Timed out while connecting to $Uri"
                 }
+                $status = [int]$response.StatusCode
+                if ($written -gt 0 -and $status -eq 200) {
+                    Write-Host "  The server cannot resume; starting $DisplayName again."
+                    $written = 0
+                }
+                elseif ($written -gt 0 -and $status -eq 416 -and $null -ne $total -and $written -eq $total) {
+                    break
+                }
+                $response.EnsureSuccessStatusCode() | Out-Null
+                if ($status -eq 200) {
+                    $total = $response.Content.Headers.ContentLength
+                }
+                elseif ($status -eq 206 -and $null -ne $response.Content.Headers.ContentRange -and
+                        $null -ne $response.Content.Headers.ContentRange.Length) {
+                    $total = [long]$response.Content.Headers.ContentRange.Length
+                }
+                $source = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                $mode = if ($written -gt 0) { [System.IO.FileMode]::Append } else { [System.IO.FileMode]::Create }
+                $target = [System.IO.File]::Open($OutFile, $mode, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                if ($attempt -gt 1) { Write-Host "  Resuming at $(Format-DownloadSize $written) (attempt $attempt of $MaxAttempts)" }
+                $sessionStart = $written
+                $timer.Restart()
+                $buffer = New-Object byte[] (1MB)
+                while ($true) {
+                    $readTimeout = [System.Threading.CancellationTokenSource]::new()
+                    $readTimeout.CancelAfter([TimeSpan]::FromSeconds($StallTimeoutSeconds))
+                    try {
+                        try {
+                            $read = $source.ReadAsync($buffer, 0, $buffer.Length, $readTimeout.Token).GetAwaiter().GetResult()
+                        }
+                        catch [System.OperationCanceledException] {
+                            throw "no data received for $StallTimeoutSeconds seconds"
+                        }
+                    }
+                    finally { $readTimeout.Dispose() }
+                    if ($read -eq 0) { break }
+                    $target.Write($buffer, 0, $read)
+                    $written += $read
+                    $seconds = [Math]::Max($timer.Elapsed.TotalSeconds, 0.001)
+                    $bytesPerSecond = ($written - $sessionStart) / $seconds
+                    $rateText = "$(Format-DownloadSize ([long]$bytesPerSecond))/s"
+                    $writtenText = Format-DownloadSize $written
+                    if ($null -ne $total -and $total -gt 0) {
+                        $percent = [Math]::Min(100, [int](100.0 * $written / $total))
+                        $remainingSeconds = if ($bytesPerSecond -gt 0) { [Math]::Max(0, [int](($total - $written) / $bytesPerSecond)) } else { 0 }
+                        $statusText = "$writtenText / $(Format-DownloadSize $total) - $percent% - $rateText - ETA $([TimeSpan]::FromSeconds($remainingSeconds).ToString('hh\:mm\:ss'))"
+                        Write-Progress -Id $progressId -Activity "Downloading $DisplayName" -Status $statusText -PercentComplete $percent
+                    }
+                    else {
+                        $statusText = "$writtenText received - $rateText"
+                        Write-Progress -Id $progressId -Activity "Downloading $DisplayName" -Status $statusText
+                    }
+                    if ($timer.Elapsed.TotalSeconds -ge $nextTextReport) {
+                        Write-Host "  $statusText"
+                        $nextTextReport = $timer.Elapsed.TotalSeconds + 5.0
+                    }
+                }
+                $target.Flush()
+                if ($null -ne $total -and $total -ge 0 -and $written -lt $total) {
+                    throw "the connection closed at $(Format-DownloadSize $written) of $(Format-DownloadSize $total)"
+                }
+                $lastError = $null
+                break
+            }
+            catch {
+                $lastError = $_.Exception.Message
+                if ($attempt -ge $MaxAttempts) { break }
+                $wait = [Math]::Min(30, 3 * $attempt)
+                Write-Host "  Download interrupted ($lastError). Retrying in $wait s..." -ForegroundColor Yellow
+                if ($null -ne $target) { $target.Dispose(); $target = $null }
+                Start-Sleep -Seconds $wait
             }
             finally {
-                $readTimeout.Dispose()
-            }
-            if ($read -eq 0) { break }
-
-            $target.Write($buffer, 0, $read)
-            $written += $read
-            $seconds = [Math]::Max($timer.Elapsed.TotalSeconds, 0.001)
-            $bytesPerSecond = $written / $seconds
-            $rateText = "$(Format-DownloadSize ([long]$bytesPerSecond))/s"
-            $writtenText = Format-DownloadSize $written
-
-            if ($null -ne $total -and $total -gt 0) {
-                $percent = [Math]::Min(100, [int](100.0 * $written / $total))
-                $remainingSeconds = if ($bytesPerSecond -gt 0) {
-                    [Math]::Max(0, [int](($total - $written) / $bytesPerSecond))
-                } else { 0 }
-                $status = "$writtenText / $(Format-DownloadSize $total) - $percent% - $rateText - ETA $([TimeSpan]::FromSeconds($remainingSeconds).ToString('mm\:ss'))"
-                Write-Progress -Id $progressId -Activity "Downloading $DisplayName" `
-                    -Status $status -PercentComplete $percent
-            }
-            else {
-                $status = "$writtenText received - $rateText"
-                Write-Progress -Id $progressId -Activity "Downloading $DisplayName" `
-                    -Status $status
-            }
-
-            if ($timer.Elapsed.TotalSeconds -ge $nextTextReport) {
-                Write-Host "  $status"
-                $nextTextReport = $timer.Elapsed.TotalSeconds + 5.0
+                if ($null -ne $target) { $target.Dispose() }
+                if ($null -ne $source) { $source.Dispose() }
+                if ($null -ne $response) { $response.Dispose() }
+                $headerTimeout.Dispose()
             }
         }
-
-        $target.Flush()
+        if ($null -ne $lastError) {
+            throw "Downloading $DisplayName failed after $MaxAttempts attempts: $lastError. Check the internet connection and run BUILD_AND_INSTALL again."
+        }
         if ($null -ne $total -and $total -ge 0 -and $written -ne $total) {
             throw "Incomplete download for $DisplayName. Expected $total bytes, received $written."
         }
-        $timer.Stop()
-        $averageRate = if ($timer.Elapsed.TotalSeconds -gt 0) {
-            Format-DownloadSize ([long]($written / $timer.Elapsed.TotalSeconds))
-        } else { Format-DownloadSize $written }
-        Write-Host "Downloaded ${DisplayName}: $(Format-DownloadSize $written) at $averageRate/s."
+        Write-Host "Downloaded ${DisplayName}: $(Format-DownloadSize $written)."
     }
     finally {
         Write-Progress -Id $progressId -Activity "Downloading $DisplayName" -Completed
-        if ($null -ne $target) { $target.Dispose() }
-        if ($null -ne $source) { $source.Dispose() }
-        if ($null -ne $response) { $response.Dispose() }
-        $headerTimeout.Dispose()
         $client.Dispose()
         $handler.Dispose()
     }
