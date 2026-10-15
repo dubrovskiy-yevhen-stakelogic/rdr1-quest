@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.rdrvr.access">
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+    <queries>
+        <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+        <intent><action android:name="org.khronos.openxr.OpenXRRuntimeService" /></intent>
+    </queries>
+    <application>
+        <!-- Quest 3/3S CPU-bound renderer: trade one GPU level for one CPU level.
+             This is a build-time preference, not a measured clock or boost. -->
+        <meta-data android:name="com.oculus.trade_cpu_for_gpu_amount" android:value="-1" />
+    </application>
+</manifest>
