@@ -241,7 +241,8 @@ def _uleb(value):
             return bytes(out)
 
 
-def mini_dex(mutate=None, owner=dexpatch.OWNER, getter=(0x0062, 0, 0x0011)) -> bytes:
+def mini_dex(mutate=None, owner=dexpatch.OWNER, getter=(0x0062, 0, 0x0011),
+             method_flags=0x000A, method_has_code=True) -> bytes:
     types = [owner, "Landroid/app/GameManager;", "Landroid/content/Context;", "Ljava/lang/Class;",
              "Ljava/lang/Object;", "V", "I", "Landroid/app/NativeActivity;"]
     names = ["activateGameMode", "getContext", "getSystemService", "getGameMode", "s_context"]
@@ -276,7 +277,8 @@ def mini_dex(mutate=None, owner=dexpatch.OWNER, getter=(0x0062, 0, 0x0011)) -> b
     data += struct.pack("<HHHHII", 1, 0, 0, 0, 0, 3) + struct.pack("<3H", *getter)
     class_data = data_start + len(data)
     data += _uleb(1) + _uleb(0) + _uleb(2) + _uleb(0) + _uleb(0) + _uleb(0x8)
-    data += _uleb(0) + _uleb(0x000A) + _uleb(code_a) + _uleb(1) + _uleb(0x0009) + _uleb(code_b)
+    data += _uleb(0) + _uleb(method_flags) + _uleb(code_a if method_has_code else 0)
+    data += _uleb(1) + _uleb(0x0009) + _uleb(code_b)
     out = bytearray(data_start)
     for i, offset in enumerate(string_offsets):
         struct.pack_into("<I", out, layout["strings"] + 4 * i, offset)
@@ -614,6 +616,21 @@ class ApkZipTests(unittest.TestCase):
 
 
 class DexTests(unittest.TestCase):
+    def test_native_declaration_is_unchanged(self):
+        data = mini_dex(method_flags=0x010A, method_has_code=False)
+        result, report = dexpatch.patch_game_manager(data)
+        self.assertEqual(result, data)
+        self.assertEqual(report['status'], 'native-method-unchanged')
+        self.assertIsNone(report['changedRange'])
+        self.assertEqual(report['inputSha256'], report['outputSha256'])
+        self.assertTrue(dexpatch.checksums_valid(result))
+
+    def test_invalid_bodyless_declarations_are_refused(self):
+        for flags, has_code in ((0x000A, False), (0x040A, False), (0x010A, True),
+                                (0x0102, False), (0x050A, False)):
+            with self.subTest(flags=flags, has_code=has_code), self.assertRaises(dexpatch.DexError):
+                dexpatch.patch_game_manager(mini_dex(method_flags=flags, method_has_code=has_code))
+
     def test_patch(self):
         data = mini_dex()
         result, report = dexpatch.patch_game_manager(data)

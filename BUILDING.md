@@ -74,8 +74,11 @@ build.
    `librdrvr.so` from `native/` with NDK r27c for arm64-v8a, Android 29.
 4. The Java loader in `loader/` is compiled and converted to DEX.
 5. `tools/build.py` edits the game manifest for VR, adds the libraries and the
-   loader, applies the GameManager null check to the game DEX, aligns and signs
-   every APK, and writes `build-manifest.json`.
+   loader, applies the GameManager null check when the supported Java method
+   is present, aligns and signs every APK, and writes `build-manifest.json`.
+   Packages declaring `activateGameMode` as a native method have no DEX body
+   to patch; their game DEX is preserved. The compatibility action is recorded
+   in the log and manifest. Engine and APK signature checks still apply.
 
 `tools/build.py` can also be run directly; see its `--help`.
 

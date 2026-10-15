@@ -1,8 +1,9 @@
 """GameManager null guard in NativeGameActivity.activateGameMode()V.
 
 The method is located through the DEX tables and its exact instruction pattern is
-checked before a same-size rewrite. Every other byte except the header checksum
-and signature stays unchanged.
+checked before a same-size rewrite. Native declarations have no DEX body to
+rewrite and are preserved. Every other byte except the header checksum and
+signature stays unchanged.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ CONTEXT_FIELD = "s_context"
 CONTEXT = "Landroid/content/Context;"
 GAME_MANAGER = "Landroid/app/GameManager;"
 ACC_STATIC = 0x0008
+ACC_NATIVE = 0x0100
+ACC_ABSTRACT = 0x0400
 HEADER_SIZE = 0x70
 NO_INDEX = 0xFFFFFFFF
 
@@ -205,6 +208,22 @@ def patch_game_manager(data: bytes) -> tuple[bytes, dict]:
     dex = Dex(data)
     if dex.class_def(OWNER) is None:
         raise DexError(f"this DEX does not define {OWNER}")
+    matches = [entry for entry in dex.methods(OWNER)
+               if dex.method(entry[0]) == (OWNER, METHOD, ("V", ()))]
+    if len(matches) == 1 and matches[0][1] & ACC_NATIVE:
+        _, flags, code = matches[0]
+        if code or not flags & ACC_STATIC or flags & ACC_ABSTRACT:
+            raise DexError(f"unexpected native {METHOD} declaration")
+        digest = hashlib.sha256(data).hexdigest()
+        return data, {
+            "owner": OWNER,
+            "method": f"{METHOD}()V",
+            "status": "native-method-unchanged",
+            "codeItemOffset": 0,
+            "changedRange": None,
+            "inputSha256": digest,
+            "outputSha256": digest,
+        }
     _, flags, code = dex.code(OWNER, METHOD, ("V", ()))
     _, _, getter = dex.code(OWNER, GETTER, (CONTEXT, ()))
     getter_words = dex.units(getter)
@@ -254,6 +273,7 @@ def patch_game_manager(data: bytes) -> tuple[bytes, dict]:
     return bytes(result), {
         "owner": OWNER,
         "method": f"{METHOD}()V",
+        "status": "null-guard-applied",
         "codeItemOffset": code,
         "changedRange": [start, start + 24],
         "inputSha256": hashlib.sha256(data).hexdigest(),

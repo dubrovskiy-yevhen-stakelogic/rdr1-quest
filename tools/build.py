@@ -180,6 +180,7 @@ class GamePackage:
     signer: str = ""
     engine_sha256: str = ""
     external: dict = field(default_factory=dict)
+    game_dex_compatibility: dict = field(default_factory=dict)
 
 
 def say(message: str) -> None:
@@ -656,7 +657,7 @@ def validate_package(
     if len(owners) != 1:
         raise KitError(f"expected one DEX defining {dexpatch.OWNER}, found {len(owners)}")
     try:
-        dexpatch.patch_game_manager(read_entry(base.path, owners[0]))
+        _, dex_compatibility = dexpatch.patch_game_manager(read_entry(base.path, owners[0]))
     except dexpatch.DexError as error:
         raise KitError(f"the game DEX is not supported: {error}") from error
     if base_info.application_class:
@@ -687,6 +688,7 @@ def validate_package(
         loader_dex=f"classes{len(names) + 1}.dex",
         external_root=external,
         signer=base.signer,
+        game_dex_compatibility=dex_compatibility,
     )
     return package
 
@@ -1206,6 +1208,7 @@ def run(options: Options, self_test: SelfTest | None = None) -> int:
 
     step("checking the game package")
     package = validate_package(options, build, tools, runner, expected)
+    say(f"Game DEX compatibility: {package.game_dex_compatibility['status']}")
     package.external = list_external(package.external_root)
     if options.validate_only:
         step("hashing the game engine")
@@ -1289,6 +1292,7 @@ def run(options: Options, self_test: SelfTest | None = None) -> int:
             "versionName": VERSION_NAME,
             "engineSha256": package.engine_sha256,
             "trade": options.trade,
+            "gameDexCompatibility": package.game_dex_compatibility,
             "launcher": package.base_info.launcher,
             "sourceSignerSha256": package.signer,
             "outputSignerSha256": hashlib.sha256(certificate).hexdigest(),
@@ -1318,6 +1322,7 @@ def validation_record(package: GamePackage) -> dict:
         "launcher": package.base_info.launcher,
         "applicationClass": package.base_info.application_class,
         "gameDex": package.game_dex,
+        "gameDexCompatibility": package.game_dex_compatibility,
         "loaderDex": package.loader_dex,
         "external": package.external,
     }
