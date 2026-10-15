@@ -1115,13 +1115,23 @@ class PipelineTests(ToolchainBase):
     def engine_stub(self) -> bytes:
         return b"".join(hashlib.sha256(i.to_bytes(4, "little")).digest() for i in range(8192))
 
-    def game_dex(self, name: str) -> bytes:
-        return self.compile_java(GAME_JAVA, name)
+    def game_dex(self, name: str, native_game_mode=False) -> bytes:
+        sources = GAME_JAVA
+        if native_game_mode:
+            sources = {**GAME_JAVA, "com/rockstargames/rdr/NativeGameActivity.java": """
+package com.rockstargames.rdr;
+public class NativeGameActivity extends android.app.NativeActivity {
+    private static native void activateGameMode();
+    public static native android.content.Context getContext();
+}
+"""}
+        return self.compile_java(sources, name)
 
-    def make_package(self, name: str, *, application=None, alias=False, single=False) -> tuple[Path, str]:
+    def make_package(self, name: str, *, application=None, alias=False, single=False,
+                     native_game_mode=False) -> tuple[Path, str]:
         folder = self.root / name
         folder.mkdir()
-        dex = self.game_dex(f"{name}-java")
+        dex = self.game_dex(f"{name}-java", native_game_mode)
         base = self.link_manifest(self.base_xml(application, alias), f"{name}-base")
         data_entries = {path: f"data {path}".encode() * 64 for path in build.DATA_FILES}
         library_entries = {build.ENGINE_ENTRY: self.engine_stub(), "lib/arm64-v8a/libc++_shared.so": b"\x7fELF" * 64}
@@ -1208,7 +1218,8 @@ class PipelineTests(ToolchainBase):
             build.run(options, self_test)
         return caught.exception
 
-    def check_outputs(self, options: build.Options, manifest: dict, signer: str, launcher: str) -> bytes:
+    def check_outputs(self, options: build.Options, manifest: dict, signer: str, launcher: str,
+                      native_game_mode=False) -> bytes:
         out = options.build_dir / "out"
         self.assertEqual(manifest["formatVersion"], 1)
         self.assertEqual(manifest["modVersion"], "0.1.0")
@@ -1243,8 +1254,14 @@ class PipelineTests(ToolchainBase):
                                     "versionCode": "63226194", "engineSha256": manifest["engineSha256"]})
             for name in build.LICENSE_FILES:
                 self.assertIn(f"assets/licenses/{name}", names)
-            with self.assertRaises(dexpatch.DexError):
-                dexpatch.patch_game_manager(archive.read("classes.dex"))
+            if native_game_mode:
+                with zipfile.ZipFile(options.game_package / "base.apk") as source:
+                    self.assertEqual(archive.read("classes.dex"), source.read("classes.dex"))
+                self.assertEqual(manifest["gameDexCompatibility"]["status"], "native-method-unchanged")
+            else:
+                with self.assertRaises(dexpatch.DexError):
+                    dexpatch.patch_game_manager(archive.read("classes.dex"))
+                self.assertEqual(manifest["gameDexCompatibility"]["status"], "null-guard-applied")
             self.assertIn("classes2.dex", names)
             self.assertNotIn("classes3.dex", names)
             loader_dex = archive.read("classes2.dex")
@@ -1252,6 +1269,14 @@ class PipelineTests(ToolchainBase):
         config = (options.build_dir / "java-gen" / "org" / "rdrvr" / "bootstrap" / "BuildConfig.java").read_text()
         self.assertEqual(config, build.build_config_source(manifest["buildId"], manifest["engineSha256"], launcher))
         return loader_dex
+
+    def test_native_game_mode_build(self):
+        package, signer = self.make_package("native", native_game_mode=True)
+        options = self.options(package, "native")
+        log = self.run_build(options, self.self_test())
+        self.assertIn("Game DEX compatibility: native-method-unchanged", log)
+        manifest = json.loads((options.build_dir / "build-manifest.json").read_text())
+        self.check_outputs(options, manifest, signer, LAUNCHER, native_game_mode=True)
 
     def test_split_folder_build(self):
         package, signer = self.make_package("play")
