@@ -2,13 +2,17 @@ package org.rdrvr.bootstrap;
 
 import android.app.Activity;
 import android.app.Application;
+import android.content.Context;
 import android.os.Bundle;
 import android.util.Log;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 
 /** Diagnostic only: preserves stock Activity, NativeActivity and asset preparation. */
 public final class RdrVrApplication extends Application {
     private static boolean loaded;
     private static native void nativeEvent(int event, String activity);
+    private static native boolean nativeDisableGameMode(Class<?> activityClass);
     static native String nativeProbe(String path, String verifiedSha);
     static native void nativeTraceConfigure(String path);
     static native void nativeTraceVerified(String path, String sha);
@@ -23,6 +27,27 @@ public final class RdrVrApplication extends Application {
     static native String nativePlannerCaptureReport();
     static native byte[] nativeTakePlannerCapture();
     static native void nativeCompletePlannerCapture(boolean writerExited);
+
+    static boolean prepareGameMode(Context context) {
+        if (context.getSystemService(Context.GAME_SERVICE) != null) return true;
+        try {
+            // Class initialization registers the protected game's native methods.
+            Class<?> activity = Class.forName("com.rockstargames.rdr.NativeGameActivity",
+                    true, context.getClassLoader());
+            Method method = activity.getDeclaredMethod("activateGameMode");
+            if (!Modifier.isNative(method.getModifiers())) return true;
+            if (!loaded || !Modifier.isStatic(method.getModifiers()) ||
+                    method.getReturnType() != void.class || !nativeDisableGameMode(activity)) {
+                Log.e("RdrVr", "Could not prepare native GameManager compatibility");
+                return false;
+            }
+            Log.i("RdrVr", "Native GameManager compatibility installed: service unavailable");
+            return true;
+        } catch (ReflectiveOperationException | LinkageError error) {
+            Log.e("RdrVr", "Could not prepare GameManager compatibility", error);
+            return false;
+        }
+    }
 
     private static void event(int code, Activity activity) {
         if (loaded) nativeEvent(code, activity == null ? null : activity.getClass().getName());

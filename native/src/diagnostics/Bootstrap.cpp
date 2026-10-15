@@ -24,6 +24,9 @@ Java_org_rdrvr_bootstrap_RdrVrApplication_nativeProfilerEnabled(JNIEnv*,jclass) 
 }
 
 namespace {
+void JNICALL skipUnavailableGameMode(JNIEnv*, jclass) {
+    __android_log_print(ANDROID_LOG_INFO, "RdrVr", "Skipped native activateGameMode: no GameManager service");
+}
 std::atomic<unsigned> eventCount{0};
 constexpr unsigned kLogLimit = 256;
 #if defined(RDRVR_TRACE)
@@ -33,6 +36,13 @@ constexpr const char* mode = "read-only-observation";
 #else
 constexpr const char* mode = "noop";
 #endif
+}
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_rdrvr_bootstrap_RdrVrApplication_nativeDisableGameMode(JNIEnv* env, jclass, jclass activity) {
+    if (!activity) return JNI_FALSE;
+    JNINativeMethod method{const_cast<char*>("activateGameMode"), const_cast<char*>("()V"),
+                           reinterpret_cast<void*>(skipUnavailableGameMode)};
+    return env->RegisterNatives(activity, &method, 1) == JNI_OK ? JNI_TRUE : JNI_FALSE;
 }
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_rdrvr_bootstrap_RdrVrApplication_nativeBenchMenuA(JNIEnv*,jclass) {

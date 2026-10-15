@@ -219,6 +219,7 @@ def patch_game_manager(data: bytes) -> tuple[bytes, dict]:
             "owner": OWNER,
             "method": f"{METHOD}()V",
             "status": "native-method-unchanged",
+            "runtimeGuard": "skip-native-query-when-game-manager-unavailable",
             "codeItemOffset": 0,
             "changedRange": None,
             "inputSha256": digest,

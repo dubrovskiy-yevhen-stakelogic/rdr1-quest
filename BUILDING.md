@@ -77,7 +77,9 @@ build.
    loader, applies the GameManager null check when the supported Java method
    is present, aligns and signs every APK, and writes `build-manifest.json`.
    Packages declaring `activateGameMode` as a native method have no DEX body
-   to patch; their game DEX is preserved. The compatibility action is recorded
+   to patch; their game DEX is preserved. Before launching the game, the loader
+   disables that native query if Android provides no GameManager service.
+   The compatibility action is recorded
    in the log and manifest. Engine and APK signature checks still apply.
 
 `tools/build.py` can also be run directly; see its `--help`.

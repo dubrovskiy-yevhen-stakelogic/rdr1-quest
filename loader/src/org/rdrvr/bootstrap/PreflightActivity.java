@@ -25,6 +25,10 @@ public final class PreflightActivity extends Activity {
                 case ERROR: showError();break;
                 case LAUNCH:
                     try {
+                        if (!RdrVrApplication.prepareGameMode(PreflightActivity.this)) {
+                            showError();
+                            break;
+                        }
                         Intent original=new Intent(getIntent());
                         original.setComponent(new android.content.ComponentName(getPackageName(),
                             BuildConfig.LAUNCHER));
