@@ -802,13 +802,10 @@ stop_game_and_verify() {
 }
 
 assert_quest_free_space() {
-  local update="$1" required_kib df_output available_kib
-  if [ "$update" -eq 1 ]; then
-    # An update keeps the old and new copies until Android commits the install.
-    required_kib=$(( (2 * APK_BYTES + 2147483648 + EXTERNAL_BYTES + 1023) / 1024 ))
-  else
-    required_kib=$(( (APK_BYTES + 3221225472 + EXTERNAL_BYTES + 1023) / 1024 ))
-  fi
+  local required_kib df_output available_kib
+  # Include staging, installed files, native extraction and Android's reserve
+  # for fresh installs as well as updates.
+  required_kib=$(( (2 * APK_BYTES + 3221225472 + EXTERNAL_BYTES + 1023) / 1024 ))
   df_output="$(adb_cmd shell toybox df -k /sdcard)" || die "could not query the free storage of the headset"
   available_kib="$(printf '%s\n' "$df_output" | tr -d '\r' | awk 'NR > 1 && NF >= 4 {value=$4} END {print value}')"
   [[ "$available_kib" =~ ^[0-9]+$ ]] || die "could not parse the free storage of the headset"
@@ -1030,6 +1027,9 @@ install_apks() {
     if [ "$rc" -eq 0 ] && printf '%s\n' "$output" | grep -Eq '^Success[[:space:]]*$'; then
       INSTALL_RESULT="success"
       return 0
+    fi
+    if printf '%s\n' "$output" | grep -qi 'INSTALL_FAILED_INSUFFICIENT_STORAGE'; then
+      die "Android could not allocate enough storage for the installation. Free more space on the headset (unused apps or videos), then retry. The APK build succeeded; keep the build outputs and personal signing key"
     fi
     if printf '%s\n' "$output" | grep -Eqi "INSTALL_FAILED_UPDATE_INCOMPATIBLE|signatures? do not match|inconsistent certificates"; then
       INSTALL_RESULT="mismatch"

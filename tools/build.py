@@ -17,6 +17,7 @@ import subprocess
 import sys
 import traceback
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -381,15 +382,29 @@ def extract_archive(source: Path, destination: Path) -> list[tuple[Path, str]]:
         result = []
         for info, name in selected:
             target = destination / name
+            partial = target.with_name(target.name + ".partial")
             written = 0
-            with archive.open(info) as stream, open(target, "wb") as output:
-                for block in iter(lambda: stream.read(BLOCK), b""):
-                    written += len(block)
-                    if written > info.file_size:
-                        raise KitError(f"{name} in {source.name} is larger than its recorded size")
-                    output.write(block)
-            if written != info.file_size:
-                raise KitError(f"{name} in {source.name} was truncated while extracting")
+            try:
+                with archive.open(info) as stream, open(partial, "wb") as output:
+                    for block in iter(lambda: stream.read(BLOCK), b""):
+                        written += len(block)
+                        if written > info.file_size:
+                            raise KitError(f"{name} in {source.name} is larger than its recorded size")
+                        output.write(block)
+                if written != info.file_size:
+                    raise KitError(f"{name} in {source.name} was truncated while extracting")
+                os.replace(partial, target)
+            except (zipfile.BadZipFile, EOFError, zlib.error) as error:
+                raise KitError(
+                    f"the archive {source.name} is damaged or incomplete: {name} failed its integrity check. "
+                    "Obtain a fresh copy of the archive or export the game again with EXPORT_RDR_APKS.bat, "
+                    "then select the new archive or export folder. The damaged APK cannot be used.",
+                    str(error),
+                ) from error
+            except OSError as error:
+                raise KitError(f"cannot extract {name} from {source.name}: {error}") from error
+            finally:
+                remove_file(partial)
             result.append((target, name))
     return result
 

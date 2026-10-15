@@ -1311,8 +1311,9 @@ function Assert-QuestFreeSpace {
         [int64]$ExternalBytes = 0
     )
     [int64]$apkBytes = $BuildInfo.ApkBytes
-    # An update keeps the old and new copies until Android commits the install.
-    [int64]$required = if ($Update.IsPresent) { (2 * $apkBytes) + 2GB } else { $apkBytes + 3GB }
+    # Allow staging and installed copies, native extraction and Android's reserve,
+    # including on a fresh install. APK download size alone is not sufficient.
+    [int64]$required = (2 * $apkBytes) + 3GB
     $required += $ExternalBytes
     [int64]$available = Get-QuestFreeBytes
     Write-Host ('Quest free space: {0:N2} GiB; required: {1:N2} GiB' -f ($available / 1GB), ($required / 1GB))
@@ -1574,6 +1575,9 @@ function Invoke-ApkInstall {
         $result = Invoke-AdbTee -Arguments $arguments
         if ($result.ExitCode -eq 0 -and $result.Text -match '(?im)^Success\s*$') {
             return [pscustomobject]@{ Success = $true; SignatureMismatch = $false; Text = $result.Text }
+        }
+        if ($result.Text -match '(?i)INSTALL_FAILED_INSUFFICIENT_STORAGE') {
+            throw 'Android could not allocate enough storage for the installation. Free more space on the headset (unused apps or videos), then retry. The APK build succeeded; keep the build outputs and personal signing key.'
         }
         if ($result.Text -match '(?i)INSTALL_FAILED_UPDATE_INCOMPATIBLE|signatures? do not match|inconsistent certificates|existing package.*signature') {
             return [pscustomobject]@{ Success = $false; SignatureMismatch = $true; Text = $result.Text }

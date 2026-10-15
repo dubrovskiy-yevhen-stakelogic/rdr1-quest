@@ -12,7 +12,8 @@ standalone on Meta Quest 3 and Quest 3S, without a PC or Quest Link.
 - Meta Quest 3 or Quest 3S with Developer Mode enabled and a USB-C data cable.
 - Windows 10/11, Linux x86_64 or macOS, an internet connection for the build
   tools, and about 20 GB of free disk space.
-- About 8 GB of free storage on the headset.
+- About 18 GB of free storage on the headset during installation; the installer
+  calculates the requirement with a reserve from the APK set size.
 
 ## Build and install
 

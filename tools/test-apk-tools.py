@@ -768,6 +768,38 @@ class BuildHelperTests(unittest.TestCase):
         with self.assertRaises(build.KitError):
             build.select_inputs(bad, work)
 
+    def test_corrupt_archive_reports_member_and_removes_partial(self):
+        for method in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            with self.subTest(compression=method):
+                source = self.root / f"damaged-{method}.apks"
+                original = zip_bytes({"base.apk": b"base", "split_data0.apk": b"x" * (build.BLOCK + 128)}, method)
+                damaged = bytearray(original)
+                with zipfile.ZipFile(io.BytesIO(original)) as archive:
+                    pos = archive.start_dir
+                while damaged[pos:pos + 4] == b"PK\x01\x02":
+                    n, e, c = struct.unpack_from("<HHH", damaged, pos + 28)
+                    if damaged[pos + 46:pos + 46 + n] == b"split_data0.apk":
+                        damaged[pos + 16] ^= 1
+                        break
+                    pos += 46 + n + e + c
+                else:
+                    self.fail("split entry not found")
+                source.write_bytes(damaged)
+                work = self.root / f"work-{method}"
+                work.mkdir()
+                with self.assertRaises(build.KitError) as caught:
+                    build.select_inputs(source, work)
+                self.assertIn("damaged or incomplete", caught.exception.message)
+                self.assertIn("split_data0.apk", caught.exception.message)
+                self.assertIn("EXPORT_RDR_APKS.bat", caught.exception.message)
+                self.assertIn("Bad CRC-32", caught.exception.details)
+                self.assertFalse((work / "input/split_data0.apk").exists())
+                self.assertEqual(list((work / "input").glob("*.partial")), [])
+                self.assertEqual(source.read_bytes(), damaged)
+                source.write_bytes(original)
+                _, files, _ = build.select_inputs(source, work)
+                self.assertEqual([name for _, name in files], ["base.apk", "split_data0.apk"])
+
     def test_third_party_markers(self):
         folder = self.make_set(self.root / "modified", {"lib/arm64-v8a/liba.so": b"x"})
         apks = [build.open_apk(path, path.name) for path in sorted(folder.glob("*.apk"))]
