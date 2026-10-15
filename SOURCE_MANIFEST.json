@@ -633,7 +633,7 @@
     "tools/axml.py": "914b551bf3d89887fffa4e41823fdbe0ea6fc4a34f80cd5d2e9fe24c8ce16034",
     "tools/build-and-install.ps1": "8c314782da5f9b6f0f6cfd404f2b1e80354f3ff7efcd6c49afa357395b0c3daa",
     "tools/build-and-install.sh": "e0af3956c2bd072f53562330a3fd4fd1972d3c2004e4174943c13fb26106d13c",
-    "tools/build.py": "f4ae7636664687faeaeacf9195ee4ca7832e98aa499cb4a52a73b7a1bd8bc59d",
+    "tools/build.py": "537400526b4254d4738c8d426eb4dbbd322500b2176080796fc1a2927d91cb85",
     "tools/collect-report.ps1": "193bdf2a4bfb2b5c0ca1e4bf3f9682a06501b723e4b8f1e0a6c8a5f903400509",
     "tools/compile_shaders.py": "6e1bf2cfad514335fe7eac8bff28b20f56f58a6af03e9341fdaff88d573de326",
     "tools/dexpatch.py": "baeae0d976ec59d7d63b0af3545818ece6710e710cc3df1ab2e56f1709539734",
@@ -646,7 +646,7 @@
     "tools/release-audit.ps1": "098c9751babd90bf0e7ac4663d857d88efd3159bce10791faa1e001e1fdd5d2c",
     "tools/reset-vr-settings.ps1": "89b379ce5417feba25b3f9db814ac31837f4ec838a944b3e8b6cafb269311bcb",
     "tools/reset-vr-settings.sh": "53797239c5982bd55ee484dfa00106db34b0b17fb5ad8ad9dced693969624b2b",
-    "tools/test-apk-tools.py": "e6e518c4de0b9b577e8879d57390e53bd90ce9d5e3858fc40c69e57a4e113fd1",
+    "tools/test-apk-tools.py": "b9b9f663b9a68f8f5bbd1851d05086a05c2dbab3445b56c106fb51d489d04916",
     "tools/transfer-saves.ps1": "8e7e71e5ac800b8cb256d36338c34795543b93ad37d86b79a8c15d8c5f68088b",
     "tools/transfer-saves.sh": "fc367e0bd9b4ced16766d830324be5c6fb2f24ddd0d1e23292cde175340032a6",
     "tools/xrmanifest.py": "415766c3bceacef849cc6d6f98f025935988927bb768ca408d61c3673a336806"
