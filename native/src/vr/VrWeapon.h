@@ -1192,8 +1192,9 @@ enum ShotReason : unsigned {ShotNotRearmed,ShotMelee,ShotCylinderOpen,ShotOtherB
 inline constexpr std::array<const char*,ShotReasonCount> shotReasonNames{"NOT_REARMED","MELEE","CYLINDER_OPEN","BLOCKED","NOT_HELD",
     "NOT_FIREARM","NO_OWNER","NATIVE_CONTEXT","NO_FORCE_AIM","NO_ENGINE_FIRE","EMPTY_CHAMBER","SPENT_CHAMBER","ONE_SHOT","HAMMER_DOWN"};
 inline constexpr std::uint64_t shotWindowNs=700'000'000;
-struct Shot {std::uint64_t ns{};int hand{-1};unsigned reason{ShotNoEngineFire};bool open{};std::uintptr_t weapon{};int aimBits{-1},kind{-1};};
-inline std::mutex shotMutex;inline Shot pendingShot{};
+struct Shot {std::uint64_t ns{};int hand{-1};unsigned reason{ShotNoEngineFire};bool open{};std::uintptr_t weapon{};int aimBits{-1},kind{-1};
+    firediag::Event diagnostic{};};
+inline std::mutex shotMutex;inline firediag::Pending<Shot> pendingShots{};
 inline std::atomic<std::uint64_t> shotEdges{},shotForwarded{},shotFired{},shotLatencyNsSum{},shotLatencyNsMax{},firesHeld{},firesHeldUnmatched{},
     firesOther{},shotMergedHammer{};
 inline std::array<std::atomic<std::uint64_t>,ShotReasonCount> shotRefusals{};
@@ -1205,22 +1206,36 @@ inline void refuseShot(unsigned why,std::uint64_t now) noexcept {
 // Caller holds shotMutex: a pending press past its window is a refusal - unless HAMMER merged that very press into another pulse's shot
 // (no pulse room, or its R1 pulse stayed open across a shot a FAN pulse claimed): then it is `mergedHammer`.
 inline void expireShotLocked(std::uint64_t now) noexcept {
-    if(pendingShot.open&&now>=pendingShot.ns&&now-pendingShot.ns>shotWindowNs){pendingShot.open=false;
-        if(pendingShot.reason==ShotNoEngineFire&&::rdrvr::vr::hammer::edgeMerged(pendingShot.ns))shotMergedHammer.fetch_add(1,std::memory_order_relaxed);
-        else refuseShot(pendingShot.reason,now);}
+    pendingShots.expire(now,shotWindowNs,[now](const Shot& s){
+        auto d=s.diagnostic;d.ns=now;
+        if(s.reason==ShotNoEngineFire&&::rdrvr::vr::hammer::edgeMerged(s.ns)){
+            shotMergedHammer.fetch_add(1,std::memory_order_relaxed);d.stage="MERGED";d.reason="HAMMER_MERGED";
+        }else{refuseShot(s.reason,now);d.stage="NO_ENGINE_FIRE";d.reason="NO_PROJECTILE_WITHIN_700MS";}
+        // hint is the state at the press, not a proven engine refusal reason.
+        firediag::record(d);
+    });
 }
 inline void noteTrigger(int hand,bool forwarded,const char* block,std::uint64_t now) noexcept {
     namespace H=::rdrvr::vr::holsters;
     shotEdges.fetch_add(1,std::memory_order_relaxed);
     std::lock_guard lock(shotMutex);expireShotLocked(now);
+    Owner o{};{std::lock_guard ownerLock(ownerMutex);o=owner;}
+    Shot s{};s.ns=now;s.hand=hand;s.open=true;s.weapon=o.weapon;s.kind=int(o.kind);s.aimBits=H::engineAimBits.load(std::memory_order_relaxed);
+    auto& d=s.diagnostic;d.ns=d.attemptNs=now;d.hand=hand;d.heldHand=H::holdHand.load();d.slot=H::currentSlot.load();
+    d.generation=int(H::holdGeneration.load());d.weapon=o.weapon;d.kind=s.kind;d.aimBits=s.aimBits;
+    d.selectState=H::engineSelectState.load();d.forceAim=H::forceAimOurs.load()?1:0;
+    const auto cfg=settings();d.preset=int(weaponPresetOf(cfg));d.hammer=int(cfg.hammerStyle());d.reload=int(cfg.reloadMode());
+    const auto name=H::handName.load();std::snprintf(d.name.data(),d.name.size(),"%s",name.c_str());
+    ::rdrvr::vr::reload::EngineAmmo ammo{};
+    if(::rdrvr::vr::reload::ammoFor(o.weapon,ammo,now)){d.ammoKnown=1;d.clip=ammo.clip;d.pool=ammo.pool;d.nativeReloading=int(ammo.nativeReloading);}
     if(!forwarded){
         const std::string b=block?block:"";
         refuseShot(b=="NOT_REARMED"?ShotNotRearmed:b=="MELEE"?ShotMelee:b=="CYLINDER_OPEN"?ShotCylinderOpen:b=="EMPTY_CHAMBER"?ShotEmptyChamber:
-            b=="SPENT_CHAMBER"?ShotSpentChamber:b=="ONE_SHOT"?ShotOneShot:b=="HAMMER_DOWN"?ShotHammerDown:ShotOtherBlock,now);return;
+            b=="SPENT_CHAMBER"?ShotSpentChamber:b=="ONE_SHOT"?ShotOneShot:b=="HAMMER_DOWN"?ShotHammerDown:ShotOtherBlock,now);
+        // ROUTE already records the exact gate (including SPIN) and raw controller values.
+        d.stage="BLOCKED";d.reason=block?block:"UNKNOWN_GATE";firediag::record(d);return;
     }
     shotForwarded.fetch_add(1,std::memory_order_relaxed);
-    Owner o{};{std::lock_guard ownerLock(ownerMutex);o=owner;}
-    Shot s{};s.ns=now;s.hand=hand;s.open=true;s.weapon=o.weapon;s.kind=int(o.kind);s.aimBits=H::engineAimBits.load(std::memory_order_relaxed);
     const auto mode=H::ForceAim(H::forceAimMode.load(std::memory_order_relaxed));
     if(H::holdHand.load(std::memory_order_relaxed)<0)s.reason=ShotNotHeld;
     else if(!o.weapon)s.reason=ShotNoOwner;
@@ -1228,7 +1243,9 @@ inline void noteTrigger(int hand,bool forwarded,const char* block,std::uint64_t 
     else if(!o.forceAllowed)s.reason=ShotContext;
     else if(mode!=H::ForceAim::Off&&!H::forceAimOurs.load(std::memory_order_relaxed)&&!(s.aimBits>=0&&(s.aimBits&H::aimBitForce)))s.reason=ShotNoForceAim;
     else s.reason=ShotNoEngineFire;
-    pendingShot=s;
+    d.stage="WAIT_ENGINE";d.reason="ROUTED_NOT_YET_CONFIRMED";d.hint=shotReasonNames[s.reason];firediag::record(d);
+    pendingShots.add(s,[now](const Shot& old){auto lost=old.diagnostic;lost.ns=now;lost.stage="TRACKING_OVERFLOW";
+        lost.reason="OUTCOME_UNKNOWN";firediag::record(lost);});
 }
 // weapWeapon::FireProjectile entry (any thread).
 // HAMMER: hammer::claimFire first - a FAN stroke / SA pulse is counted in vr.weapon.hammer (not an
@@ -1236,23 +1253,27 @@ inline void noteTrigger(int hand,bool forwarded,const char* block,std::uint64_t 
 // An SA pulse IS the trigger press that route() forwarded (it opened the pendingShot): engineFiresHammer
 // AND the press closes as fired.
 inline std::atomic<std::uint64_t> firesHammer{};
-inline bool matchShotLocked(std::uint64_t now) noexcept { // caller holds shotMutex: the open press within its window -> fired (+ latency)
-    if(!(pendingShot.open&&now>=pendingShot.ns&&now-pendingShot.ns<=shotWindowNs))return false;
-    pendingShot.open=false;shotFired.fetch_add(1,std::memory_order_relaxed);const auto l=now-pendingShot.ns;
+inline bool matchShotLocked(std::uintptr_t weapon,std::uint64_t now) noexcept { // caller holds shotMutex
+    expireShotLocked(now);
+    const auto* shot=pendingShots.match(weapon,now,shotWindowNs);if(!shot)return false;
+    shotFired.fetch_add(1,std::memory_order_relaxed);const auto l=now-shot->ns;
+    auto d=shot->diagnostic;d.ns=now;d.stage="FIRED";d.reason="FIRE_PROJECTILE_CALLED";firediag::record(d);
     shotLatencyNsSum.fetch_add(l,std::memory_order_relaxed);
     auto m=shotLatencyNsMax.load(std::memory_order_relaxed);while(l>m&&!shotLatencyNsMax.compare_exchange_weak(m,l)){}
     return true;
 }
 inline void noteFire(std::uintptr_t weapon,std::uint64_t now) noexcept {
     std::uintptr_t held{};{std::lock_guard lock(ownerMutex);held=owner.weapon;}
-    if(!weapon||weapon!=held){firesOther.fetch_add(1,std::memory_order_relaxed);return;}
+    if(!weapon||weapon!=held){firesOther.fetch_add(1,std::memory_order_relaxed);
+        // A delayed projectile can arrive after holstering or switching weapons.
+        if(weapon){std::lock_guard lock(shotMutex);matchShotLocked(weapon,now);}return;}
     firesHeld.fetch_add(1,std::memory_order_relaxed);
     {const auto c=::rdrvr::vr::hammer::claimFire(weapon,now);
         if(c.claimed&&c.kind!=::rdrvr::vr::hammer::KindTrigger){firesHammer.fetch_add(1,std::memory_order_relaxed);
-            if(c.kind==::rdrvr::vr::hammer::KindSa){std::lock_guard lock(shotMutex);matchShotLocked(now);}
+            if(c.kind==::rdrvr::vr::hammer::KindSa){std::lock_guard lock(shotMutex);matchShotLocked(weapon,now);}
             return;}}
     std::lock_guard lock(shotMutex);
-    if(!matchShotLocked(now))firesHeldUnmatched.fetch_add(1,std::memory_order_relaxed); // auto-fire repeats, engine-initiated shots
+    if(!matchShotLocked(weapon,now))firesHeldUnmatched.fetch_add(1,std::memory_order_relaxed); // auto-fire repeats, engine-initiated shots
 }
 
 // ---- BODY ----
@@ -1376,7 +1397,8 @@ inline std::string report() {
         lastShotNs.load()&&now>=lastShotNs.load()?double(now-lastShotNs.load())/1e6:-1.0);out+=b;
     {bool first=true;for(unsigned i=0;i<ShotReasonCount;++i){const auto n=shotRefusals[i].load();if(!n)continue;
         std::snprintf(b,sizeof b,"%s\"%s\":%llu",first?"":",",shotReasonNames[i],(unsigned long long)n);out+=b;first=false;}}
-    std::snprintf(b,sizeof b,"}},\"triggers\":{\"ltNative\":%s,\"meleeTrigger\":%s,\"heldKind\":%d,\"edges\":%llu,\"forwarded\":%llu,"
+    out+="}},\"diagnostics\":"+firediag::report()+',';
+    std::snprintf(b,sizeof b,"\"triggers\":{\"ltNative\":%s,\"meleeTrigger\":%s,\"heldKind\":%d,\"edges\":%llu,\"forwarded\":%llu,"
         "\"ltBlockedFrames\":%llu,\"rtBlockedMelee\":%llu,\"rtBlockedCylinder\":%llu,\"rtBlockedRearm\":%llu,\"bMaskedFrames\":%llu,"
         "\"empty\":{\"native\":%s,\"strikeOnly\":%s,\"edgesWithheld\":%llu,\"framesWithheld\":%llu,\"strikePassed\":%llu,\"passedGated\":%llu}},",
         H::ltNative.load()?"true":"false",H::meleeTrigger.load()?"true":"false",H::heldKind.load(),(unsigned long long)H::triggerEdges.load(),

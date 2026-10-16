@@ -165,6 +165,14 @@ Saves of the PC version load unchanged. Saves from consoles are untested.
   VR settings after confirmation. Saved games are not touched.
 - `COLLECT_REPORT.bat` collects a diagnostic report from the headset into the
   work folder. Nothing is uploaded.
+  If a weapon stops firing, try the trigger several times and collect the report
+  while the game is still running, before restarting it. Include the weapon name
+  and whether the problem began after holstering, dropping or changing weapons.
+  New builds record shot attempts and holster events as `RdrVrFire` in the log,
+  with the last 64 events also saved in `vr.weapon.diagnostics` in the JSON report.
+  The report ZIP includes a separate `fire-diagnostics.txt` with these log lines.
+  Input blocks have an explicit reason; `NO_ENGINE_FIRE` only means no projectile
+  was observed within 700 ms. Its context hint is not a confirmed engine cause.
 
 ## Known limitations
 

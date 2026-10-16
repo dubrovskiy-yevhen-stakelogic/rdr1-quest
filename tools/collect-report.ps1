@@ -334,6 +334,8 @@ try {
     $null = Save-Capture -Name 'logcat-crash.txt' -Arguments @('logcat', '-b', 'crash', '-d', '-v', 'threadtime')
     $null = Save-Capture -Name 'logcat-filtered.txt' -Arguments @('logcat', '-d', '-v', 'threadtime', '-t', '20000') `
         -Filter { Test-KeptLogLine -Line $_ } -TimeoutSeconds 120
+    $null = Save-Capture -Name 'fire-diagnostics.txt' -Arguments @('logcat', '-d', '-v', 'threadtime', '-s', 'RdrVrFire:I', '*:S') `
+        -TimeoutSeconds 120
 
     $package = Save-Capture -Name 'package.txt' -Arguments @('shell', 'dumpsys', 'package', $script:PackageName)
     $paths = Save-Capture -Name 'package-paths.txt' -Arguments @('shell', 'pm', 'path', $script:PackageName)
@@ -398,7 +400,10 @@ try {
     $fields = @(
         'buildId', 'status', 'hashVerified', 'preflightVerified', 'writerError',
         'gameBootstrap.sessionState', 'lastViewFlags', 'nativeUi.state',
-        'stereoReplay.driverSets.identity', 'graphics.persistenceOk', 'graphics.cfgVersion'
+        'stereoReplay.driverSets.identity', 'graphics.persistenceOk', 'graphics.cfgVersion',
+        'vr.weapon.fire.triggerEdges', 'vr.weapon.fire.forwarded', 'vr.weapon.fire.fired',
+        'vr.weapon.fire.lastRefusal', 'vr.weapon.fire.lastRefusalAgeMs',
+        'vr.weapon.diagnostics.total'
     )
     $summary = New-Object 'System.Collections.Generic.List[string]'
     $summary.Add('RED DEAD REDEMPTION VR REPORT')
@@ -418,6 +423,9 @@ try {
         $summary.Add('vulkan-trace.json was not found. Start the game once, then collect again.')
     }
     $summary.Add('')
+    $summary.Add('Shooting diagnostics: fire-diagnostics.txt and vr.weapon.diagnostics.events in vulkan-trace.json.')
+    $summary.Add('Reproduce several failed trigger presses, then collect while the game is still running.')
+    $summary.Add('NO_ENGINE_FIRE means no projectile was observed within 700 ms; hint is context, not a proven cause.')
     $summary.Add("debug.rdrvr properties set: $debugCount")
     if ($debugCount -gt 0) {
         $summary.Add('  Debug properties change the behaviour of the mod. Restart the headset to clear them.')

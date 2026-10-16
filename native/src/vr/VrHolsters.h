@@ -28,6 +28,7 @@
 #include "VrGuard.h"
 #include "VrLassoLink.h" // LASSO: brain (route / keepHold / ownsHand / dwell), grade H rules, PlayerLink
 #include "VrSpin.h"      // SPIN: the revolver on the trigger finger (brain, hinge sim, exits)
+#include "VrFireDiagnostics.h"
 #include "runtime/ControllerInput.h"
 #include <algorithm>
 #include <array>
@@ -232,6 +233,8 @@ inline void noteEvent(HolsterEvent e,int slot,int hand,const char* reason,std::u
     auto& s=eventRing[eventCount.fetch_add(1,std::memory_order_relaxed)%eventRingSize];
     s.packed.store(std::uint64_t(e)|(std::uint64_t(std::uint8_t(slot))<<8)|(std::uint64_t(std::uint8_t(hand))<<16)|(std::uint64_t(aux)<<32),std::memory_order_relaxed);
     s.reason.store(reason?reason:"",std::memory_order_relaxed);s.ns.store(now,std::memory_order_release);
+    firediag::Event d{};d.ns=now;d.stage="HOLSTER";d.reason=eventNames[e];d.hint=reason?reason:"";
+    d.slot=slot;d.hand=hand;firediag::record(d);
 }
 
 // ---- WEAPON KEEP: configuration (set once at startup by vr::weapon::startup) and live engine facts ----
@@ -906,7 +909,17 @@ class InputBrain {
     // withheld until released (latch: no fresh native press when the gate changes under a held trigger).
     // nativeFistTrigger: RT passes as the engine's punch.
     std::array<bool,2> emptyLatch_{},emptyDown_{};
-    void routeEmpty(const ControllerSample& in,PadState& pad) noexcept {
+    void traceRoute(const ControllerSample& in,const PadState& pad,int hand,int hold,std::uint64_t now,
+                    const char* reason,bool menu=false,const char* stage="ROUTE") const noexcept {
+        firediag::Event d{};d.ns=d.attemptNs=now;d.reason=reason;d.stage=stage;d.hand=hand;d.heldHand=hold;
+        d.slot=currentSlot.load();d.kind=heldKind.load();d.generation=int(holdGeneration.load());
+        const auto s=settings();d.preset=int(weaponPresetOf(s));d.hammer=int(s.hammerStyle());d.reload=int(s.reloadMode());
+        d.armed=rtArmed_?1:0;d.menu=menu?1:0;d.trigger=in.triggers[unsigned(hand)];d.grip=in.grips[unsigned(hand)];
+        d.sentRt=pad.triggers[1];d.sentLt=pad.triggers[0];d.aimBits=engineAimBits.load();d.selectState=engineSelectState.load();
+        d.forceAim=forceAimOurs.load()?1:0;const auto name=handName.load();std::snprintf(d.name.data(),d.name.size(),"%s",name.c_str());
+        firediag::record(d);
+    }
+    void routeEmpty(const ControllerSample& in,PadState& pad,std::uint64_t now,bool menu) noexcept {
         const bool withhold=!emptyTriggerNative.load(std::memory_order_relaxed)&&contextAllowed.load(std::memory_order_relaxed);
         const bool strikeOnly=nativeFistTrigger.load(std::memory_order_relaxed);
         for(unsigned t=0;t<2;++t){ // t: 0 = LT (left controller), 1 = RT (right controller) - the native mapping of an empty pad
@@ -922,6 +935,7 @@ class InputBrain {
             }else if(edge){
                 if(withhold)emptyStrikePassed.fetch_add(1,std::memory_order_relaxed);else emptyTriggerPassedGated.fetch_add(1,std::memory_order_relaxed);
             }
+            if(edge)traceRoute(in,pad,int(t),-1,now,cut?"NO_VR_WEAPON":strikeOnly&&t==1?"NATIVE_PUNCH":"EMPTY_HAND_PASSTHROUGH",menu);
         }
         if(emptyLatch_[0]||emptyLatch_[1])emptyTriggerLatched.fetch_add(1,std::memory_order_relaxed);
     }
@@ -963,16 +977,22 @@ class InputBrain {
         if(down&&!physDownPh_){
             offhandTriggerEdges.fetch_add(1,std::memory_order_relaxed);
             const int ps=phantomSlot.load(std::memory_order_relaxed);
+            firediag::Event d{};d.ns=d.attemptNs=now;d.stage="OFFHAND_REQUEST";d.hand=ph;d.heldHand=hold;d.slot=ps;
+            d.generation=int(generation);d.trigger=in.triggers[o];d.grip=in.grips[o];d.reason="NOT_FIREARM";
+            const auto cfg=settings();d.preset=int(weaponPresetOf(cfg));d.hammer=int(cfg.hammerStyle());d.reload=int(cfg.reloadMode());
             if(phantomFirearmSlot(ps)){
                 bool cylinder=false;if(const auto s=fireBlockSink.load(std::memory_order_acquire)){try{cylinder=s(now);}catch(...){}}
                 if(hold>=0&&swapFire.load(std::memory_order_relaxed)&&dualActive()&&!swapSeq_&&!cylinder){
                     std::uint32_t seq{};
-                    if(post(OpDrawKeep,ps,o,1,1000,now,seq,hold)){swapSeq_=seq;swapHand_=ph;swapNs_=now;swapLandNs_=0;swapsRequested.fetch_add(1,std::memory_order_relaxed);}
+                    if(post(OpDrawKeep,ps,o,1,1000,now,seq,hold)){swapSeq_=seq;swapHand_=ph;swapNs_=now;swapLandNs_=0;swapsRequested.fetch_add(1,std::memory_order_relaxed);
+                        d.reason="SWAP_FIRE_QUEUED";}else d.reason="COMMAND_QUEUE_REJECTED";
                 }else{ // swap-fire off / blocked (cylinder open, swap in flight): a dry click
+                    d.reason=cylinder?"CYLINDER_OPEN":hold<0?"NO_ENGINE_HAND":!swapFire.load()?"SWAP_FIRE_DISABLED":!dualActive()?"DUAL_DISABLED":"SWAP_PENDING";
                     if(cylinder)swapBlocked.fetch_add(1,std::memory_order_relaxed);
                     offhandDry.fetch_add(1,std::memory_order_relaxed);haptics::pulse(o,.15f,20'000,now,haptics::SourceRefuse);
                 }
             } // knife phantom: the trigger does nothing (physical melee)
+            firediag::record(d);
         }
         physDownPh_=down;
     }
@@ -1006,7 +1026,8 @@ class InputBrain {
     }
     void route(const ControllerSample& in,int hold,PadState& pad,std::uint64_t now,bool menu=false) noexcept {
         const auto generation=holdGeneration.load(std::memory_order_relaxed);
-        if(generation!=lastGeneration_||hold!=lastHold_){
+        const bool changed=generation!=lastGeneration_||hold!=lastHold_;
+        if(changed){
             lastGeneration_=generation;if(hold!=lastHold_)attachmentGeneration.fetch_add(1,std::memory_order_relaxed);
             lastHold_=hold;rtArmed_=hold<0;logical_={};physDown_=hold>=0&&in.triggers[unsigned(hold)]>=.55f; // a carried-over squeeze is no edge
             gateActive_=false;gateBlock_=nullptr;gateVerdict_=-1;pendingEdgeNs_=0;
@@ -1023,7 +1044,7 @@ class InputBrain {
             if(o.putAway&&hold>=0){std::uint32_t seq{};post(OpPutAway,SlotLasso,unsigned(hold),PutAwayHoldRelease,3000,now,seq);} // TOGGLE squeeze-and-open
             if(o.owned){emptyLatch_={};emptyDown_={in.triggers[0]>=.55f,in.triggers[1]>=.55f};physDown_=hold>=0&&in.triggers[unsigned(hold)]>=.55f;return;}
         }
-        if(hold<0){routeEmpty(in,pad);return;} // Empty VR hands never draw a weapon from a trigger
+        if(hold<0){routeEmpty(in,pad,now,menu);return;} // Empty VR hands never draw a weapon from a trigger
         emptyLatch_={};emptyDown_={in.triggers[0]>=.55f,in.triggers[1]>=.55f};
         const unsigned h=unsigned(hold),o=1u-h;
         // HAMMER: who owns the holding trigger. A change of owner while the trigger is squeezed
@@ -1101,10 +1122,12 @@ class InputBrain {
             HammerOut ho{};try{hsk->step(in,hi,ho);}catch(...){}
         }
         if(block){pad.triggers[1]=0;pad.buttons&=~runtime::PadRightTrigger;}
+        if(changed&&down&&!edge)traceRoute(in,pad,hold,hold,now,"TRIGGER_HELD_AT_DRAW",menu);
         if(swapPress_){ // DUAL swap-fire: the press that asked for the swap fired only if its edge is forwarded
             if(edge||replay){swapPress_=false;if(!block)swapsFiredAfter.fetch_add(1,std::memory_order_relaxed);}
             else if(in.triggers[h]<.45f)swapPress_=false;}
         if(edge||replay){
+            traceRoute(in,pad,hold,hold,now,block?block:"ROUTED",menu);
             triggerEdges.fetch_add(1,std::memory_order_relaxed);if(!block)triggerForwarded.fetch_add(1,std::memory_order_relaxed);
             else if(!std::strcmp(block,"NOT_REARMED"))rtBlockedRearm.fetch_add(1,std::memory_order_relaxed);
             if(const auto s=triggerSink.load(std::memory_order_acquire)){try{s(hold,!block,block?block:"",now);}catch(...){}}
@@ -1163,6 +1186,7 @@ class InputBrain {
 public:
     void reset() noexcept {*this=InputBrain{};}
     // pad.ready false = native neutral state: nothing is routed. input==nullptr / head==nullptr / !world suspend holsters.
+    std::array<bool,2> diagnosticDown_{};
     void frame(const ControllerSample* input,const Pose* head,bool world,std::uint64_t now,PadState& pad) noexcept {
         using namespace detail;
         inputFrames.fetch_add(1,std::memory_order_relaxed);
@@ -1173,6 +1197,11 @@ public:
         const bool menu=menuNs&&(now<menuNs||now-menuNs<menuFreezeNs);
         const bool usable=world&&input&&runtime::validController(*input)&&now>=input->publishedNs&&now-input->publishedNs<=inputMaxAgeNs&&
             input->referenceSpace&&input->continuity;
+        // Record raw edges even when they never reach route(). These are observed context states, not engine verdicts.
+        if(input)for(unsigned h=0;h<2;++h){const bool down=input->triggers[h]>=(diagnosticDown_[h]?.45f:.55f);
+            if(down&&!diagnosticDown_[h]&&(gated||!usable||!pad.ready||menu))
+                traceRoute(*input,pad,int(h),hold,now,gated?"HOLSTERS_BYPASSED":!usable?"INPUT_NOT_USABLE":!pad.ready?"PAD_NOT_READY":"MENU_OPEN",menu,"INPUT_CONTEXT");
+            diagnosticDown_[h]=down;}
         if(const auto* hsk=hammerSinks.load(std::memory_order_acquire);hsk&&hsk->frameBegin){ // HAMMER: FIRST, on every path
             HammerFrame hf{};hf.now=now;hf.in=usable?input:nullptr;hf.head=head&&poseOk(*head)?head:nullptr;hf.hold=hold;hf.menu=menu;
             hf.suspended=gated||menu||!usable||!pad.ready;try{hsk->frameBegin(hf);}catch(...){}}
