@@ -33,7 +33,7 @@ import xrmanifest  # noqa: E402
 
 KIT_ROOT = TOOLS.parent
 
-MOD_VERSION = "0.1.0"
+MOD_VERSION = "0.1.1"
 PACKAGE_NAME = "com.rockstargames.rdr"
 VERSION_CODE = "63226194"
 VERSION_NAME = "1.58.63226194"

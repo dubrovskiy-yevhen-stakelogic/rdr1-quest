@@ -813,9 +813,9 @@ void XrHarness::frame() {
             if(load.valid)std::snprintf(renderLoad,sizeof(renderLoad),"%.0f%%",load.percent);else std::snprintf(renderLoad,sizeof(renderLoad),"N/A");
             const auto rateState=fragmentRateReadiness.load(std::memory_order_relaxed);
 #ifdef RDRVR_HEAD_CAMERA
-            constexpr const char* displayVersion="0.1.0";
+            constexpr const char* displayVersion="0.1.1";
 #else
-            constexpr const char* displayVersion="0.1.0";
+            constexpr const char* displayVersion="0.1.1";
 #endif
             char descriptorReuse[40];
 #ifdef RDRVR_HEAD_CAMERA

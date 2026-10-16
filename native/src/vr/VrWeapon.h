@@ -81,7 +81,7 @@ enum class Predict : std::uint8_t {Off,Capsule,Velocity};
 // it in the character's hand (knife, tomahawk, lasso, rigid guns without a muzzle locator).
 enum class HoldMode : std::uint8_t {Auto,Barrel,Hand};
 struct Config {
-    bool enabled{true},latency{true},melee{true},launch{true};float aimDistanceM{150.f};std::uint64_t planMaxAgeNs{250'000'000};
+    bool enabled{true},latency{true},melee{true},launch{true},reticleTarget{true},hideReticle{true};float aimDistanceM{150.f};std::uint64_t planMaxAgeNs{250'000'000};
     std::array<Offset,classCount> offsets{};
     AnchorMode anchor{AnchorMode::Wrist};float wristM{0.055f};bool handBone{true};
     Predict predict{Predict::Capsule};bool turnBridge{true};int turnSign{0}; // 0 = learn from the first post-turn plan (start +1)
@@ -143,6 +143,8 @@ inline void startup() noexcept {
     for(unsigned k=1;k<classCount;++k){Offset o{};
         if(parseOffset(H::property((std::string("debug.rdrvr.vr.weapon.offset.")+classKey(E::WeaponClass(k))).c_str()),o))c.offsets[k]=o;}
     c.launch=!off(H::property("debug.rdrvr.vr.weapon.launch")); // 0 = keep the native camera launch override
+    c.reticleTarget=!off(H::property("debug.rdrvr.vr.weapon.reticletarget")); // 0 = keep the camera-ray reticle target
+    c.hideReticle=H::property("debug.rdrvr.vr.weapon.nativereticle")!="1"; // 1 = keep the game's free-aim dot in the HUD
     { // Anchor / prediction / turn bridge / aim fix / spread / laser
         const auto anchor=H::property("debug.rdrvr.vr.weapon.anchor");if(anchor=="grip")c.anchor=AnchorMode::Grip;
         const auto num=[](const std::string& t,float lo,float hi,float& out){if(t.empty())return;char* e{};const float v=std::strtof(t.c_str(),&e);
@@ -202,6 +204,17 @@ inline void accepted(Channel c,std::uint64_t now) noexcept {
     auto& s=stats[c];s.done.fetch_add(1,std::memory_order_relaxed);s.last.store(Ok,std::memory_order_relaxed);s.lastNs.store(now,std::memory_order_relaxed);
 }
 inline std::atomic<std::uint64_t> poseCompleted{},poseCompletedNative{},aimFromPose{},aimFromController{},modelSkipped{};
+// RETICLE TARGET: tgtReticleComponent+0x3810 (copy at +0x3820) is the point the reticle ray from the native game camera hits.
+// aniAim::UpdateInternalStates copies it to aniAim+0x390, and GunUpCheck raises the gun (no aim, no fire) when that point is
+// within 0.3 m (or the weapon minimum) of the player horizontally. The VR view drops the game camera pitch, so nothing levels
+// it: after riding, the on-foot camera stays high and pitched down and its ray hits the ground at the player's feet. For the
+// VR-held firearm on foot, the barrel-line point is written there after each reticle Update.
+inline std::atomic<std::uint64_t> reticleTargetSet{},reticleTargetNear{},reticleTargetSkipped{};inline std::atomic<float> reticleNativeM{-1.f};
+// NATIVE RETICLE: the game draws its free-aim dot into the HUD while sagPlayerStates+0xc (the reticle prevention mask) is 0.
+// The VR-held firearm aims with its barrel and laser, so while one is held the mod sets its own mask bit (mission scripts hide the
+// reticle the same way with 0x10000). EvaluateReticleDraw then fades the reticle UI alpha to 0; aiming and firing do not read it.
+inline constexpr std::uint32_t reticlePreventionBit=0x40000000u;
+inline std::atomic<std::uint64_t> reticleHiddenFrames{},reticleShownFrames{};
 
 // ---- weapon geometry (main thread, cached per weapon) ----
 // modelMuzzle = model^-1 * muzzle from ONE skeleton state: GetWeaponMatrix(false) (skeleton root or weapon+0x80, 0x25466c4) and
@@ -1348,8 +1361,11 @@ inline std::string report() {
         if(c==ChannelPose){std::snprintf(b,sizeof b,",\"completed\":%llu,\"completedNativeTrue\":%llu",(unsigned long long)poseCompleted.load(),
             (unsigned long long)poseCompletedNative.load());out+=b;}
         if(c==ChannelModel){std::snprintf(b,sizeof b,",\"rigidSkipped\":%llu",(unsigned long long)modelSkipped.load());out+=b;}
-        if(c==ChannelAim){std::snprintf(b,sizeof b,",\"fromPose\":%llu,\"fromController\":%llu",(unsigned long long)aimFromPose.load(),
-            (unsigned long long)aimFromController.load());out+=b;}
+        if(c==ChannelAim){std::snprintf(b,sizeof b,",\"fromPose\":%llu,\"fromController\":%llu,\"reticleTarget\":{\"enabled\":%s,\"set\":%llu,"
+            "\"nativeNear\":%llu,\"skipped\":%llu,\"lastNativeM\":%.2f},\"nativeReticle\":{\"hide\":%s,\"hiddenFrames\":%llu,\"shownFrames\":%llu}",(unsigned long long)aimFromPose.load(),
+            (unsigned long long)aimFromController.load(),config.reticleTarget?"true":"false",(unsigned long long)reticleTargetSet.load(),
+            (unsigned long long)reticleTargetNear.load(),(unsigned long long)reticleTargetSkipped.load(),double(reticleNativeM.load()),
+            config.hideReticle?"true":"false",(unsigned long long)reticleHiddenFrames.load(),(unsigned long long)reticleShownFrames.load());out+=b;}
         out+="},";
     }
     std::snprintf(b,sizeof b,"\"placement\":{\"ageMs\":%.1f,\"hand\":%d,\"grip\":%s,\"muzzle\":%s,\"barrel\":%s,\"shift\":%s,\"shifted\":%s,"

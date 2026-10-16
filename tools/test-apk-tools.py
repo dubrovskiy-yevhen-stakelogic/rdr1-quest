@@ -717,7 +717,7 @@ class BuildHelperTests(unittest.TestCase):
             "package org.rdrvr.bootstrap;\nfinal class BuildConfig {\nstatic final boolean PROBE=false;\n"
             "static final boolean BENCH_CONTROL=true;\nstatic final boolean TRACE=true;\n"
             f'static final String BUILD_ID="{"ab" * 32}";\nstatic final String ENGINE_SHA="{"cd" * 32}";\n'
-            f'static final String LAUNCHER="{LAUNCHER}";\nstatic final String MOD_VERSION="0.1.0";\n}}\n',
+            f'static final String LAUNCHER="{LAUNCHER}";\nstatic final String MOD_VERSION="0.1.1";\n}}\n',
         )
         source = "import android.app.Application;\npublic final class R extends  Application {}\n"
         self.assertIn("extends a.b.App {}", build.rewrite_superclass(source, "a.b.App"))
@@ -1260,7 +1260,7 @@ public class NativeGameActivity extends android.app.NativeActivity {
                       native_game_mode=False) -> bytes:
         out = options.build_dir / "out"
         self.assertEqual(manifest["formatVersion"], 1)
-        self.assertEqual(manifest["modVersion"], "0.1.0")
+        self.assertEqual(manifest["modVersion"], "0.1.1")
         self.assertEqual(manifest["buildId"], build.source_build_id(self.make_kit()))
         self.assertEqual((manifest["package"], manifest["versionCode"], manifest["versionName"]),
                          (PACKAGE, "63226194", "1.58.63226194"))
@@ -1288,7 +1288,7 @@ public class NativeGameActivity extends android.app.NativeActivity {
         with zipfile.ZipFile(out / "base.apk") as archive:
             names = set(archive.namelist())
             info = json.loads(archive.read(build.BUILD_INFO_ENTRY))
-            self.assertEqual(info, {"modVersion": "0.1.0", "buildId": manifest["buildId"], "package": PACKAGE,
+            self.assertEqual(info, {"modVersion": "0.1.1", "buildId": manifest["buildId"], "package": PACKAGE,
                                     "versionCode": "63226194", "engineSha256": manifest["engineSha256"]})
             for name in build.LICENSE_FILES:
                 self.assertIn(f"assets/licenses/{name}", names)

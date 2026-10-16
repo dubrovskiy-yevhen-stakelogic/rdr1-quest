@@ -17,7 +17,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$script:ModVersion = '0.1.0'
+$script:ModVersion = '0.1.1'
 $script:PackageName = 'com.rockstargames.rdr'
 $script:ExpectedVersionCode = '63226194'
 $script:ExpectedVersionName = '1.58.63226194'

@@ -1842,7 +1842,7 @@ void vrWeaponPoseComplete(const WeaponPoseCall& call,bool prepared) noexcept {
     p=vw::Pending{};
 }
 // weapWeapon::Aim (vector overload) of the VR-held firearm: a free target on the barrel line.
-bool vrWeaponAim(const WeaponAimCall& call,WeaponAimVector& point,std::uint64_t now) noexcept {
+bool vrWeaponAim(const WeaponAimCall& call,WeaponAimVector& point,std::uint64_t now,bool clearLaunch=true) noexcept {
     if(!vw::config.enabled||!vw::started.load(std::memory_order_relaxed))return false;
     try{
         const auto o=vw::ownerSnapshot();
@@ -1867,7 +1867,7 @@ bool vrWeaponAim(const WeaponAimCall& call,WeaponAimVector& point,std::uint64_t 
         const auto p=vw::aimPoint(origin,direction,vw::config.aimDistanceM,unitsPerMetre);
         for(float x:p)if(!std::isfinite(x))return no(vw::Place);
         point.x=p[0];point.y=p[1];point.z=p[2];point.padding=0;vw::accepted(vw::ChannelAim,now);
-        vrClearLaunch(o.weapon,vw::LaunchAim); // Launch from the VR muzzle, not the camera
+        if(clearLaunch)vrClearLaunch(o.weapon,vw::LaunchAim); // Launch from the VR muzzle, not the camera
         return true;
     }catch(...){return vw::decline(vw::ChannelAim,vw::Exception,now);}
 }
@@ -2568,6 +2568,74 @@ static void subtitlesApply() noexcept {
     else if(subtitleWeForced){subtitleWeForced=false;if(!on){subtitleSetEnabled(reinterpret_cast<void*>(hud),true);subtitleRestored.fetch_add(1,std::memory_order_relaxed);}}
 }
 std::string gameSubtitlesReport(){return "{\"forcedOff\":"+std::to_string(subtitleForcedOff.load())+",\"restored\":"+std::to_string(subtitleRestored.load())+"}";}
+#if defined(RDRVR_HEAD_CAMERA) && defined(RDRVR_NATIVE_MENUS)
+// The barrel-line point of the VR-held firearm for this player's reticle, on foot only (player+0x5d4 == 2, also right after a
+// dismount). Shares vrWeaponAim's ray and freshness gates; the launch state is left alone.
+static bool vrOnFootBarrelTarget(const LocalWeapon& owner,void* reticle,WeaponAimVector& point,std::uint64_t now) noexcept {
+    if(!weaponOwner.onOwnerThread()||!worldPresentationAllowed()||!controllerAimFirearm(owner.type.kind))return false;
+    WeaponContext context{};
+    if(!WeaponContextReader(weaponObservationApi).inspect(owner,context)||!vw::gates(context,owner.type.kind,vw::config,now).aim)return false;
+    std::uintptr_t currentReticle{};std::uint32_t mode{};const auto& api=weaponObservationApi;
+    if(!api.read(api.context,owner.actor+0xb8,&currentReticle,sizeof currentReticle)||!currentReticle||
+       currentReticle!=reinterpret_cast<std::uintptr_t>(reticle)||!api.read(api.context,owner.player+0x5d4,&mode,sizeof mode)||mode!=2)return false;
+    const auto cached=vw::ownerSnapshot();
+    if(cached.actor!=owner.actor||cached.item!=owner.item||cached.weapon!=owner.weapon||cached.actorGuid!=owner.actorGuid)return false;
+    WeaponAimCall call{};call.weapon=reinterpret_cast<void*>(owner.weapon);
+    return vrWeaponAim(call,point,now,false);
+}
+#endif
+// RETICLE TARGET (VrWeapon.h): right after tgtReticleComponent::Update, the barrel-line point replaces the camera-ray hit at
+// reticle +0x3810 / +0x3820, which aniAim::UpdateInternalStates copies to aniAim+0x390 for GunUpCheck.
+static void vrReticleTarget(void* reticle,std::uint64_t now) noexcept {
+#if defined(RDRVR_HEAD_CAMERA) && defined(RDRVR_NATIVE_MENUS)
+    if(!vw::config.reticleTarget||!reticle||!weaponObservationReady.load(std::memory_order_acquire))return;
+    try{
+        LocalWeapon owner{};if(!weaponOwner.inspect(owner)||!owner.player)return;
+        WeaponAimVector point{};
+        if(!vrOnFootBarrelTarget(owner,reticle,point,now)){vw::reticleTargetSkipped.fetch_add(1,std::memory_order_relaxed);return;}
+        const auto r=reinterpret_cast<std::uintptr_t>(reticle);float native[3]{};
+        const auto l=vw::latestPlacement();const float upm=l.placement.unitsPerMetre>0.f?l.placement.unitsPerMetre:1.f;
+        if(weaponObservationApi.read(weaponObservationApi.context,r+0x3810,native,sizeof native)&&l.weapon==owner.weapon){
+            const float dx=native[0]-l.placement.origin[0],dz=native[2]-l.placement.origin[2],m=std::sqrt(dx*dx+dz*dz)/upm;
+            if(std::isfinite(m)){vw::reticleNativeM.store(m,std::memory_order_relaxed);if(m<1.5f)vw::reticleTargetNear.fetch_add(1,std::memory_order_relaxed);}
+        }
+        const float v[3]{point.x,point.y,point.z};
+        vw::processWrite(r+0x3810,v,sizeof v);vw::processWrite(r+0x3820,v,sizeof v);
+        vw::reticleTargetSet.fetch_add(1,std::memory_order_relaxed);
+    }catch(...){vw::reticleTargetSkipped.fetch_add(1,std::memory_order_relaxed);}
+#else
+    (void)reticle;(void)now;
+#endif
+}
+// NATIVE RETICLE (VrWeapon.h): the mod's prevention bit is set on the player's sagPlayerStates while a VR-held firearm is in
+// hand and cleared again (only on the same, still current states object) once it is not.
+static void vrNativeReticle() noexcept {
+#if defined(RDRVR_HEAD_CAMERA) && defined(RDRVR_NATIVE_MENUS)
+    static std::uintptr_t appliedPlayer{},appliedStates{};
+    if(!weaponObservationReady.load(std::memory_order_acquire))return;
+    try{
+        const auto& api=weaponObservationApi;constexpr auto bit=vw::reticlePreventionBit;
+        LocalWeapon owner{};std::uintptr_t states{};bool want=false;
+        if(vw::config.hideReticle&&::rdrvr::vr::holsters::holdHand.load(std::memory_order_acquire)>=0&&weaponOwner.inspect(owner)&&owner.player&&
+           api.read(api.context,owner.player+0x410,&states,sizeof states)&&states&&states%8==0){
+            const auto o=vw::ownerSnapshot();want=o.weapon&&o.weapon==owner.weapon&&vw::firearm(o.kind);
+        }
+        if(appliedStates&&(!want||states!=appliedStates)){
+            std::uintptr_t current{};std::uint32_t mask{};
+            if(api.read(api.context,appliedPlayer+0x410,&current,sizeof current)&&current==appliedStates&&
+               api.read(api.context,appliedStates+0xc,&mask,sizeof mask)&&(mask&bit)){mask&=~bit;vw::processWrite(appliedStates+0xc,&mask,sizeof mask);}
+            appliedPlayer=appliedStates=0;
+        }
+        if(want){
+            std::uint32_t mask{};
+            if(api.read(api.context,states+0xc,&mask,sizeof mask)){
+                if(!(mask&bit)){mask|=bit;vw::processWrite(states+0xc,&mask,sizeof mask);}
+                appliedPlayer=owner.player;appliedStates=states;vw::reticleHiddenFrames.fetch_add(1,std::memory_order_relaxed);
+            }
+        }else vw::reticleShownFrames.fetch_add(1,std::memory_order_relaxed);
+    }catch(...){}
+#endif
+}
 void gameObserveReticle(void* reticle,std::uint64_t timestamp,std::uint64_t thread) noexcept {
     const int saved=errno;struct Restore{int saved;~Restore(){errno=saved;}} restore{saved};
 #ifdef RDRVR_NATIVE_MENUS
@@ -2577,6 +2645,8 @@ void gameObserveReticle(void* reticle,std::uint64_t timestamp,std::uint64_t thre
 #endif
     const auto ordinal=++reticleUpdates;
     try{subtitlesApply();}catch(...){}
+    vrReticleTarget(reticle,timestamp);
+    vrNativeReticle();
 
 #ifdef RDRVR_HEAD_CAMERA
     try{

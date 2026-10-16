@@ -1,6 +1,6 @@
 # Red Dead Redemption VR for Quest
 
-Version `0.1.0 alpha`. Source code and build tools for the Quest VR mod.
+Version `0.1.1 alpha`. Source code and build tools for the Quest VR mod.
 
 An unofficial VR mod for the Android version of Red Dead Redemption. It runs
 standalone on Meta Quest 3 and Quest 3S, without a PC or Quest Link.

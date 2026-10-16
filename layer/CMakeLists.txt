@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(rdrvr_worker_layer VERSION 0.1.0 LANGUAGES CXX)
+project(rdrvr_worker_layer VERSION 0.1.1 LANGUAGES CXX)
 if(NOT ANDROID OR NOT ANDROID_ABI STREQUAL "arm64-v8a")
   message(FATAL_ERROR "Configure with the NDK r27c toolchain file and ANDROID_ABI=arm64-v8a. Use BUILD_AND_INSTALL to build the complete package.")
 endif()

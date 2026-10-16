@@ -5,8 +5,8 @@ set -euo pipefail
 umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-MOD_VERSION="0.1.0"
-USER_AGENT="RDRVR-SourceKit/0.1.0"
+MOD_VERSION="0.1.1"
+USER_AGENT="RDRVR-SourceKit/0.1.1"
 PACKAGE_NAME="com.rockstargames.rdr"
 EXPECTED_VERSION_CODE="63226194"
 EXPECTED_VERSION_NAME="1.58.63226194"
