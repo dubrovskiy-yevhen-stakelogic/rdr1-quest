@@ -735,8 +735,10 @@ def check_game_data(package):
     present = set().union(*(apk.entries for apk in package.apks))
     missing = [name for name in DATA_FILES if name not in present]
     if missing:
-        raise KitError("the game data is incomplete; launch the game on the phone once, let it finish "
-                       "downloading, then export the complete game again. A second edition is not required.",
+        raise KitError("the game data is incomplete. The FULL game is required, including all world and audio files. "
+                       "Open the game on your phone, wait for ALL additional data to download, and check that you can enter the game world. "
+                       "Then export the complete game again with EXPORT_RDR_APKS.bat. "
+                       "Do not rely on the Quest to download missing files. A second edition is not required.",
                        "\n".join(missing))
 
 

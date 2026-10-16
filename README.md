@@ -26,8 +26,11 @@ same file again whenever a new version is out: your exported game, the
 personal signing key and build caches are kept; only the mod's own files are
 replaced.
 
-1. Export the game from the phone with `EXPORT_RDR_APKS.bat`. Keep the whole
-   export folder: `base.apk`, every `split_*.apk` and the `external` folder.
+1. **Download the full game on your phone first.** Open it, wait for all
+   additional data to download, and check that you can enter the game world.
+   Then export it with `EXPORT_RDR_APKS.bat`. Keep the whole export folder:
+   `base.apk`, every `split_*.apk` and the `external` folder. A small APK or
+   incomplete XAPK is not enough; do not rely on the Quest to download missing data.
 2. Run `BUILD_AND_INSTALL.bat` on Windows or `bash BUILD_AND_INSTALL.sh` on
    Linux/macOS.
 3. Select the export folder.

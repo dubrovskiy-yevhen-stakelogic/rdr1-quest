@@ -1734,6 +1734,9 @@ function Invoke-Main {
 
     Write-Host "Red Dead Redemption VR $($script:ModVersion) - personal Quest builder" -ForegroundColor Green
     Write-Host "This tool needs your own Red Dead Redemption $($script:ExpectedVersionName) for Android, exported from your phone with EXPORT_RDR_APKS.bat."
+    Write-Host 'FULL GAME REQUIRED: a small APK or an incomplete XAPK is not enough.' -ForegroundColor Yellow
+    Write-Host 'On your phone, open the game, let it download ALL additional data, and check that you can enter the game world. Then export the complete game with EXPORT_RDR_APKS.bat.'
+    Write-Host 'The Quest installer needs all game data in the selected input; do not rely on the Quest to download missing files.'
     Write-Host 'It does not download or redistribute game APKs or game data.'
     Write-Host "Work directory: $resolvedWorkDir"
     Write-Host "Log: $resolvedLogPath"
@@ -1783,7 +1786,7 @@ function Invoke-Main {
             $resolvedGamePackage = Find-PreviousGameInput -WorkRoot $resolvedWorkDir -Cache $cache
         }
         $resolvedGamePackage = Resolve-RequiredInputPath -Value $resolvedGamePackage -Name 'GamePackage' `
-            -Prompt 'Select the game exported by EXPORT_RDR_APKS.bat: the RDR-export folder with base.apk and the split_*.apk files, or a single APK' `
+            -Prompt 'Select the FULL game after all data has downloaded on your phone: the complete RDR-export folder or a complete APK/XAPK archive' `
             -Filter 'Game APK or archive (*.apk;*.apks;*.zip;*.xapk)|*.apk;*.apks;*.zip;*.xapk|All files (*.*)|*.*' `
             -StartFolder $resolvedWorkDir
         Write-Host "Game input: $resolvedGamePackage"
