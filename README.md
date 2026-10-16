@@ -173,6 +173,10 @@ choose a different input, or add `-Rebuild` to force a fresh build.
   VR settings after confirmation. Saved games are not touched.
 - `COLLECT_REPORT.bat` collects a diagnostic report from the headset into the
   work folder. Nothing is uploaded.
+  While the game is running it requests a fresh diagnostic snapshot, including
+  with the FPS counter off. It does not change settings or start/stop the game.
+  `summary.txt` states whether that snapshot was confirmed; if not, the saved
+  JSON can contain only startup state and is not evidence of gameplay counters.
   If a weapon stops firing, try the trigger several times and collect the report
   while the game is still running, before restarting it. Include the weapon name
   and whether the problem began after holstering, dropping or changing weapons.

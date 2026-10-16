@@ -313,11 +313,46 @@ function Get-ReportField {
     return 'n/a'
 }
 
+function Request-TraceSnapshot {
+    param([string]$ExpectedPid)
+    $token = [Guid]::NewGuid().ToString('N')
+    $local = Join-Path $script:BundleRoot 'snapshot-request.tmp'
+    $remote = "$($script:RemoteSettingsRoot)/bench-trace-snapshot"
+    $staging = "$remote.$token.tmp"
+    try {
+        Write-Utf8 -Path $local -Text $token
+        $push = Invoke-Adb -Arguments @('push', $local, $staging) -TimeoutSeconds 10
+        if ($push.ExitCode -ne 0) { throw 'Could not send the diagnostic request.' }
+        # Use the device clock, then publish atomically: the loader rejects stale requests.
+        $publish = Invoke-Adb -Arguments @('shell', "touch $staging && mv $staging $remote") -TimeoutSeconds 5
+        if ($publish.ExitCode -ne 0) { throw 'Could not publish the diagnostic request.' }
+        for ($attempt = 0; $attempt -lt 8; $attempt++) {
+            Start-Sleep -Milliseconds 1000
+            $result = Invoke-Adb -Arguments @('shell', 'cat', "$($script:RemoteSettingsRoot)/vulkan-trace.json") -TimeoutSeconds 5
+            if ($result.ExitCode -eq 0 -and
+                (Get-ReportField -Json $result.Text -Path 'snapshotToken') -ceq $token -and
+                (Get-ReportField -Json $result.Text -Path 'reportPid') -eq $ExpectedPid) {
+                return $result.Text
+            }
+        }
+        throw 'No matching live snapshot arrived. Keep the game running and the headset awake, then collect again.'
+    }
+    catch { $script:Warnings.Add("Fresh gameplay snapshot unavailable: $($_.Exception.Message)"); return $null }
+    finally {
+        if (Test-Path -LiteralPath $local) { Remove-Item -LiteralPath $local -Force }
+        # Remove only our staging file. The loader consumes/expires the published token.
+        try { $null = Invoke-Adb -Arguments @('shell', 'rm', '-f', $staging) -TimeoutSeconds 5 }
+        catch { $script:Warnings.Add('Could not clean up the temporary diagnostic request.') }
+    }
+}
+
+if ($MyInvocation.InvocationName -eq '.') { return }
+
 try {
     $resolvedWorkDir = [System.IO.Path]::GetFullPath($WorkDir.Trim().Trim('"').Trim("'"))
     $driveRoot = [System.IO.Path]::GetPathRoot($resolvedWorkDir)
     if ($resolvedWorkDir.TrimEnd('\') -eq $driveRoot.TrimEnd('\')) { throw 'WorkDir must be a dedicated folder, not a drive root.' }
-    Write-Host 'Red Dead Redemption VR report collector. Read-only: nothing on the headset is changed, nothing is uploaded.' -ForegroundColor Cyan
+    Write-Host 'Red Dead Redemption VR report collector. Requests a diagnostic snapshot; settings are unchanged and nothing is uploaded.' -ForegroundColor Cyan
     $script:AdbExe = Resolve-Adb -ResolvedWorkDir $resolvedWorkDir
     Write-Host "ADB: $($script:AdbExe)"
     $identity = Select-Quest
@@ -352,9 +387,13 @@ try {
     $debugCount = @($debugProperties.Lines | Where-Object { $_ -match '^\[debug\.rdrvr\.' }).Count
     $pidResult = Invoke-Adb -Arguments @('shell', 'pidof', $script:PackageName)
     $running = $pidResult.ExitCode -eq 0 -and $pidResult.Text -match '\d'
+    $freshTrace = $null
     if ($running) {
+        Write-Host 'Requesting current gameplay diagnostics (keep the game running)...'
+        $freshTrace = Request-TraceSnapshot -ExpectedPid ([regex]::Match($pidResult.Text, '\d+').Value)
         $null = Save-Capture -Name 'memory.txt' -Arguments @('shell', 'dumpsys', 'meminfo', $script:PackageName)
     }
+    else { $script:Warnings.Add('The game was not running. Saved reports may contain only startup state; reproduce the issue and collect before closing the game.') }
 
     $copied = New-Object 'System.Collections.Generic.List[object]'
     $missing = New-Object 'System.Collections.Generic.List[string]'
@@ -375,7 +414,11 @@ try {
         Write-Host "Copying $relative ..."
         $destination = Join-Path $filesRoot ($relative.Replace('/', '\'))
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
-        $pull = Invoke-Adb -Arguments @('pull', $remote, $destination) -TimeoutSeconds 120
+        if ($relative -eq 'vulkan-trace.json' -and -not [string]::IsNullOrWhiteSpace($freshTrace)) {
+            Write-Utf8 -Path $destination -Text $freshTrace
+            $pull = [pscustomobject]@{ ExitCode = 0 }
+        }
+        else { $pull = Invoke-Adb -Arguments @('pull', $remote, $destination) -TimeoutSeconds 120 }
         if ($pull.ExitCode -eq 0 -and (Test-Path -LiteralPath $destination -PathType Leaf)) {
             $copied.Add([pscustomobject]@{
                 path = "files/$relative"
@@ -414,6 +457,7 @@ try {
     $summary.Add("Game versionName: $(if ($versionName.Success) { $versionName.Groups[1].Value } else { 'unknown' })")
     $summary.Add("Game versionCode: $(if ($versionCode.Success) { $versionCode.Groups[1].Value } else { 'unknown' })")
     $summary.Add("Game running during collection: $running")
+    $summary.Add("Fresh gameplay snapshot confirmed: $(-not [string]::IsNullOrWhiteSpace($freshTrace))")
     $summary.Add('')
     if ($traceText.Length -gt 0) {
         $summary.Add('Report fields (vulkan-trace.json):')
@@ -447,6 +491,7 @@ try {
         package = $script:PackageName
         headset = $identity
         gameRunning = [bool]$running
+        freshGameplaySnapshot = -not [string]::IsNullOrWhiteSpace($freshTrace)
         files = @($copied.ToArray())
         missingFiles = @($missing.ToArray())
         warnings = @($script:Warnings.ToArray())

@@ -17,6 +17,7 @@ echo.
 echo This copies the mod report files, the VR settings and filtered
 echo system logs from the headset into the reports folder of the work
 echo directory and packs them into a ZIP file.
+echo Keep the game running: the collector requests a fresh diagnostic snapshot.
 echo Nothing is uploaded and the game is not started.
 echo.
 
