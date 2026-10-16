@@ -185,6 +185,10 @@ choose a different input, or add `-Rebuild` to force a fresh build.
   New builds record shot attempts and holster events as `RdrVrFire` in the log,
   with the last 64 events also saved in `vr.weapon.diagnostics` in the JSON report.
   The report ZIP includes a separate `fire-diagnostics.txt` with these log lines.
+  `NATIVE_PAD` events and `gameBootstrap.nativeInput.delivery` record trigger delivery
+  after the native input update: requested/submitted RT, selected controller,
+  native held/pressed buttons, and rejected filters. `ROUTED` alone only confirms
+  that the VR weapon filter forwarded the press, not that the game consumed it.
   Input blocks have an explicit reason; `NO_ENGINE_FIRE` only means no projectile
   was observed within 700 ms. Its context hint is not a confirmed engine cause.
 

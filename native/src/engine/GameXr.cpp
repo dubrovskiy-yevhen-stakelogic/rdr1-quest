@@ -4501,7 +4501,9 @@ std::string gameXrReport() {
        <<",\"declined\":"<<poseGeometryDeclined<<",\"animated\":"<<poseGeometryAnimated<<",\"sampleNs\":"<<poseGeometrySampleNs
        <<",\"localOffsetDelta\":"<<poseGeometryLast.offsetDistance<<",\"localRotationDeltaDegrees\":"<<poseGeometryLast.rotationDegrees<<",\"weaponInjection\":false}";}
     out<<",\"nativeInput\":{\"state\":\""<<nativePad.status()<<"\",\"updates\":"<<nativePad.updates()
-       <<",\"neutralUpdates\":"<<nativePad.neutralUpdates()<<",\"created\":"<<nativePad.created()<<"}";
+       <<",\"neutralUpdates\":"<<nativePad.neutralUpdates()<<",\"created\":"<<nativePad.created()
+       <<",\"filterRejected\":"<<nativePad.filterRejected()<<",\"controlsRejected\":"<<nativePad.controlsRejected()
+       <<",\"delivery\":"<<nativePad.deliveryReport()<<"}";
     out<<",\"haptics\":{\"source\":\"native-actuator-pair\",\"published\":"<<haptics.published()
        <<",\"rejected\":"<<haptics.rejected()<<",\"declined\":"<<hapticDeclined<<",\"applied\":"<<hapticApplied
        <<",\"stopped\":"<<hapticStopped<<",\"failed\":"<<hapticFailed<<",\"maxAgeNs\":"<<runtime::HapticMailbox::maxAgeNs

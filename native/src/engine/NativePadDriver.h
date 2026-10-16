@@ -1,5 +1,6 @@
 #pragma once
 #include "NativePadEvents.h"
+#include "NativePadDiagnostics.h"
 #include <atomic>
 #include <thread>
 
@@ -46,6 +47,25 @@ private:
     std::atomic<std::uint64_t> updates_{},neutral_{},created_{};
     inline static thread_local const NativePadDriver* outputDriver_{};
     runtime::ControllerSample outputInput_{};std::uint64_t outputNs_{};
+    NativePadDiagnostics diagnostics_;
+    NativePadDiagnostics::Event delivery_{};
+    void traceDelivery() noexcept {
+        try{
+            auto e=delivery_;e.status=status();e.filterRejected=filterRejected();e.controlsRejected=controlsRejected();
+            if(!diagnostics_.wanted(e))return;
+            if(api_&&pad_&&system_&&api_.getSystem()==system_&&table(system_,api_.systemVtable)&&registeredPad()){
+                e.selected=api_.getPad(system_,0)==pad_;
+                const auto p=reinterpret_cast<std::uintptr_t>(pad_);
+                std::array<unsigned char,2> raw{},held{},pressed{};unsigned char connected{};
+                if(api_.read(nullptr,p+0x360,raw.data(),2)&&api_.read(nullptr,p+0x4c,held.data(),2)&&
+                   api_.read(nullptr,p+0xfd,pressed.data(),2)&&api_.read(nullptr,p+0x300,&connected,1)){
+                    e.readable=true;e.rawLt=raw[0];e.rawRt=raw[1];e.heldLt=held[0];e.heldRt=held[1];
+                    e.pressedLt=pressed[0];e.pressedRt=pressed[1];e.connected=connected;
+                }
+            }
+            diagnostics_.record(e);
+        }catch(...){/* Observations cannot interrupt native input. */}
+    }
     bool table(const void* object,std::uintptr_t expected)const {
         std::uintptr_t found{};return object&&api_.read(nullptr,reinterpret_cast<std::uintptr_t>(object),&found,sizeof(found))&&found==expected;
     }
@@ -77,6 +97,7 @@ public:
     std::uint64_t updates()const{return updates_.load();}
     std::uint64_t neutralUpdates()const{return neutral_.load();}
     std::uint64_t created()const{return created_.load();}
+    std::string deliveryReport()const{return diagnostics_.report();}
     // Called on the same native input thread after a menu/world transition.
     void rearm() noexcept {policy_.invalidate();if(outputDriver_==this)outputDriver_=nullptr;}
     // Output is accepted only on the native thread that most recently supplied
@@ -99,6 +120,7 @@ public:
         struct Restore {int value;~Restore(){errno=value;}} restore{saved};
         if(outputDriver_==this)outputDriver_=nullptr;
         routePending_=false;
+        delivery_={};delivery_.ns=now;
         try{
             if(!api_){status_="NOT_CONFIGURED";return;}
             if(system!=api_.getSystem()){status_="INPUT_SYSTEM_MISMATCH";return;}
@@ -115,6 +137,7 @@ public:
                 if(current){api_.setOverride(system_,nullptr);if(!overrideSlot(current)||current){status_="PAD_OVERRIDE_CLEAR_FAILED";return;}}
             }
             runtime::ControllerSample sample{};const bool available=mailbox_.snapshot(now,sample);
+            if(available){delivery_.physicalLt=sample.triggers[0];delivery_.physicalRt=sample.triggers[1];}
             auto state=policy_.sample(available?&sample:nullptr);
             auto* info=api_.getInfo(system,deviceId);
             if(pad_){
@@ -171,9 +194,13 @@ public:
                 auto filtered=state;
                 try{
                     filter_(filterContext_,state.ready&&available?&sample:nullptr,now,filtered);
+                    delivery_.requestedRt=std::isfinite(filtered.triggers[1])?filtered.triggers[1]:-1.f;
+                    delivery_.requestedBit=(filtered.buttons&runtime::PadRightTrigger)!=0;
                     if(saneFilterOutput(state,filtered))state=filtered;else ++filterRejected_;
                 }catch(...){++filterRejected_;}
             }
+            else{delivery_.requestedRt=state.triggers[1];delivery_.requestedBit=(state.buttons&runtime::PadRightTrigger)!=0;}
+            delivery_.ready=state.ready;delivery_.submittedRt=state.triggers[1];delivery_.submittedBit=(state.buttons&runtime::PadRightTrigger)!=0;
             if(!submitPadEvents(api_.events,pad_,deviceId,state)){
                 // Best-effort release uses the same checked owning object.
                 submitPadEvents(api_.events,pad_,deviceId,{});failed_=true;policy_.invalidate();status_="PAD_EVENTS_FAILED";return;
@@ -190,6 +217,7 @@ public:
     }
     void afterUpdate(void* system,std::uint64_t) noexcept {
         const int saved=errno;struct Restore{int n;~Restore(){errno=n;}} restore{saved};
+        struct Trace{NativePadDriver* self;~Trace(){self->traceDelivery();}} trace{this};
         if(!routePending_)return;routePending_=false;
         try{
             void* current{},*touchOverride{};
