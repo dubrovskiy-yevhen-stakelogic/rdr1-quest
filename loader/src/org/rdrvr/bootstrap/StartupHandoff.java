@@ -14,7 +14,7 @@ final class StartupHandoff {
     private static ViewTreeObserver.OnWindowFocusChangeListener listener;
     static void created(Activity a) {
         String name=a.getClass().getName();
-        if(a instanceof PreflightActivity || name.equals(BuildConfig.LAUNCHER))
+        if(a instanceof PreflightActivity || (name.equals(BuildConfig.LAUNCHER) && !name.equals(GAME)))
             pending.add(new WeakReference<>(a));
     }
     private static void finishStartup() {

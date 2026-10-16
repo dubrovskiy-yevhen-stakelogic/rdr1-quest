@@ -8,7 +8,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-# Google Play and Netflix Games install the same game build; either one can be exported.
+# Both package names can be exported. The builder identifies the engine by its hash.
 $script:KnownPackages = @(
     [pscustomobject]@{ Name = 'com.rockstargames.rdr'; Label = 'Google Play (Rockstar)' },
     [pscustomobject]@{ Name = 'com.netflix.NGP.Kamo'; Label = 'Netflix Games' }
@@ -198,7 +198,7 @@ function Select-SourceDevice {
             for ($index = 0; $index -lt $ready.Count; $index++) {
                 Write-Host "  [$($index + 1)] $($ready[$index].Serial) $($ready[$index].Detail)"
             }
-            $answer = Read-Host 'Choose the phone/tablet containing the Google Play game'
+            $answer = Read-Host 'Choose the phone/tablet containing the game'
             [int]$number = 0
             if (-not [int]::TryParse($answer, [ref]$number) -or
                 $number -lt 1 -or $number -gt $ready.Count) {

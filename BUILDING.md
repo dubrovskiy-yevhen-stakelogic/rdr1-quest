@@ -53,7 +53,7 @@ Omit `--build-only` for installation. Work files are stored under
 
 | Windows | Linux/macOS | Meaning |
 | --- | --- | --- |
-| `-GamePackage` | `--game-package` | export folder, `base.apk`, single APK or `.apks` |
+| `-GamePackage` | `--game-package` | export folder, `base.apk`, single APK, `.apks`, `.zip` or `.xapk` |
 | `-WorkDir` | `--work-dir` | tools, downloads, builds, logs and backups |
 | `-AndroidSdk`, `-JavaHome` | `--android-sdk`, `--java-home` | use an existing SDK or JDK 21 |
 | `-Keystore` | `--keystore` | use another personal signing key |
@@ -73,9 +73,17 @@ script accepts `-Off` (`--off`), `-Status` (`--status`) and `-Serial`
 
 The game input is the folder written by `EXPORT_RDR_APKS.bat` (`base.apk` and
 its `split_*.apk` files), a `base.apk` next to its splits, a single APK, or an
-`.apks` archive. The package must be `com.rockstargames.rdr` version
-`1.58.63226194` (`63226194`), and `lib/arm64-v8a/librdr.so` must match the
-supported engine. Packages modified by third parties are refused.
+`.apks`, `.zip` or `.xapk` archive. The package can be `com.rockstargames.rdr`
+or `com.netflix.NGP.Kamo`, version `1.58.63226194` (`63226194`). The SHA-256
+of `lib/arm64-v8a/librdr.so` selects engine variant 1 or 2 independently of
+the package name. Unknown engines are refused with their hash and a request
+to contact the author. The original engine is retained. Packages modified by
+third parties and incomplete game data are refused.
+
+Variant 2 uses the checked source profile in `tools/engine-profiles/variant-2.json`.
+It is applied to a private copy under the build directory; source and result
+hashes prevent silently applying stale edits after a shared source change.
+Maintainers must revalidate and regenerate the profile when those sources change.
 
 Keep the signing key at `%LOCALAPPDATA%\RDRVRBuilder\signing` on Windows, or
 `$XDG_DATA_HOME/rdrvr-builder/signing` (`~/.local/share/rdrvr-builder/signing`

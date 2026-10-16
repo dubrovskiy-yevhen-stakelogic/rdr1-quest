@@ -7,7 +7,7 @@ standalone on Meta Quest 3 and Quest 3S, without a PC or Quest Link.
 
 ## Requirements
 
-- Red Dead Redemption for Android from Google Play, version `1.58.63226194`
+- Red Dead Redemption for Android, version `1.58.63226194`
   (arm64), exported from an Android phone or tablet with `EXPORT_RDR_APKS.bat`.
 - Meta Quest 3 or Quest 3S with Developer Mode enabled and a USB-C data cable.
 - Windows 10/11, Linux x86_64 or macOS, an internet connection for the build
@@ -38,6 +38,20 @@ The installer downloads and verifies every build tool, builds the mod from
 these sources, signs the APK set with a personal key and installs it. The game
 is left stopped. Start it from **Library > Unknown sources > RDR** while wearing
 the headset in a well-lit room.
+
+The installer supports two engine variants and identifies them by the SHA-256
+of `librdr.so`, independently of the Rockstar/Netflix package name. Variant 2
+has been tested in VR, including gameplay, but has had less testing; some
+features may behave differently. The installer shows the detected variant and
+engine ID. An unknown variant is stopped with a request to report the ID to the
+author; the installer never applies another variant's hooks or replaces the
+game engine.
+
+Use one complete export of your game. APK, APKS, ZIP and XAPK inputs are
+accepted. Some XAPKs contain the engine and initial data but omit the world and
+audio packs. If the installer reports missing resources, let that same game
+finish downloading on the phone and export it again. A second edition is not
+required, and the installer does not supply game files.
 
 Keep the personal signing key (see [BUILDING.md](BUILDING.md)). Updates must be
 signed with the same key; otherwise Android requires uninstalling the game,

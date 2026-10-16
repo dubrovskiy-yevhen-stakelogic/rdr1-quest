@@ -10,7 +10,6 @@ USER_AGENT="RDRVR-SourceKit/0.1.1"
 PACKAGE_NAME="com.rockstargames.rdr"
 EXPECTED_VERSION_CODE="63226194"
 EXPECTED_VERSION_NAME="1.58.63226194"
-EXPECTED_ENGINE_SHA256="3F80845EDEC32A663C42A8570E3131446813E695076C4BC96E2142C190BC22F3"
 THIRD_PARTY_SIGNER="358020B0ED9D910C3EB4E03E261EB340604833F8BDC75E236D965E80E63A56DE"
 REMOTE_DATA_ROOT="/sdcard/Android/data/$PACKAGE_NAME"
 REMOTE_FILES_ROOT="$REMOTE_DATA_ROOT/files"
@@ -522,14 +521,25 @@ root = pathlib.Path(sys.argv[1]).resolve()
 data = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 trade, mod_version, plan = int(sys.argv[3]), sys.argv[4], pathlib.Path(sys.argv[5])
 expected = {
-    "formatVersion": 1, "modVersion": mod_version, "package": "com.rockstargames.rdr",
+    "formatVersion": 1, "modVersion": mod_version,
     "versionCode": "63226194", "versionName": "1.58.63226194",
 }
 for key, value in expected.items():
     if str(data.get(key)) != str(value):
         raise SystemExit(f"build manifest field {key!r} is unexpected: {data.get(key)!r}")
-if str(data.get("engineSha256", "")).lower() != "3f80845edec32a663c42a8570e3131446813e695076c4bc96e2142c190bc22f3":
-    raise SystemExit("build manifest engine hash is not the supported librdr.so")
+if data.get("package") not in ("com.rockstargames.rdr", "com.netflix.NGP.Kamo"):
+    raise SystemExit("build manifest package is unsupported")
+profiles = {"3f80845edec32a663c42a8570e3131446813e695076c4bc96e2142c190bc22f3": "variant-1",
+            "0f288e2f9255d04277190bb5ffca742ec395d33a47fb305ddb22b9f0e904ef72": "variant-2"}
+engine_hash = str(data.get("engineSha256", "")).lower()
+if engine_hash not in profiles:
+    raise SystemExit("This engine variant is not supported yet. Please report it to the author. Engine SHA-256: " + engine_hash)
+variant = profiles[engine_hash]
+if data.get("engineVariant", variant) != variant:
+    raise SystemExit("build manifest engine variant does not match its hash")
+print(f"Target package: {data['package']}; engine: {variant}", file=sys.stderr)
+if variant == "variant-2":
+    print("Engine variant 2 has less testing. Some features may behave differently. Report issues to the author with the engine ID.", file=sys.stderr)
 if data.get("trade") is None or int(data["trade"]) != trade:
     raise SystemExit(f"build manifest trade value {data.get('trade')!r} does not match --trade {trade}")
 if not re.fullmatch(r"[0-9a-fA-F]{64}", str(data.get("buildId", ""))):
@@ -578,10 +588,13 @@ ordered = bases + sorted((r for r in outputs if r.get("split") is not None), key
 (plan / "expected-apks.tsv").write_text("".join(
     ("base.apk" if r.get("split") is None else "split_" + re.sub(r"[^A-Za-z0-9_.-]+", "_", str(r["split"])) + ".apk")
     + "\t" + str(r["sha256"]).lower() + "\n" for r in outputs), encoding="utf-8", newline="\n")
-print(total, int(code, 16))
+print(total, int(code, 16), data["package"])
 PY
 )" || die "build verification failed"
-  read -r APK_BYTES SIGNER_HASH_DEC <<< "$summary"
+  read -r APK_BYTES SIGNER_HASH_DEC PACKAGE_NAME <<< "$summary"
+  REMOTE_DATA_ROOT="/sdcard/Android/data/$PACKAGE_NAME"
+  REMOTE_FILES_ROOT="$REMOTE_DATA_ROOT/files"
+  REMOTE_OBB_ROOT="/sdcard/Android/obb/$PACKAGE_NAME"
   echo "Verified build manifest: $manifest"
 }
 
@@ -830,7 +843,9 @@ verify_remote_tree() {
 }
 
 assert_safe_generated_path() {
-  [[ "$1" =~ ^/sdcard/(\.rdrvr-stage-[a-f0-9]{32}(/[A-Za-z0-9_.-]+)?|Android/obb/\.rdrvr-backup-[a-f0-9]{32}|Android/data/com\.rockstargames\.rdr/files/\.rdrvr-backup-[a-f0-9]{32})$ ]] ||
+  local package_pattern="${PACKAGE_NAME//./\\.}"
+  local pattern="^/sdcard/(\\.rdrvr-stage-[a-f0-9]{32}(/[A-Za-z0-9_.-]+)?|Android/obb/\\.rdrvr-backup-[a-f0-9]{32}|Android/data/$package_pattern/files/\\.rdrvr-backup-[a-f0-9]{32})$"
+  [[ "$1" =~ $pattern ]] ||
     die "refusing unsafe generated remote path: $1"
 }
 
@@ -965,7 +980,7 @@ top = [line for line in (root / "top-level.txt").read_text(encoding="utf-8").spl
                                        encoding="utf-8", newline="\n")
 excluded = [".rdrvr-stage-*", ".rdrvr-backup-*"] + (["assetpacks"] if skip else [])
 (root / "backup-manifest.json").write_text(json.dumps({
-    "formatVersion": 1, "package": "com.rockstargames.rdr", "remoteRoot": remote_root,
+    "formatVersion": 1, "package": remote_root.split("/")[4], "remoteRoot": remote_root,
     "excluded": excluded, "topLevelItems": top, "files": items}, indent=2) + "\n", encoding="utf-8", newline="\n")
 PY
   while IFS=$'\t' read -r relative expected; do

@@ -68,7 +68,7 @@ function Find-PreviousGameInput {
         if ((Test-Path -LiteralPath $manifest -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $input 'base.apk') -PathType Leaf)) {
             try {
                 $m = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
-                if ($m.package -eq $script:PackageName -and $m.versionCode -eq $script:ExpectedVersionCode -and
+                if ($m.package -cin @('com.rockstargames.rdr', 'com.netflix.NGP.Kamo') -and $m.versionCode -eq $script:ExpectedVersionCode -and
                     @($m.external.obb).Count -eq 0 -and @($m.external.assetpacks).Count -eq 0) { return $input }
             }
             catch { continue }

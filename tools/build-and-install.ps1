@@ -21,7 +21,6 @@ $script:ModVersion = '0.1.1'
 $script:PackageName = 'com.rockstargames.rdr'
 $script:ExpectedVersionCode = '63226194'
 $script:ExpectedVersionName = '1.58.63226194'
-$script:ExpectedEngineSha256 = '3F80845EDEC32A663C42A8570E3131446813E695076C4BC96E2142C190BC22F3'
 $script:ExpectedOpenXrLoader = '713E3BB8D955254C670ACC1C4899A65CB8C930E97DD9958BF37EA922D72B7A06'
 $script:ThirdPartySigner = '358020B0ED9D910C3EB4E03E261EB340604833F8BDC75E236D965E80E63A56DE'
 $script:VulkanHeadersRootName = 'Vulkan-Headers-vulkan-sdk-1.4.357.0'
@@ -940,7 +939,6 @@ function Assert-BuildArtifacts {
     $expected = [ordered]@{
         formatVersion = '1'
         modVersion = $script:ModVersion
-        package = $script:PackageName
         versionCode = $script:ExpectedVersionCode
         versionName = $script:ExpectedVersionName
     }
@@ -949,8 +947,21 @@ function Assert-BuildArtifacts {
             throw "Build manifest field '$key' is unexpected: $(Get-JsonProperty $manifest $key)"
         }
     }
-    if ([string](Get-JsonProperty $manifest 'engineSha256') -ne $script:ExpectedEngineSha256) {
-        throw 'Build manifest engine hash is not the supported librdr.so.'
+    $targetPackage = [string](Get-JsonProperty $manifest 'package')
+    if ($targetPackage -cnotin @('com.rockstargames.rdr', 'com.netflix.NGP.Kamo')) {
+        throw 'Build manifest has an unsupported package.'
+    }
+    $engineProfiles = @{
+        '3f80845edec32a663c42a8570e3131446813e695076c4bc96e2142c190bc22f3' = 'variant-1'
+        '0f288e2f9255d04277190bb5ffca742ec395d33a47fb305ddb22b9f0e904ef72' = 'variant-2'
+    }
+    $engineHash = [string](Get-JsonProperty $manifest 'engineSha256')
+    if (-not $engineProfiles.ContainsKey($engineHash)) {
+        throw "This engine variant is not supported yet. Please report it to the author. Engine SHA-256: $engineHash"
+    }
+    $variant = [string](Get-JsonProperty $manifest 'engineVariant')
+    if ($variant -and $variant -ne $engineProfiles[$engineHash]) {
+        throw 'Build manifest engine variant does not match its engine hash.'
     }
     $manifestTrade = Get-JsonProperty $manifest 'trade'
     if ($null -eq $manifestTrade -or [int]$manifestTrade -ne $Trade) {
@@ -989,6 +1000,14 @@ function Assert-BuildArtifacts {
     }
     $ordered = @($bases[0]) + @($outputs | Where-Object { $null -ne (Get-JsonProperty $_ 'split') } | Sort-Object -Property file)
     $apkPaths = @($ordered | ForEach-Object { Resolve-ManifestFile -Root $outputRoot -RelativePath ([string]$_.file) })
+    $script:PackageName = $targetPackage
+    $script:RemoteDataRoot = "/sdcard/Android/data/$targetPackage"
+    $script:RemoteFilesRoot = "$($script:RemoteDataRoot)/files"
+    $script:RemoteObbRoot = "/sdcard/Android/obb/$targetPackage"
+    Write-Host "Target package: $targetPackage; engine: $($engineProfiles[$engineHash])"
+    if ($engineProfiles[$engineHash] -eq 'variant-2') {
+        Write-Host 'Engine variant 2 has less testing. Some features may behave differently. Report issues to the author with the engine ID.' -ForegroundColor Yellow
+    }
     return [pscustomobject]@{
         Manifest = $manifest
         ManifestPath = $manifestPath
@@ -1337,7 +1356,7 @@ function Test-RemotePath {
 function Assert-SafeGeneratedRemotePath {
     param([Parameter(Mandatory = $true)][string]$RemotePath)
     if ($RemotePath -match "['`r`n]" -or
-        $RemotePath -notmatch '^/sdcard/(\.rdrvr-stage-[a-f0-9]{32}(/[A-Za-z0-9_.-]+)?|Android/obb/\.rdrvr-backup-[a-f0-9]{32}|Android/data/com\.rockstargames\.rdr/files/\.rdrvr-backup-[a-f0-9]{32})$') {
+        $RemotePath -notmatch ('^/sdcard/(\.rdrvr-stage-[a-f0-9]{32}(/[A-Za-z0-9_.-]+)?|Android/obb/\.rdrvr-backup-[a-f0-9]{32}|Android/data/' + [regex]::Escape($script:PackageName) + '/files/\.rdrvr-backup-[a-f0-9]{32})$')) {
         throw "Refusing unsafe generated remote path: $RemotePath"
     }
 }
@@ -1765,7 +1784,7 @@ function Invoke-Main {
         }
         $resolvedGamePackage = Resolve-RequiredInputPath -Value $resolvedGamePackage -Name 'GamePackage' `
             -Prompt 'Select the game exported by EXPORT_RDR_APKS.bat: the RDR-export folder with base.apk and the split_*.apk files, or a single APK' `
-            -Filter 'Game APK or archive (*.apk;*.apks;*.zip)|*.apk;*.apks;*.zip|All files (*.*)|*.*' `
+            -Filter 'Game APK or archive (*.apk;*.apks;*.zip;*.xapk)|*.apk;*.apks;*.zip;*.xapk|All files (*.*)|*.*' `
             -StartFolder $resolvedWorkDir
         Write-Host "Game input: $resolvedGamePackage"
         if ([string]::IsNullOrWhiteSpace($inputKey) -or $fingerprintedGamePackage -ine $resolvedGamePackage) {

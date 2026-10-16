@@ -768,6 +768,30 @@ class BuildHelperTests(unittest.TestCase):
         with self.assertRaises(build.KitError):
             build.select_inputs(bad, work)
 
+    def test_xapk_identity_names_and_duplicate_refusal(self):
+        archive = self.root / "game.xapk"
+        base = zip_bytes({"AndroidManifest.xml": play_manifest()})
+        split = zip_bytes({"AndroidManifest.xml": split_manifest("data0")})
+        with zipfile.ZipFile(archive, "w") as out:
+            out.writestr("package-name.apk", base)
+            out.writestr("data0.apk", split)
+        work = self.root / "xapk-work"
+        work.mkdir()
+        _, files, _ = build.select_inputs(archive, work)
+        self.assertEqual(sorted(n for _, n in files), ["base.apk", "split_data0.apk"])
+        self.assertTrue(all(path.name == name for path, name in files))
+        with zipfile.ZipFile(archive, "a") as out:
+            out.writestr("duplicate.apk", base)
+        with self.assertRaisesRegex(build.KitError, "duplicate"):
+            build.select_inputs(archive, work)
+
+    def test_incomplete_world_resources_refused(self):
+        from types import SimpleNamespace
+        only_data = {name: None for name in build.DATA_FILES if name.startswith("assets/data/")}
+        with self.assertRaisesRegex(build.KitError, "incomplete"):
+            build.check_game_data(SimpleNamespace(apks=[SimpleNamespace(entries=only_data)]))
+        build.check_game_data(SimpleNamespace(apks=[SimpleNamespace(entries={name: None for name in build.DATA_FILES})]))
+
     def test_corrupt_archive_reports_member_and_removes_partial(self):
         for method in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
             with self.subTest(compression=method):

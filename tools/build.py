@@ -30,6 +30,8 @@ if str(TOOLS) not in sys.path:
 import apkzip  # noqa: E402
 import dexpatch  # noqa: E402
 import xrmanifest  # noqa: E402
+import engine_profiles  # noqa: E402
+import quest_startup  # noqa: E402
 
 KIT_ROOT = TOOLS.parent
 
@@ -53,6 +55,9 @@ DATA_FILES = tuple(
         "textures", "treeres", "tune", "vfx", "vgd",
     )
 )
+DATA_FILES += tuple(f"assets/game/{name}_android.rpf" for name in (
+    "content", "cutscene", "grassres", "psocache", "audio", "audio2", "base/content",
+))
 LICENSE_FILES = ("OpenXR-LICENSE.txt", "MiamiVR-Quest-LICENSE.txt", "UltimateXR-LICENSE.txt",
                  "NVIDIA-FXAA-3.11.txt")
 BUILD_INFO_ENTRY = "assets/rdrvr/build.json"
@@ -82,7 +87,7 @@ GIB = 1024 ** 3
 # Subdirectories of the build directory that build.py clears and rewrites.
 MANAGED_DIRS = (
     "input", "engine", "generated", "layer", "native", "java-gen", "java-src", "java-stub",
-    "classes", "dex", "manifest", "apk", "out",
+    "classes", "dex", "manifest", "apk", "out", "profile-source",
 )
 MAX_ARCHIVE_APKS = 64
 MAX_APK_BYTES = apkzip.ZIP32_LIMIT
@@ -140,6 +145,7 @@ class Expected:
     openxr_loader_sha256: str = OPENXR_LOADER_SHA256
     third_party_signer_sha256: str = THIRD_PARTY_SIGNER_SHA256
     kit_root: Path = KIT_ROOT
+    self_test: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,6 +189,9 @@ class GamePackage:
     engine_sha256: str = ""
     external: dict = field(default_factory=dict)
     game_dex_compatibility: dict = field(default_factory=dict)
+    engine_profile: dict = field(default_factory=dict)
+    startup_dex: dict = field(default_factory=dict)
+    prepared_manifest: bytes = b""
 
 
 def say(message: str) -> None:
@@ -357,6 +366,7 @@ def is_split_name(name: str) -> bool:
 
 
 def extract_archive(source: Path, destination: Path) -> list[tuple[Path, str]]:
+    xapk = source.suffix.lower() == ".xapk"
     try:
         archive = zipfile.ZipFile(source)
     except (OSError, zipfile.BadZipFile) as error:
@@ -367,10 +377,10 @@ def extract_archive(source: Path, destination: Path) -> list[tuple[Path, str]]:
             if info.is_dir():
                 continue
             member = safe_member(info.filename)
-            if member.name == "base.apk" or is_split_name(member.name):
+            if member.name == "base.apk" or is_split_name(member.name) or (xapk and member.suffix.lower() == ".apk"):
                 selected.append((info, member.name))
         names = [name for _, name in selected]
-        if "base.apk" not in names:
+        if "base.apk" not in names and not xapk:
             raise KitError(f"{source.name} does not contain base.apk")
         if len(names) != len({name.lower() for name in names}):
             raise KitError(f"{source.name} contains the same APK name more than once")
@@ -407,6 +417,25 @@ def extract_archive(source: Path, destination: Path) -> list[tuple[Path, str]]:
             finally:
                 remove_file(partial)
             result.append((target, name))
+        if xapk:
+            # XAPK filenames are arbitrary. Read identities from the APK manifests.
+            normalized = []
+            for index, (path, _) in enumerate(result):
+                apk = open_apk(path, path.name)
+                split = apk.info.split
+                if split is not None and not re.fullmatch(r"[A-Za-z0-9_.-]+", split):
+                    raise KitError("unsafe split name in XAPK")
+                name = "base.apk" if split is None else f"split_{split}.apk"
+                if name in [n for _, n in normalized]:
+                    raise KitError("the XAPK contains duplicate base/split identities")
+                temporary = destination / f"normalized-{index}.tmp"
+                path.rename(temporary)
+                normalized.append((temporary, name))
+            result = []
+            for temporary, name in normalized:
+                target = destination / name
+                temporary.rename(target)
+                result.append((target, name))
     return result
 
 
@@ -440,10 +469,10 @@ def select_inputs(source: Path, build: Path) -> tuple[str, list[tuple[Path, str]
         if is_split_name(source.name):
             raise KitError("select base.apk or the export folder, not a split APK")
         return "single", [(source, "base.apk")], None
-    if suffix in (".apks", ".zip"):
+    if suffix in (".apks", ".zip", ".xapk"):
         destination = clean_directory(build / "input", build)
         return "archive", extract_archive(source, destination), None
-    raise KitError("the game package must be an export folder, base.apk, a single .apk, or an .apks/.zip archive")
+    raise KitError("the game package must be an export folder, base.apk, a single .apk, or an .apks/.zip/.xapk archive")
 
 
 def open_apk(path: Path, name: str) -> InputApk:
@@ -603,23 +632,16 @@ def list_external(root: Path | None) -> dict:
     return result
 
 
-NETFLIX_MESSAGE = (
-    "this is the Netflix Games edition (com.netflix.NGP.Kamo). Its game engine is a different build from the "
-    "Google Play edition (same version number, different code), and the mod hooks into the Google Play engine. "
-    "Export the Google Play version of Red Dead Redemption instead."
-)
-
-
 def validate_package(
     options: Options, build: Path, tools: Toolchain, runner: Runner, expected: Expected
 ) -> GamePackage:
     kind, files, external = select_inputs(options.game_package, build)
     apks = [open_apk(path, name) for path, name in files]
     for apk in apks:
-        if apk.info.package == xrmanifest.NETFLIX_PACKAGE:
-            raise KitError(f"{apk.name}: {NETFLIX_MESSAGE}")
-        if apk.info.package != PACKAGE_NAME:
-            raise KitError(f"{apk.name} belongs to {apk.info.package}, not {PACKAGE_NAME}")
+        if apk.info.package not in engine_profiles.PACKAGES:
+            raise KitError(f"{apk.name} belongs to an unsupported game package: {apk.info.package}")
+        if apk.info.package != apks[0].info.package:
+            raise KitError("the APKs belong to different packages; export one complete copy of the game")
         if apk.info.version_code != VERSION_CODE:
             raise KitError(
                 f"{apk.name} is version code {apk.info.version_code}; "
@@ -647,19 +669,9 @@ def validate_package(
             "include split_config.arm64_v8a.apk from a 64-bit ARM phone"
         )
     engine = engines[0]
-    if engine.entries[ENGINE_ENTRY].file_size != expected.engine_size:
-        raise KitError(f"unsupported game engine: {ENGINE_ENTRY} has an unexpected size")
-    present = set().union(*(apk.entries for apk in apks))
-    missing = [name for name in DATA_FILES if name not in present]
-    if missing:
-        raise KitError(
-            "the game data is incomplete; launch the game on the phone once, let it finish "
-            "downloading, then export it again",
-            "\n".join(missing),
-        )
-
     try:
-        base_info = xrmanifest.inspect_base(read_entry(base.path, "AndroidManifest.xml"))
+        prepared_manifest = quest_startup.prepare_manifest(read_entry(base.path, "AndroidManifest.xml"))
+        base_info = xrmanifest.inspect_base(prepared_manifest)
     except xrmanifest.ManifestError as error:
         raise KitError(f"the base APK manifest is not supported: {error}") from error
     names = dex_names(base.entries)
@@ -681,7 +693,7 @@ def validate_package(
 
     values = badging(runner, tools, base.path, "base.apk")
     if (values.get("name"), values.get("versionCode"), values.get("versionName")) != (
-        PACKAGE_NAME, VERSION_CODE, VERSION_NAME,
+        base.info.package, VERSION_CODE, VERSION_NAME,
     ) or values.get("split"):
         raise KitError("aapt2 reports a different identity for base.apk")
 
@@ -705,8 +717,27 @@ def validate_package(
         external_root=external,
         signer=base.signer,
         game_dex_compatibility=dex_compatibility,
+        prepared_manifest=prepared_manifest,
     )
+    if base.info.package == xrmanifest.NETFLIX_PACKAGE:
+        for name in names:
+            original = read_entry(base.path, name)
+            try:
+                patched = quest_startup.patch_provider(original)
+            except dexpatch.DexError as error:
+                raise KitError(str(error)) from error
+            if patched != original:
+                package.startup_dex[name] = patched
     return package
+
+
+def check_game_data(package):
+    present = set().union(*(apk.entries for apk in package.apks))
+    missing = [name for name in DATA_FILES if name not in present]
+    if missing:
+        raise KitError("the game data is incomplete; launch the game on the phone once, let it finish "
+                       "downloading, then export the complete game again. A second edition is not required.",
+                       "\n".join(missing))
 
 
 def hash_engine(package: GamePackage, destination: Path | None, expected: Expected) -> None:
@@ -714,14 +745,20 @@ def hash_engine(package: GamePackage, destination: Path | None, expected: Expect
         size, digest = apkzip.entry_digest(package.engine.path, ENGINE_ENTRY, destination)
     except (OSError, zipfile.BadZipFile, apkzip.ApkZipError) as error:
         raise KitError(f"cannot read {ENGINE_ENTRY}: {error}") from error
-    if size != expected.engine_size or digest != expected.engine_sha256:
+    try:
+        if expected.self_test:
+            if size != expected.engine_size or digest != expected.engine_sha256:
+                raise ValueError("unsupported game engine: self-test identity mismatch")
+            package.engine_profile = {"id": "self-test", "size": size, "notice": "Self-test engine"}
+        else:
+            package.engine_profile = engine_profiles.identify(digest, size)
+    except ValueError as error:
         if destination is not None:
             remove_file(destination)
-        raise KitError(
-            f"unsupported game engine: {ENGINE_ENTRY} sha256 {digest}; "
-            f"this kit supports {VERSION_NAME} ({expected.engine_sha256})"
-        )
+        raise KitError(str(error)) from error
     package.engine_sha256 = digest
+    say(package.engine_profile["notice"])
+    say(f"Engine ID: {digest}")
 
 
 # Sources and native build.
@@ -1045,6 +1082,11 @@ def plan_changes(
         dex_method = compression_of(apk, package.game_dex, zipfile.ZIP_DEFLATED)
         changes["AndroidManifest.xml"] = (manifest, compression_of(apk, "AndroidManifest.xml", zipfile.ZIP_DEFLATED))
         changes[package.game_dex] = (game_dex, dex_method)
+        for name, data in package.startup_dex.items():
+            changes[name] = (data, compression_of(apk, name, zipfile.ZIP_DEFLATED))
+        if package.game_dex in package.startup_dex:
+            combined, _ = dexpatch.patch_game_manager(package.startup_dex[package.game_dex])
+            changes[package.game_dex] = (combined, dex_method)
         changes[package.loader_dex] = (loader_dex, dex_method)
         added.append(package.loader_dex)
         for name, data in licenses.items():
@@ -1142,13 +1184,19 @@ def check_output_manifest(
     output = build / "out" / "base.apk"
     values = badging(runner, tools, output, "output-base.apk")
     if (values.get("name"), values.get("versionCode"), values.get("versionName")) != (
-        PACKAGE_NAME, VERSION_CODE, VERSION_NAME,
+        package.base.info.package, VERSION_CODE, VERSION_NAME,
     ):
         raise KitError("aapt2 reports a different identity for the output base.apk")
     if values.get("launchable-activity") != xrmanifest.PREFLIGHT_ACTIVITY:
         raise KitError("the output base.apk does not launch PreflightActivity")
     command = [tools.aapt2, "dump", "xmltree", "--file", "AndroidManifest.xml"]
-    original = runner.run("manifest-original", [*command, package.base.path],
+    # Independently verify the VR transform against its prepared input manifest.
+    original_path = package.base.path
+    if package.prepared_manifest and package.prepared_manifest != read_entry(package.base.path, "AndroidManifest.xml"):
+        original_path = build / "manifest" / "startup-reference.apk"
+        with zipfile.ZipFile(original_path, "w") as reference:
+            reference.writestr("AndroidManifest.xml", package.prepared_manifest)
+    original = runner.run("manifest-original", [*command, original_path],
                           "aapt2 cannot read the original manifest", capture=True)
     result = runner.run("manifest-result", [*command, output], "aapt2 cannot read the output manifest",
                         capture=True)
@@ -1228,6 +1276,7 @@ def run(options: Options, self_test: SelfTest | None = None) -> int:
             openxr_loader_sha256=self_test.openxr_loader_sha256,
             third_party_signer_sha256=self_test.third_party_signer_sha256,
             kit_root=self_test.kit_root,
+            self_test=True,
         )
     kit = expected.kit_root.resolve()
     build = options.build_dir
@@ -1253,6 +1302,7 @@ def run(options: Options, self_test: SelfTest | None = None) -> int:
     if options.validate_only:
         step("hashing the game engine")
         hash_engine(package, None, expected)
+        check_game_data(package)
         write_json(build / "validation.json", validation_record(package))
         say(f"Validation passed: {len(package.apks)} APK(s), engine {package.engine_sha256}")
         say(f"Report: {build / 'validation.json'}")
@@ -1267,6 +1317,18 @@ def run(options: Options, self_test: SelfTest | None = None) -> int:
     engine_dir = clean_directory(build / "engine", build)
     engine_path = engine_dir / "librdr.so"
     hash_engine(package, engine_path, expected)
+    check_game_data(package)
+    if not expected.self_test and (package.engine_profile["id"] != "variant-1" or package.base.info.package != PACKAGE_NAME):
+        step("preparing sources for " + package.engine_profile["id"])
+        staged = build / "profile-source"
+        if staged.exists():
+            clean_directory(staged, build)
+            staged.rmdir()
+        try:
+            kit = engine_profiles.stage_sources(kit, staged, package.engine_profile, package.base.info.package)
+        except ValueError as error:
+            raise KitError(str(error)) from error
+        files = kit_files(kit)
 
     step("preparing the manifest and the game DEX")
     manifest_dir = clean_directory(build / "manifest", build)
@@ -1279,7 +1341,7 @@ def run(options: Options, self_test: SelfTest | None = None) -> int:
     )
     try:
         manifest, _ = xrmanifest.transform(
-            read_entry(package.base.path, "AndroidManifest.xml"),
+            package.prepared_manifest,
             read_entry(fragment_apk, "AndroidManifest.xml"),
             options.trade,
         )
@@ -1299,7 +1361,7 @@ def run(options: Options, self_test: SelfTest | None = None) -> int:
         {
             "modVersion": MOD_VERSION,
             "buildId": build_id,
-            "package": PACKAGE_NAME,
+            "package": package.base.info.package,
             "versionCode": VERSION_CODE,
             "engineSha256": package.engine_sha256,
         },
@@ -1327,10 +1389,12 @@ def run(options: Options, self_test: SelfTest | None = None) -> int:
             "formatVersion": 1,
             "modVersion": MOD_VERSION,
             "buildId": build_id,
-            "package": PACKAGE_NAME,
+            "package": package.base.info.package,
             "versionCode": VERSION_CODE,
             "versionName": VERSION_NAME,
             "engineSha256": package.engine_sha256,
+            "engineVariant": package.engine_profile["id"],
+            "engineNotice": package.engine_profile["notice"],
             "trade": options.trade,
             "gameDexCompatibility": package.game_dex_compatibility,
             "launcher": package.base_info.launcher,
@@ -1351,13 +1415,15 @@ def validation_record(package: GamePackage) -> dict:
     return {
         "formatVersion": 1,
         "modVersion": MOD_VERSION,
-        "package": PACKAGE_NAME,
+        "package": package.base.info.package,
         "versionCode": VERSION_CODE,
         "versionName": VERSION_NAME,
         "input": package.kind,
         "apks": [{"file": apk.name, "split": apk.info.split, "size": apk.size} for apk in package.apks],
         "engineApk": package.engine.name,
         "engineSha256": package.engine_sha256,
+        "engineVariant": package.engine_profile["id"],
+        "engineNotice": package.engine_profile["notice"],
         "sourceSignerSha256": package.signer,
         "launcher": package.base_info.launcher,
         "applicationClass": package.base_info.application_class,
@@ -1370,7 +1436,7 @@ def validation_record(package: GamePackage) -> dict:
 
 def parse_args(argv=None) -> Options:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--game-package", required=True, help="export folder, base.apk, .apk, .apks or .zip")
+    parser.add_argument("--game-package", required=True, help="export folder, base.apk, .apk, .apks, .zip or .xapk")
     parser.add_argument("--build-dir", required=True, help="disposable build directory")
     parser.add_argument("--sdk", required=True, help="Android SDK root")
     parser.add_argument("--java-home", required=True, help="JDK 21 root")

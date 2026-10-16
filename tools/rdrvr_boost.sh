@@ -93,12 +93,15 @@ run() {
   # The loop also ends when a newer helper takes over the pid file.
   while [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ]; do
     want=
-    if pidof $PACKAGE >/dev/null 2>&1; then
-      case $(cat "$REQUEST_FILE" 2>/dev/null) in
-        6) want=6 ;;
-        7) want=7 ;;
-      esac
-    fi
+    for package in com.rockstargames.rdr com.netflix.NGP.Kamo; do
+      if pidof "$package" >/dev/null 2>&1; then
+        request=/sdcard/Android/data/$package/files/rdrvr/boost.req
+        case $(cat "$request" 2>/dev/null) in
+          6) [ "$want" = 7 ] || want=6 ;;
+          7) want=7 ;;
+        esac
+      fi
+    done
     if [ "$want" != "$applied" ]; then
       setprop debug.oculus.gpuLevel "$want" || log "could not set the GPU level"
       applied=$want
@@ -156,8 +159,11 @@ case ${1:-run} in
       ''|*[!0-9]*) echo "heartbeat: none" ;;
       *) echo "heartbeat: $(( $(date +%s) - beat )) s ago" ;;
     esac
-    if pidof $PACKAGE >/dev/null 2>&1; then game=running; else game="not running"; fi
-    echo "game: $game, request: $(cat "$REQUEST_FILE" 2>/dev/null || echo none)"
+    for package in com.rockstargames.rdr com.netflix.NGP.Kamo; do
+      if pidof "$package" >/dev/null 2>&1; then game=running; else game="not running"; fi
+      request=/sdcard/Android/data/$package/files/rdrvr/boost.req
+      echo "$package: $game, request: $(cat "$request" 2>/dev/null || echo none)"
+    done
     if [ -f "$LOG_FILE" ]; then
       echo "last log lines:"
       tail -n 5 "$LOG_FILE"
