@@ -62,7 +62,8 @@ which deletes its saved games. Copy them to the PC first with
 - Horseback riding with a stable seat camera (adjustable height and
   distance), spurring by tapping A, jumping with B.
 - Weapon presets: REALISTIC (gun spin, manual reload one round at a time,
-  hammer cocking) or CASUAL (the trigger just fires, B reloads, no spin).
+  hammer cocking) or CASUAL (default: the trigger just fires, B reloads, no spin).
+  Existing saved settings are preserved; resetting VR settings restores CASUAL.
 - HOLSTERS page: choose which of your revolvers, rifles, shotguns, thrown
   and melee weapons sits in each holster.
 - Whistle for the horse by holding an empty hand to the mouth and squeezing

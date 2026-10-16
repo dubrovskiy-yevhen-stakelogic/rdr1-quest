@@ -123,13 +123,13 @@ inline constexpr std::array<KeyInfo,keyCount> keyInfo{{
     // rounds from the chest / belt one by one or a whole speedloader) or the game's own reload; NATIVE also when debug.rdrvr.vr.reload 0 (PROP)
     // or the install failed (UNAVAILABLE). CYLINDER CLOSE: which gestures close the open
     // cylinder besides B (B AND HAND = + the free hand's push, ALL = + wrist flick / wave); no row note (the SHADOW state is in the report).
-    {"reloadMode",    "RELOAD MODE",    3,0,Feature::Reload,   2,true, {"SINGLE","FULL","NATIVE"}},
+    {"reloadMode",    "RELOAD MODE",    3,2,Feature::Reload,   2,true, {"SINGLE","FULL","NATIVE"}},
     {"cylinderClose", "CYLINDER CLOSE", 3,2,Feature::Reload,  -1,false,{"B ONLY","B AND HAND","ALL"}},
     // CHAMBERS: SIMPLE (default: AUTO INDEX to the first live round on every close) / REALISTIC (the
     // chamber aligned with the barrel decides: live fires, spent / empty = a dry click; cocking / the
     // trigger turns the cylinder one chamber first; a swipe across the closed cylinder spins it with
     // friction). Reload killed -> SIMPLE.
-    {"chambers",      "CHAMBERS",       2,1,Feature::Reload,   0,false,{"SIMPLE","REALISTIC"}},
+    {"chambers",      "CHAMBERS",       2,0,Feature::Reload,   0,false,{"SIMPLE","REALISTIC"}},
     // HAMMER / FAN SPREAD: fanning the revolver's hammer with the free palm. FAN SPREAD = the cone of a
     // FAN series (LOW 1.5 deg, HIGH 4 deg). debug.rdrvr.vr.hammer 0 -> rows PROP, HAMMER OFF.
     // HAMMER has exactly two behaviours. CASUAL (default) = FAN (the trigger fires; a hammer drag / swipe to full cock fires too).
@@ -137,13 +137,13 @@ inline constexpr std::array<KeyInfo,keyCount> keyInfo{{
     // hand drags / slaps the hammer to full cock fires at once (fanning); double-action / non-revolvers act CASUAL. Cfg key "hammerStyle"
     // (the legacy "hammer" key 0..3 is migrated in parse(): SINGLE ACTION -> REALISTIC, the rest -> CASUAL). Kill switch: no legacy value (the
     // module itself is off).
-    {"hammerStyle",   "HAMMER",         2,1,Feature::Hammer,  -1,true, {"CASUAL","REALISTIC"}},
+    {"hammerStyle",   "HAMMER",         2,0,Feature::Hammer,  -1,true, {"CASUAL","REALISTIC"}},
     {"fanSpread",     "FAN SPREAD",     3,1,Feature::Hammer,  -1,false,{"OFF","LOW","HIGH"}},
     // SPIN: open the grip with the index on the trigger -> the revolver hangs / spins on the
     // finger. debug.rdrvr.vr.spin 0 -> row PROP, OFF.
     // ON = every HOLD release away from the holster hangs on the finger (note "HANGS ON FINGER  TILT TO DROP"),
     // OFF = it falls / flies (note "RELEASE DROPS"); near the holster both holster.
-    {"gunSpin",       "GUN SPIN",       2,1,Feature::Spin,     0,true, {"OFF","ON"}},
+    {"gunSpin",       "GUN SPIN",       2,0,Feature::Spin,     0,true, {"OFF","ON"}},
     // QUEST MARKER: the yellow beacon in both eyes at the radar's objective blips / mission GPS destination (VrMarker.h).
     // debug.rdrvr.vr.marker 0 -> row PROP, OFF (no module, nothing read).
     {"questMarker",   "QUEST MARKER",   2,1,Feature::Marker,   0,true, {"OFF","ON"}},
