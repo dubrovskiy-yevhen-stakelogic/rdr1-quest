@@ -5,7 +5,9 @@
 //   FAN W/ TRIGGER the swipe counts only while the holding trigger is squeezed.
 //   SINGLE ACTION  only a cocked hammer fires; the swipe (slow is fine) cocks it; after the shot it is down again.
 // The menu row is HAMMER CASUAL / REALISTIC (cfg "hammerStyle"; stored 4-value settings map SINGLE ACTION -> REALISTIC, the
-// rest -> CASUAL). CASUAL = the FAN engine above. REALISTIC = SINGLE ACTION for single-action revolvers (Cattleman, Schofield, LeMat, ...;
+// rest -> CASUAL). The full CASUAL weapon preset disables this module's pulses/gestures;
+// its firearm RT is the ordinary held trigger. Custom settings with HAMMER CASUAL retain FAN.
+// REALISTIC = SINGLE ACTION for single-action revolvers (Cattleman, Schofield, LeMat, ...;
 // an unrecognised revolver name counts as single-action): a dry trigger does nothing (faint click), a drag / swipe to full cock cocks, the
 // trigger fires the cocked hammer; the trigger HELD while the free hand drags / slaps the hammer to full cock fires at once (fanning, one
 // shot per full cock). A double-action revolver (hand item name contains DOUBLE) or a non-revolver pistol under REALISTIC = CASUAL.
@@ -226,6 +228,7 @@ inline int classifyAction(const char* name) noexcept {
     return ActionUnknown;}
 inline bool realisticAction(int a) noexcept {return a==ActionUnknown||a==ActionSingle;}
 inline unsigned modeOf(const ::rdrvr::vr::Snapshot& s) noexcept {
+    if(weaponPresetOf(s)==PresetCasual)return ModeOff;
     return s.hammerStyle()==StyleRealistic&&realisticAction(heldAction.load(std::memory_order_relaxed))?ModeSingle:ModeFan;}
 inline unsigned style() noexcept {return settings().hammerStyle();}
 inline unsigned mode() noexcept {

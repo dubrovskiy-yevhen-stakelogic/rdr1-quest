@@ -63,6 +63,8 @@ which deletes its saved games. Copy them to the PC first with
   distance), spurring by tapping A, jumping with B.
 - Weapon presets: REALISTIC (gun spin, manual reload one round at a time,
   hammer cocking) or CASUAL (default: the trigger just fires, B reloads, no spin).
+  CASUAL forwards the held firearm trigger without VR hammer or cylinder gates;
+  hand gestures do not cock or fan the hammer. The game controls ammo and firing cadence.
   Existing saved settings are preserved; resetting VR settings restores CASUAL.
 - HOLSTERS page: choose which of your revolvers, rifles, shotguns, thrown
   and melee weapons sits in each holster.

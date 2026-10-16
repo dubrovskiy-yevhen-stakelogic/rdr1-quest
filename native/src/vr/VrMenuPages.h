@@ -213,7 +213,8 @@ struct VrPage {
             if(note&&std::strcmp(note,"NOT OWNED")==0&&status::code(Feature::Lasso)==status::Ready){out+=lassoNotOwnedFooter;return;}}
         if(store.persistenceOk()&&page==PageHands&&sel==weaponPresetRow){out+=weaponPresetFooters[weaponPresetOf(store.requested())];return;}
         if(store.persistenceOk()&&page==PageHands&&sel==Key::Hammer&&!keyKilled(Key::Hammer)){
-            out+=store.requested().hammerStyle()?hammerRealisticFooter:hammerCasualFooter;return;}
+            out+=weaponPresetOf(store.requested())==PresetCasual?"TRIGGER FIRES  B: GAME RELOAD":
+                store.requested().hammerStyle()?hammerRealisticFooter:hammerCasualFooter;return;}
         if(store.persistenceOk()&&page==PageHands&&sel==Key::Chambers&&!keyKilled(Key::Chambers)&&store.requested().realisticChambers()){
             out+=chambersRealisticFooter;return;}
         if(store.persistenceOk()&&page==PageHud&&!keyKilled(Key::Hud)&&store.effective().hudMode()){

@@ -132,7 +132,8 @@ inline constexpr std::array<KeyInfo,keyCount> keyInfo{{
     {"chambers",      "CHAMBERS",       2,0,Feature::Reload,   0,false,{"SIMPLE","REALISTIC"}},
     // HAMMER / FAN SPREAD: fanning the revolver's hammer with the free palm. FAN SPREAD = the cone of a
     // FAN series (LOW 1.5 deg, HIGH 4 deg). debug.rdrvr.vr.hammer 0 -> rows PROP, HAMMER OFF.
-    // HAMMER has exactly two behaviours. CASUAL (default) = FAN (the trigger fires; a hammer drag / swipe to full cock fires too).
+    // Full CASUAL preset passes the held trigger through, with no hammer gestures or pulse shaping.
+    // In CUSTOM settings, HAMMER CASUAL = FAN (the trigger fires; a hammer drag / swipe to full cock fires too).
     // REALISTIC = single-action revolvers fire only a cocked hammer (drag / swipe it back, then the trigger), the trigger HELD while the other
     // hand drags / slaps the hammer to full cock fires at once (fanning); double-action / non-revolvers act CASUAL. Cfg key "hammerStyle"
     // (the legacy "hammer" key 0..3 is migrated in parse(): SINGLE ACTION -> REALISTIC, the rest -> CASUAL). Kill switch: no legacy value (the

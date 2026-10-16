@@ -1047,15 +1047,21 @@ class InputBrain {
         if(hold<0){routeEmpty(in,pad,now,menu);return;} // Empty VR hands never draw a weapon from a trigger
         emptyLatch_={};emptyDown_={in.triggers[0]>=.55f,in.triggers[1]>=.55f};
         const unsigned h=unsigned(hold),o=1u-h;
+        // Full CASUAL preset: let the game own firearm trigger duration and cadence.
+        // In particular, do not shorten a held RT to a hammer pulse, or retain a
+        // manual-reload/rearm latch after drawing, transferring or changing preset.
+        // Empty hands, lasso, melee, menu/focus and native gameplay rules still own their paths.
+        const bool casualFire=!menu&&weaponPresetOf(settings())==PresetCasual&&phantomFirearmSlot(currentSlot.load());
         // HAMMER: who owns the holding trigger. A change of owner while the trigger is squeezed
         // latches NOT_REARMED until it is released (else the engine would see a fresh 0->1 edge:
         // an extra shot / a Dead Eye paint). Never on the frame a DUAL swap settled: that press is
         // meant to be a fresh edge for the new item. Counted only when it disarms (rtArmed_ was set).
         const auto* hsk=hammerSinks.load(std::memory_order_acquire);
-        bool hammerOwns=false;if(hsk&&hsk->ownsRt){try{hammerOwns=hsk->ownsRt(hold,now);}catch(...){hammerOwns=false;}}
+        bool hammerOwns=false;if(!casualFire&&hsk&&hsk->ownsRt){try{hammerOwns=hsk->ownsRt(hold,now);}catch(...){hammerOwns=false;}}
         if(hammerOwns!=hammerOwned_){hammerOwned_=hammerOwns;
             if(in.triggers[h]>triggerRearm&&rtArmed_&&!swapArmed){rtArmed_=false;hammerRearmLatched.fetch_add(1,std::memory_order_relaxed);}}
         if(!rtArmed_&&in.triggers[h]<=triggerRearm)rtArmed_=true;
+        if(casualFire){rtArmed_=true;gateActive_=false;gateBlock_=nullptr;gateVerdict_=-1;pendingEdgeNs_=0;}
         const float fire=std::fmin(std::fmax(in.triggers[h],0.f),1.f),other=std::fmin(std::fmax(in.triggers[o],0.f),1.f);
         pad.triggers[1]=fire;logical_[1]=fire>=(logical_[1]?.45f:.55f);
         if(ltNative.load(std::memory_order_relaxed)){pad.triggers[0]=other;logical_[0]=other>=(logical_[0]?.45f:.55f);}
@@ -1074,7 +1080,8 @@ class InputBrain {
         // Without the sink (reload killed / not started): the per-frame CYLINDER_OPEN rule.
         const auto gateSink=rtGateSink.load(std::memory_order_acquire);
         if(!down){gateActive_=false;gateBlock_=nullptr;gateVerdict_=-1;pendingEdgeNs_=0;}
-        if(spin_.blocksRt(hold)){block="SPIN";if(fire>triggerActive)spin::bump(spin::stats.rtBlockedSpin);} // SPIN: never fires while on the finger
+        if(casualFire){} // Preserve the physical held state above; no VR firearm gate or pulse shaping.
+        else if(spin_.blocksRt(hold)){block="SPIN";if(fire>triggerActive)spin::bump(spin::stats.rtBlockedSpin);} // SPIN: never fires while on the finger
         else if(!rtArmed_){block="NOT_REARMED";rtHeldFrames.fetch_add(1,std::memory_order_relaxed);}
         else if(melee&&!meleeTrigger.load(std::memory_order_relaxed)){block="MELEE";if(fire>triggerActive)rtBlockedMelee.fetch_add(1,std::memory_order_relaxed);}
         else{
