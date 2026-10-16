@@ -159,6 +159,14 @@ Saves of the PC version load unchanged. Saves from consoles are untested.
 
 ## Settings and reports
 
+On Windows, running `UPDATE.bat` again remembers your game source and reuses a
+verified build when its inputs have not changed. After a failed USB installation
+or insufficient headset storage, free space/reconnect and rerun it; keep
+`C:\RDRVRBuild` and your signing key. When the mod changes, unchanged data APKs can
+be reused, and only APKs differing from the installed set are sent to the Quest.
+File checks still take time. Use `BUILD_AND_INSTALL.bat -GamePackage "path"` to
+choose a different input, or add `-Rebuild` to force a fresh build.
+
 - In the headset: VR menu > **RESET ALL**, press A twice. Graphics, VR and
   button settings go back to the defaults. Saved games are not touched.
 - `RESET_VR_SETTINGS.bat` or `bash RESET_VR_SETTINGS.sh` restores the default

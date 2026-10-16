@@ -130,6 +130,7 @@ class Options:
     trade: int = 0
     validate_only: bool = False
     jobs: int = 0
+    reuse_build: Path | None = None
 
 
 @dataclass
@@ -1068,6 +1069,7 @@ def assemble(
     runner: Runner,
     keystore: Path,
     contents: dict,
+    reuse_build: Path | None = None,
 ) -> tuple[list[dict], str]:
     work = clean_directory(build / "apk", build)
     out = clean_directory(build / "out", build)
@@ -1078,17 +1080,36 @@ def assemble(
         unsigned = work / f"{apk.name}.unsigned"
         aligned = work / f"{apk.name}.aligned"
         signed = out / apk.name
-        step(f"assembling {apk.name}")
-        try:
-            apkzip.write_apk(apk.path, unsigned, changes)
-        except (OSError, apkzip.ApkZipError) as error:
-            raise KitError(f"cannot assemble {apk.name}: {error}") from error
-        runner.run(f"zipalign-{apk.name}", [tools.zipalign, "-P", "16", "-f", "4", unsigned, aligned],
-                   f"aligning {apk.name} failed")
-        remove_file(unsigned)
-        step(f"signing {apk.name}")
-        sign_apk(tools, runner, keystore, aligned, signed)
-        remove_file(aligned)
+        reused = False
+        if reuse_build is not None and not changes and len(signers) == 1:
+            cached = reuse_build / "out" / apk.name
+            try:
+                # Match the actual payload and current key, not merely the old manifest or filename.
+                certificate = apkzip.signer_certificate(cached)
+                if certificate in signers:
+                    apkzip.verify_payload(apk.path, cached, {})
+                    if apk_signer(runner, tools, cached, f"cache-{apk.name}") != hashlib.sha256(certificate).hexdigest():
+                        raise KitError("cached APK signing block differs from apksigner")
+                    runner.run(f"cache-align-{apk.name}", [tools.zipalign, "-c", "-P", "16", "4", cached],
+                               "cached APK alignment failed")
+                    shutil.copyfile(cached, signed)
+                    reused = True
+                    step(f"reusing verified {apk.name}; no repackaging or signing needed")
+            except (OSError, ValueError, zipfile.BadZipFile, apkzip.ApkZipError, KitError):
+                remove_file(signed)
+                say(f"    cached {apk.name} cannot be reused; rebuilding it")
+        if not reused:
+            step(f"assembling {apk.name}")
+            try:
+                apkzip.write_apk(apk.path, unsigned, changes)
+            except (OSError, apkzip.ApkZipError) as error:
+                raise KitError(f"cannot assemble {apk.name}: {error}") from error
+            runner.run(f"zipalign-{apk.name}", [tools.zipalign, "-P", "16", "-f", "4", unsigned, aligned],
+                       f"aligning {apk.name} failed")
+            remove_file(unsigned)
+            step(f"signing {apk.name}")
+            sign_apk(tools, runner, keystore, aligned, signed)
+            remove_file(aligned)
         signer = apk_signer(runner, tools, signed, f"output-{apk.name}")
         runner.run(f"zipalign-check-{apk.name}", [tools.zipalign, "-c", "-P", "16", "4", signed],
                    f"{apk.name} is not aligned")
@@ -1176,6 +1197,9 @@ def check_options(options: Options, build: Path, kit: Path, expected: Expected) 
     check_protected("game package", options.game_package, build)
     check_protected("Android SDK", options.sdk, build)
     check_protected("JDK", options.java_home, build)
+    if options.reuse_build is not None:
+        if is_within(options.reuse_build, build) or is_within(build, options.reuse_build):
+            raise KitError("--reuse-build must be separate from the new build directory")
     if options.trade not in (-1, 0, 1):
         raise KitError("--trade must be -1, 0 or 1")
     if options.validate_only:
@@ -1293,7 +1317,7 @@ def run(options: Options, self_test: SelfTest | None = None) -> int:
         "build_info": build_info,
         "licenses": {name: files[name].read_bytes() for name in LICENSE_FILES},
     }
-    outputs, certificate = assemble(package, build, tools, runner, options.keystore, contents)
+    outputs, certificate = assemble(package, build, tools, runner, options.keystore, contents, options.reuse_build)
     check_output_manifest(package, build, tools, runner, options.trade)
 
     step("writing build-manifest.json")
@@ -1353,6 +1377,7 @@ def parse_args(argv=None) -> Options:
     parser.add_argument("--openxr-loader", help="Khronos OpenXR loader 1.1.43 arm64 libopenxr_loader.so")
     parser.add_argument("--vulkan-headers", help="Vulkan-Headers vulkan-sdk-1.4.357.0 root")
     parser.add_argument("--keystore", help="personal signing key; created when missing")
+    parser.add_argument("--reuse-build", help="previous build whose unchanged signed data APKs may be reused after verification")
     parser.add_argument("--trade", type=int, choices=(-1, 0, 1), default=0,
                         help="com.oculus.trade_cpu_for_gpu_amount (default 0)")
     parser.add_argument("--validate-only", action="store_true", help="check the game package and stop")
@@ -1373,6 +1398,7 @@ def parse_args(argv=None) -> Options:
         trade=args.trade,
         validate_only=args.validate_only,
         jobs=args.jobs if args.jobs > 0 else (os.cpu_count() or 4),
+        reuse_build=path(args.reuse_build),
     )
 
 

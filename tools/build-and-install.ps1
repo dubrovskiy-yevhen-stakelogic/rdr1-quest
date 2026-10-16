@@ -9,6 +9,7 @@ param(
     [string]$Keystore,
     [ValidateSet(-1, 0, 1)][int]$Trade = 0,
     [switch]$BuildOnly,
+    [switch]$Rebuild,
     [switch]$NonInteractive
 )
 
@@ -30,6 +31,8 @@ $script:RemoteObbRoot = "/sdcard/Android/obb/$($script:PackageName)"
 $script:SelectedSerial = $null
 $script:AdbExe = $null
 $script:TranscriptStarted = $false
+
+. (Join-Path $PSScriptRoot 'build-cache.ps1')
 
 $script:PinnedFiles = @{
     Python = @{
@@ -865,7 +868,8 @@ function Invoke-KitBuild {
         [Parameter(Mandatory = $true)][string]$ResolvedJavaHome,
         [Parameter(Mandatory = $true)][string]$OpenXrLoader,
         [Parameter(Mandatory = $true)][string]$VulkanHeaders,
-        [Parameter(Mandatory = $true)][string]$KeystorePath
+        [Parameter(Mandatory = $true)][string]$KeystorePath,
+        [string]$ReuseBuild
     )
     $arguments = @(
         '-u', $BuildScript,
@@ -879,6 +883,7 @@ function Invoke-KitBuild {
         '--trade', ([string]$Trade)
     )
     $oldJavaHome = $env:JAVA_HOME
+    if (-not [string]::IsNullOrWhiteSpace($ReuseBuild)) { $arguments += @('--reuse-build', $ReuseBuild) }
     $oldSdkRoot = $env:ANDROID_SDK_ROOT
     $oldAndroidHome = $env:ANDROID_HOME
     try {
@@ -1567,9 +1572,10 @@ function Test-TransportFailure {
 }
 
 function Invoke-ApkInstall {
-    param([Parameter(Mandatory = $true)][string[]]$ApkPaths)
+    param([Parameter(Mandatory = $true)][string[]]$ApkPaths, [switch]$Inherit)
     $arguments = @('install-multiple', '-r', '--no-incremental') + $ApkPaths
-    if ($ApkPaths.Count -eq 1) { $arguments = @('install', '-r', '--no-incremental', $ApkPaths[0]) }
+    if ($Inherit.IsPresent) { $arguments = @('install-multiple', '-r', '-p', $script:PackageName, '--no-incremental') + $ApkPaths }
+    elseif ($ApkPaths.Count -eq 1) { $arguments = @('install', '-r', '--no-incremental', $ApkPaths[0]) }
     for ($attempt = 1; $attempt -le 2; $attempt++) {
         Write-Host 'Sending the APK set to the headset. This takes a few minutes over USB.'
         $result = Invoke-AdbTee -Arguments $arguments
@@ -1713,11 +1719,11 @@ function Invoke-Main {
     Write-Host "Work directory: $resolvedWorkDir"
     Write-Host "Log: $resolvedLogPath"
 
-    $resolvedGamePackage = Resolve-RequiredInputPath -Value $GamePackage -Name 'GamePackage' `
-        -Prompt 'Select the game exported by EXPORT_RDR_APKS.bat: the RDR-export folder with base.apk and the split_*.apk files, or a single APK' `
-        -Filter 'Game APK or archive (*.apk;*.apks;*.zip)|*.apk;*.apks;*.zip|All files (*.*)|*.*' `
-        -StartFolder $resolvedWorkDir
-    Write-Host "Game input: $resolvedGamePackage"
+    $cache = Read-BuildCache -WorkRoot $resolvedWorkDir
+    $explicitInput = -not [string]::IsNullOrWhiteSpace($GamePackage)
+    $resolvedGamePackage = $GamePackage
+    if (-not $explicitInput -and $null -ne $cache) { $resolvedGamePackage = [string]$cache.gamePackage }
+    $kitKey = Get-KitCacheKey -ProjectRoot $projectRoot
 
     Write-Step 'Preparing pinned build tools'
     $resolvedJavaHome = Resolve-JavaHome -Requested $JavaHome -DownloadRoot $downloads -ToolsRoot $toolsRoot
@@ -1727,7 +1733,10 @@ function Invoke-Main {
     $resolvedSdk = Resolve-AndroidSdk -Requested $AndroidSdk -DefaultRoot $defaultSdk -DownloadRoot $downloads `
         -ToolsRoot $toolsRoot -ResolvedJavaHome $resolvedJavaHome
     if ([string]::IsNullOrWhiteSpace($Keystore)) {
-        $keystorePath = Get-PersistentKeystorePath -ProjectRoot $projectRoot -ResolvedWorkDir $resolvedWorkDir
+        if ($null -ne $cache -and (Test-Path -LiteralPath ([string]$cache.keystore) -PathType Leaf)) {
+            $keystorePath = [string]$cache.keystore
+        }
+        else { $keystorePath = Get-PersistentKeystorePath -ProjectRoot $projectRoot -ResolvedWorkDir $resolvedWorkDir }
     }
     else {
         $keystorePath = Get-FullPath $Keystore
@@ -1739,13 +1748,40 @@ function Invoke-Main {
     Write-Host "Android SDK: $resolvedSdk"
     Write-Host "Personal signing key: $keystorePath (created by the first build; keep it for future updates)"
 
-    Write-Step 'Building the personal APK set'
-    Invoke-KitBuild -Python $python -BuildScript $buildScript -GamePackagePath $resolvedGamePackage `
-        -BuildRoot $buildRoot -SdkRoot $resolvedSdk -ResolvedJavaHome $resolvedJavaHome `
-        -OpenXrLoader $openXrLoader -VulkanHeaders $vulkanHeaders -KeystorePath $keystorePath
-
-    Write-Step 'Verifying the build outputs'
-    $buildInfo = Assert-BuildArtifacts -BuildRoot $buildRoot
+    $buildInfo = $null
+    $inputKey = $null
+    $fingerprintedGamePackage = $null
+    if (-not $explicitInput -and -not $Rebuild.IsPresent -and $null -ne $cache -and $cache.kitKey -eq $kitKey) {
+        if (-not [string]::IsNullOrWhiteSpace($resolvedGamePackage)) { $inputKey = Get-GameInputCacheKey -Path $resolvedGamePackage }
+        $fingerprintedGamePackage = $resolvedGamePackage
+        $buildInfo = Get-ReusableBuild -Cache $cache -KitKey $kitKey -KeystorePath $keystorePath -InputKey $inputKey -RequestedTrade $Trade
+    }
+    if ($null -ne $buildInfo) {
+        Write-Host 'Reusing the verified APK set. No compilation or APK repackaging is needed.' -ForegroundColor Green
+    }
+    else {
+        if (-not $explicitInput -and ([string]::IsNullOrWhiteSpace($resolvedGamePackage) -or -not (Test-Path -LiteralPath $resolvedGamePackage))) {
+            $resolvedGamePackage = Find-PreviousGameInput -WorkRoot $resolvedWorkDir -Cache $cache
+        }
+        $resolvedGamePackage = Resolve-RequiredInputPath -Value $resolvedGamePackage -Name 'GamePackage' `
+            -Prompt 'Select the game exported by EXPORT_RDR_APKS.bat: the RDR-export folder with base.apk and the split_*.apk files, or a single APK' `
+            -Filter 'Game APK or archive (*.apk;*.apks;*.zip)|*.apk;*.apks;*.zip|All files (*.*)|*.*' `
+            -StartFolder $resolvedWorkDir
+        Write-Host "Game input: $resolvedGamePackage"
+        if ([string]::IsNullOrWhiteSpace($inputKey) -or $fingerprintedGamePackage -ine $resolvedGamePackage) {
+            $inputKey = Get-GameInputCacheKey -Path $resolvedGamePackage
+        }
+        Write-Step 'Building the personal APK set'
+        Invoke-KitBuild -Python $python -BuildScript $buildScript -GamePackagePath $resolvedGamePackage `
+            -BuildRoot $buildRoot -SdkRoot $resolvedSdk -ResolvedJavaHome $resolvedJavaHome `
+            -OpenXrLoader $openXrLoader -VulkanHeaders $vulkanHeaders -KeystorePath $keystorePath `
+            -ReuseBuild $(if ($null -ne $cache -and -not $Rebuild.IsPresent) { [string]$cache.buildRoot } else { '' })
+        Write-Step 'Verifying the build outputs'
+        $buildInfo = Assert-BuildArtifacts -BuildRoot $buildRoot
+        # Persist before device selection: a storage/USB failure must not force another build.
+        Save-BuildCache -WorkRoot $resolvedWorkDir -KitKey $kitKey -GamePath $resolvedGamePackage -InputKey $inputKey `
+            -BuildRoot $buildRoot -KeystorePath $keystorePath -RequestedTrade $Trade
+    }
     Write-Host "Verified build manifest: $($buildInfo.ManifestPath)" -ForegroundColor Green
     if ($BuildOnly.IsPresent) {
         Write-Host "BuildOnly complete. APKs: $($buildInfo.OutputRoot)" -ForegroundColor Green
@@ -1784,7 +1820,12 @@ function Invoke-Main {
         Write-Host 'Red Dead Redemption is not installed on this headset. A fresh install follows.'
     }
     Stop-GameAndVerify
-    Assert-QuestFreeSpace -BuildInfo $buildInfo -Update:($mode -eq 'Update' -or $mode -eq 'Unknown') -ExternalBytes $externalBytes
+    $installPlan = [pscustomobject]@{ ApkPaths = @($buildInfo.ApkPaths); Inherit = $false; Bytes = $buildInfo.ApkBytes }
+    if ($mode -eq 'Update') { $installPlan = Get-ApkUpdatePlan -BuildInfo $buildInfo }
+    if ($installPlan.ApkPaths.Count -gt 0 -or $externalBytes -gt 0) {
+        Assert-QuestFreeSpace -BuildInfo ([pscustomobject]@{ ApkBytes = $installPlan.Bytes }) `
+            -Update:($mode -eq 'Update' -or $mode -eq 'Unknown') -ExternalBytes $externalBytes
+    }
     $skipAssetPacks = @($externalPlan | Where-Object { $_.Name -eq 'assetpacks' }).Count -gt 0
     $backupManifest = $null
     if ($mode -eq 'Replace') {
@@ -1792,7 +1833,14 @@ function Invoke-Main {
     }
 
     Write-Step 'Installing the personally signed APK set'
-    $install = Invoke-ApkInstall -ApkPaths $buildInfo.ApkPaths
+    if ($installPlan.ApkPaths.Count -eq 0) {
+        Write-Host 'All installed APKs already match. No APK transfer is needed.' -ForegroundColor Green
+        $install = [pscustomobject]@{ Success = $true; SignatureMismatch = $false; Text = 'Already installed' }
+    }
+    else {
+        Write-Host "Sending $($installPlan.ApkPaths.Count) of $($buildInfo.ApkPaths.Count) APK(s)."
+        $install = Invoke-ApkInstall -ApkPaths $installPlan.ApkPaths -Inherit:$installPlan.Inherit
+    }
     if (-not $install.Success -and $install.SignatureMismatch -and $null -eq $backupManifest) {
         Write-Warning 'Android rejected the update because the installed copy has a different signing key.'
         $backupManifest = Invoke-SignerReplacement -BackupRoot $backupRoot -SkipAssetPacks:$skipAssetPacks

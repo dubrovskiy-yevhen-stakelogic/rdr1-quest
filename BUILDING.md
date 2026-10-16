@@ -18,6 +18,24 @@ assembled APK set. Work files are stored under `C:\RDRVRBuild`, or the
 directory passed with `-WorkDir`. `-Trade` selects the Quest CPU/GPU level
 trade written to the manifest (`-1`, `0` or `1`; default `0`).
 
+On Windows, the builder remembers the last verified build, original game path
+and signing key in `WorkDir/last-build.json`, before starting installation.
+Rerunning after a USB or storage failure reuses matching verified APKs. A source,
+input, key or trade change triggers a new build. Unchanged data APKs are reused
+only after their payload, signature and alignment have been checked. The base
+APK and any APK containing changed mod libraries are rebuilt.
+
+For an installed copy with the same signing key, the Windows installer compares
+all installed APK hashes and sends only changed APKs, retaining matching splits.
+It verifies the full set afterwards. An unavailable or different APK set uses a
+full installation. Game data and settings follow the existing update rules.
+
+The game input is requested again only when no usable saved input/build exists.
+Older complete archive builds can supply their original extracted `input` folder;
+the patched installed APK is never treated as the original game source.
+Pass `-GamePackage` to select another source, or `-Rebuild` to disable build reuse.
+Keep the work folder and signing key to retain these conveniences.
+
 ## Linux and macOS
 
 Install Bash, Python 3.10 or newer, curl, tar and unzip. Run:
@@ -43,6 +61,7 @@ Omit `--build-only` for installation. Work files are stored under
 | `-Serial` | `--serial` | ADB serial of the headset when several devices are connected |
 | `-LogPath` | `--log-path` | log file location |
 | `-BuildOnly` | `--build-only` | build and sign without touching a headset |
+| `-Rebuild` | — | Windows: rebuild instead of reusing cached APKs |
 | `-NonInteractive` | `--non-interactive` | fail instead of prompting |
 
 The reset script accepts `-Yes` (`--yes`) to skip its confirmation and

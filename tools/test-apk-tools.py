@@ -1316,6 +1316,38 @@ public class NativeGameActivity extends android.app.NativeActivity {
         manifest = json.loads((options.build_dir / "build-manifest.json").read_text())
         self.check_outputs(options, manifest, signer, LAUNCHER, native_game_mode=True)
 
+    def test_reuse_unchanged_data_split(self):
+        package, signer = self.make_package("reuse-input")
+        original = self.options(package, "reuse-original")
+        self.run_build(original, self.self_test())
+        cached = original.build_dir / "out" / "split_data0.apk"
+        cached_hash = build.sha256_file(cached)
+        # A new mod version must rebuild base/engine APKs but may keep identical signed data.
+        source = self.make_kit() / "native" / "main.cpp"
+        source.write_text(source.read_text() + "\n// next mod version\n")
+        updated = self.options(package, "reuse-updated")
+        updated.reuse_build = original.build_dir
+        log = self.run_build(updated, self.self_test())
+        self.assertIn("reusing verified split_data0.apk", log)
+        self.assertNotIn("reusing verified base.apk", log)
+        self.assertNotIn("reusing verified split_config.arm64_v8a.apk", log)
+        self.assertEqual(build.sha256_file(updated.build_dir / "out" / cached.name), cached_hash)
+        self.assertEqual(build.sha256_file(cached), cached_hash)
+        manifest = json.loads((updated.build_dir / "build-manifest.json").read_text())
+        self.check_outputs(updated, manifest, signer, LAUNCHER)
+        # Corrupt cache falls back to a fresh signed APK, without damaging the input.
+        cached.write_bytes(b"broken cache")
+        repaired = self.options(package, "reuse-repaired")
+        repaired.reuse_build = original.build_dir
+        log = self.run_build(repaired, self.self_test())
+        self.assertIn("cached split_data0.apk cannot be reused", log)
+        self.check_outputs(repaired, json.loads((repaired.build_dir / "build-manifest.json").read_text()), signer, LAUNCHER)
+        # Never let cleanup of a new run erase its cache.
+        repaired.reuse_build = repaired.build_dir
+        error = self.expect_failure(repaired, self.self_test())
+        self.assertIn("must be separate", error.message)
+        self.assertTrue((repaired.build_dir / "build-manifest.json").is_file())
+
     def test_split_folder_build(self):
         package, signer = self.make_package("play")
         options = self.options(package, "play", trade=0)
