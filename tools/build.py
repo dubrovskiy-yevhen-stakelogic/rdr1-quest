@@ -28,6 +28,7 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 import apkzip  # noqa: E402
+import axml  # noqa: E402
 import dexpatch  # noqa: E402
 import xrmanifest  # noqa: E402
 import engine_profiles  # noqa: E402
@@ -58,6 +59,21 @@ DATA_FILES = tuple(
 DATA_FILES += tuple(f"assets/game/{name}_android.rpf" for name in (
     "content", "cutscene", "grassres", "psocache", "audio", "audio2", "base/content",
 ))
+# Asset packs copied from the app's private storage: asset-packs/<pack>/assets/...
+ASSET_PACK_FOLDER = "asset-packs"
+INCOMPLETE_DATA_MESSAGE = (
+    "the game data is incomplete. The FULL game is required, including all world and audio files. "
+    "Open the game on your phone, wait for ALL additional data to download, and check that you can enter the game world. "
+    "Then export the complete game again with EXPORT_RDR_APKS.bat. "
+    "Do not rely on the Quest to download missing files. A second edition is not required."
+)
+NETFLIX_DATA_MESSAGE = (
+    "the game data is incomplete. The Netflix edition downloads its world, cutscene and audio packs "
+    "into the app's private storage, and Android lets only a rooted phone copy them over USB. "
+    "Export the game with EXPORT_RDR_APKS.bat from a rooted phone and allow superuser access for Shell "
+    "when the phone asks; the exporter then saves the packs in the asset-packs folder. "
+    "The Google Play edition installs all data as APK files and exports completely without root."
+)
 LICENSE_FILES = ("OpenXR-LICENSE.txt", "MiamiVR-Quest-LICENSE.txt", "UltimateXR-LICENSE.txt",
                  "NVIDIA-FXAA-3.11.txt")
 BUILD_INFO_ENTRY = "assets/rdrvr/build.json"
@@ -87,7 +103,7 @@ GIB = 1024 ** 3
 # Subdirectories of the build directory that build.py clears and rewrites.
 MANAGED_DIRS = (
     "input", "engine", "generated", "layer", "native", "java-gen", "java-src", "java-stub",
-    "classes", "dex", "manifest", "apk", "out", "profile-source",
+    "classes", "dex", "manifest", "apk", "out", "profile-source", "packs",
 )
 MAX_ARCHIVE_APKS = 64
 MAX_APK_BYTES = apkzip.ZIP32_LIMIT
@@ -176,6 +192,15 @@ class InputApk:
 
 
 @dataclass
+class AssetPack:
+    """Pack folder from the export, packaged as an install-time split during the build."""
+
+    name: str
+    files: list[tuple[str, Path]]
+    size: int
+
+
+@dataclass
 class GamePackage:
     kind: str
     apks: list[InputApk]
@@ -192,6 +217,8 @@ class GamePackage:
     engine_profile: dict = field(default_factory=dict)
     startup_dex: dict = field(default_factory=dict)
     prepared_manifest: bytes = b""
+    asset_packs: list[AssetPack] = field(default_factory=list)
+    asset_pack_template: InputApk | None = None
 
 
 def say(message: str) -> None:
@@ -632,6 +659,108 @@ def list_external(root: Path | None) -> dict:
     return result
 
 
+def asset_pack_root(source: Path) -> Path | None:
+    """asset-packs folder next to base.apk in an export folder."""
+    folder = source if source.is_dir() else source.parent if source.name == "base.apk" else None
+    if folder is None:
+        return None
+    root = folder / ASSET_PACK_FOLDER
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise KitError(f"{root} is not a plain folder")
+    return root if root.is_dir() else None
+
+
+def read_asset_packs(root: Path | None, splits: set[str]) -> list[AssetPack]:
+    """Packs saved as asset-packs/<pack>/assets/...; a pack that is also an APK split is ignored."""
+    if root is None:
+        return []
+    packs = []
+    for folder in sorted(root.iterdir()):
+        label = f"{ASSET_PACK_FOLDER}/{folder.name}"
+        if folder.is_symlink() or not folder.is_dir() or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", folder.name):
+            raise KitError(f"unexpected item in the {ASSET_PACK_FOLDER} folder: {folder.name}")
+        if folder.name in splits:
+            say(f"    ignoring {label}; split_{folder.name}.apk is used")
+            continue
+        assets = folder / "assets"
+        if [path.name for path in folder.iterdir()] != ["assets"] or assets.is_symlink() or not assets.is_dir():
+            raise KitError(f"{label} must contain only the assets folder of the pack")
+        files = []
+        for directory, subdirectories, names in os.walk(assets):
+            if any((Path(directory) / name).is_symlink() for name in subdirectories):
+                raise KitError(f"{label} contains a link; export the game again")
+            subdirectories.sort()
+            for name in sorted(names):
+                path = Path(directory) / name
+                if path.is_symlink() or not path.is_file():
+                    raise KitError(f"{label} contains something other than plain files: {name}")
+                if name.endswith(".partial"):
+                    raise KitError(f"{label} holds an interrupted copy ({name}); export the game again")
+                member = "assets/" + path.relative_to(assets).as_posix()
+                safe_member(member)
+                files.append((member, path))
+        if not files:
+            raise KitError(f"{label} is empty; export the game again")
+        packs.append(AssetPack(name=folder.name, files=files, size=sum(path.stat().st_size for _, path in files)))
+    return packs
+
+
+def is_install_time_asset_pack(manifest: bytes) -> bool:
+    try:
+        root = axml.Document(manifest).tree()
+    except axml.AxmlError:
+        return False
+    for module in root.find("module"):
+        if any(attr.name == "type" and attr.value() == "asset-pack" for attr in module.attributes):
+            return any(delivery.find("install-time") for delivery in module.find("delivery"))
+    return False
+
+
+def asset_pack_manifest(template: bytes, name: str) -> bytes:
+    """Manifest of another install-time asset pack split with the split name changed."""
+    try:
+        document = axml.Document(template)
+        root = document.tree()
+        splits = [attr for attr in root.attributes if attr.namespace is None and attr.name == "split"]
+        if len(splits) != 1 or splits[0].type != axml.TYPE_STRING:
+            raise KitError(f"cannot write the manifest of the {name} asset pack: the template has no split name")
+        index = document.string(name)
+        struct.pack_into("<IHBBI", document.parts[root.start][1], splits[0].offset + 8, index, 8, 0,
+                         axml.TYPE_STRING, index)
+        result = document.to_bytes()
+        info = xrmanifest.read_package_info(result)
+    except (axml.AxmlError, xrmanifest.ManifestError) as error:
+        raise KitError(f"cannot write the manifest of the {name} asset pack: {error}") from error
+    if info.split != name or not is_install_time_asset_pack(result):
+        raise KitError(f"cannot write the manifest of the {name} asset pack")
+    return result
+
+
+def package_asset_packs(package: GamePackage, build: Path) -> None:
+    """Turn every asset-packs folder into split_<pack>.apk next to the exported splits."""
+    if not package.asset_packs:
+        return
+    folder = clean_directory(build / "packs", build)
+    template = read_entry(package.asset_pack_template.path, "AndroidManifest.xml")
+    for pack in package.asset_packs:
+        name = f"split_{pack.name}.apk"
+        step(f"packaging {ASSET_PACK_FOLDER}/{pack.name} as {name}")
+        target = folder / name
+        try:
+            apkzip.write_stored_apk(target, asset_pack_manifest(template, pack.name), pack.files)
+        except (OSError, apkzip.ApkZipError) as error:
+            raise KitError(f"cannot package {ASSET_PACK_FOLDER}/{pack.name}: {error}") from error
+        apk = open_apk(target, name)
+        if (apk.info.package, apk.info.split, apk.info.version_code) != (
+            package.base.info.package, pack.name, VERSION_CODE,
+        ):
+            raise KitError(f"{name} does not match the game package")
+        package.apks.append(apk)
+    package.apks = [package.base] + sorted(
+        (apk for apk in package.apks if apk is not package.base), key=lambda apk: apk.name
+    )
+
+
 def validate_package(
     options: Options, build: Path, tools: Toolchain, runner: Runner, expected: Expected
 ) -> GamePackage:
@@ -661,6 +790,22 @@ def validate_package(
     apks = [base] + sorted((apk for apk in apks if apk is not base), key=lambda apk: apk.name)
 
     check_third_party_markers(apks)
+    packs = read_asset_packs(asset_pack_root(options.game_package), set(splits))
+    template = None
+    if packs:
+        present = set().union(*(apk.entries for apk in apks))
+        repeated = sorted(name for pack in packs for name, _ in pack.files if name in present)
+        if repeated:
+            raise KitError(f"the {ASSET_PACK_FOLDER} folder repeats files that are already in the APKs",
+                           "\n".join(repeated[:20]))
+        templates = [
+            apk for apk in apks
+            if apk.info.split is not None and is_install_time_asset_pack(read_entry(apk.path, "AndroidManifest.xml"))
+        ]
+        if not templates:
+            raise KitError(f"the {ASSET_PACK_FOLDER} folder needs the exported data splits (split_data0.apk) "
+                           "in the same export folder")
+        template = templates[0]
 
     engines = [apk for apk in apks if ENGINE_ENTRY in apk.entries]
     if len(engines) != 1:
@@ -718,6 +863,8 @@ def validate_package(
         signer=base.signer,
         game_dex_compatibility=dex_compatibility,
         prepared_manifest=prepared_manifest,
+        asset_packs=packs,
+        asset_pack_template=template,
     )
     if base.info.package == xrmanifest.NETFLIX_PACKAGE:
         for name in names:
@@ -733,13 +880,11 @@ def validate_package(
 
 def check_game_data(package):
     present = set().union(*(apk.entries for apk in package.apks))
+    present.update(name for pack in package.asset_packs for name, _ in pack.files)
     missing = [name for name in DATA_FILES if name not in present]
     if missing:
-        raise KitError("the game data is incomplete. The FULL game is required, including all world and audio files. "
-                       "Open the game on your phone, wait for ALL additional data to download, and check that you can enter the game world. "
-                       "Then export the complete game again with EXPORT_RDR_APKS.bat. "
-                       "Do not rely on the Quest to download missing files. A second edition is not required.",
-                       "\n".join(missing))
+        netflix = package.base.info.package == xrmanifest.NETFLIX_PACKAGE
+        raise KitError(NETFLIX_DATA_MESSAGE if netflix else INCOMPLETE_DATA_MESSAGE, "\n".join(missing))
 
 
 def hash_engine(package: GamePackage, destination: Path | None, expected: Expected) -> None:
@@ -1310,9 +1455,10 @@ def run(options: Options, self_test: SelfTest | None = None) -> int:
         say(f"Report: {build / 'validation.json'}")
         return 0
 
-    total = sum(apk.size for apk in package.apks)
-    largest = max(apk.size for apk in package.apks)
-    require_free_space(build, total + largest + expected.engine_size + 2 * GIB, "the build")
+    packs = sum(pack.size for pack in package.asset_packs)
+    total = sum(apk.size for apk in package.apks) + packs
+    largest = max([apk.size for apk in package.apks] + [pack.size for pack in package.asset_packs])
+    require_free_space(build, total + packs + largest + expected.engine_size + 2 * GIB, "the build")
     ensure_keystore(tools, runner, options.keystore)
 
     step("extracting the game engine")
@@ -1381,6 +1527,7 @@ def run(options: Options, self_test: SelfTest | None = None) -> int:
         "build_info": build_info,
         "licenses": {name: files[name].read_bytes() for name in LICENSE_FILES},
     }
+    package_asset_packs(package, build)
     outputs, certificate = assemble(package, build, tools, runner, options.keystore, contents, options.reuse_build)
     check_output_manifest(package, build, tools, runner, options.trade)
 
@@ -1405,9 +1552,11 @@ def run(options: Options, self_test: SelfTest | None = None) -> int:
             "outputSignerHashCode": apkzip.java_hash_code(certificate),
             "outputs": outputs,
             "external": package.external,
+            "assetPacks": asset_pack_record(package),
         },
     )
     remove_file(engine_path)
+    shutil.rmtree(build / "packs", ignore_errors=True)
     say(f"APK output: {build / 'out'}")
     say(f"Build manifest: {build / 'build-manifest.json'}")
     return 0
@@ -1433,7 +1582,12 @@ def validation_record(package: GamePackage) -> dict:
         "gameDexCompatibility": package.game_dex_compatibility,
         "loaderDex": package.loader_dex,
         "external": package.external,
+        "assetPacks": asset_pack_record(package),
     }
+
+
+def asset_pack_record(package: GamePackage) -> list[dict]:
+    return [{"name": pack.name, "files": len(pack.files), "size": pack.size} for pack in package.asset_packs]
 
 
 def parse_args(argv=None) -> Options:

@@ -26,8 +26,10 @@ function Get-GameInputCacheKey {
     }
     $root = if ($item.PSIsContainer) { $item.FullName } else { $item.DirectoryName }
     $files = @(Get-ChildItem -LiteralPath $root -File | Where-Object { $_.Name -eq 'base.apk' -or $_.Name -like 'split_*.apk' })
-    $external = Join-Path $root 'external'
-    if (Test-Path -LiteralPath $external -PathType Container) { $files += @(Get-ChildItem -LiteralPath $external -Recurse -File) }
+    foreach ($folder in @('external', 'asset-packs')) {
+        $extra = Join-Path $root $folder
+        if (Test-Path -LiteralPath $extra -PathType Container) { $files += @(Get-ChildItem -LiteralPath $extra -Recurse -File) }
+    }
     if ($files.Count -eq 0) { return $null }
     $lines = foreach ($file in @($files | Sort-Object FullName)) {
         Write-Host "Checking saved input $($file.Name)..."

@@ -1736,6 +1736,7 @@ function Invoke-Main {
     Write-Host "This tool needs your own Red Dead Redemption $($script:ExpectedVersionName) for Android, exported from your phone with EXPORT_RDR_APKS.bat."
     Write-Host 'FULL GAME REQUIRED: a small APK or an incomplete XAPK is not enough.' -ForegroundColor Yellow
     Write-Host 'On your phone, open the game, let it download ALL additional data, and check that you can enter the game world. Then export the complete game with EXPORT_RDR_APKS.bat.'
+    Write-Host 'Netflix edition: its downloaded data can be exported only from a rooted phone; EXPORT_RDR_APKS.bat saves it in the asset-packs folder of the export.'
     Write-Host 'The Quest installer needs all game data in the selected input; do not rely on the Quest to download missing files.'
     Write-Host 'It does not download or redistribute game APKs or game data.'
     Write-Host "Work directory: $resolvedWorkDir"

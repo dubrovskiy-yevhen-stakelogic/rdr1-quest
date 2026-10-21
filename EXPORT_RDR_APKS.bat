@@ -16,11 +16,12 @@ echo  RED DEAD REDEMPTION - EXPORT YOUR GAME FROM AN ANDROID PHONE
 echo ================================================================
 echo.
 echo Connect the Android phone or tablet where Red Dead Redemption
-echo (Google Play version) is installed and has been launched
-echo once, then approve USB debugging on the phone.
+echo (Google Play or Netflix version) is installed and has finished
+echo downloading all data, then approve USB debugging on the phone.
 echo Seeing the phone in Windows File Explorer is not enough by itself.
+echo The Netflix version needs a rooted phone for its downloaded data.
 echo.
-echo About 6 GB of free disk space is needed on drive C:.
+echo About 9 GB of free disk space is needed on drive C:.
 echo.
 
 set "RDRVR_EXPORT=%~dp0tools\export-rdr-apks.ps1"

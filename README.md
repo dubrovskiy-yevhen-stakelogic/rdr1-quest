@@ -29,8 +29,9 @@ replaced.
 1. **Download the full game on your phone first.** Open it, wait for all
    additional data to download, and check that you can enter the game world.
    Then export it with `EXPORT_RDR_APKS.bat`. Keep the whole export folder:
-   `base.apk`, every `split_*.apk` and the `external` folder. A small APK or
-   incomplete XAPK is not enough; do not rely on the Quest to download missing data.
+   `base.apk`, every `split_*.apk` and the `asset-packs` and `external`
+   folders. A small APK or incomplete XAPK is not enough; do not rely on the
+   Quest to download missing data.
 2. Run `BUILD_AND_INSTALL.bat` on Windows or `bash BUILD_AND_INSTALL.sh` on
    Linux/macOS.
 3. Select the export folder.
@@ -55,6 +56,15 @@ accepted. Some XAPKs contain the engine and initial data but omit the world and
 audio packs. If the installer reports missing resources, let that same game
 finish downloading on the phone and export it again. A second edition is not
 required, and the installer does not supply game files.
+
+The Google Play edition installs all of its data as APK files, so it exports
+completely from any phone. The Netflix edition installs only part of the data
+as APK files and downloads the world, cutscene and audio packs (about 3.7 GB)
+into the app's private storage, which Android lets only a rooted phone copy
+over USB. On a rooted phone `EXPORT_RDR_APKS.bat` asks for superuser access for
+Shell, copies these packs into the `asset-packs` folder of the export and
+checks every file; the builder turns them into APK files for the Quest. Without
+root the Netflix edition cannot be exported completely.
 
 Keep the personal signing key (see [BUILDING.md](BUILDING.md)). Updates must be
 signed with the same key; otherwise Android requires uninstalling the game,

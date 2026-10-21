@@ -17,14 +17,27 @@ $script:PackageName = $null
 $script:PackageLabel = $null
 $script:ExpectedVersionName = '1.58.63226194'
 $script:ExpectedVersionCode = '63226194'
-$script:SupportedEngineSha256 = '3F80845EDEC32A663C42A8570E3131446813E695076C4BC96E2142C190BC22F3'
+# Engine variants 1 and 2, as in tools/engine_profiles.py.
+$script:SupportedEngineSha256 = @(
+    '3F80845EDEC32A663C42A8570E3131446813E695076C4BC96E2142C190BC22F3',
+    '0F288E2F9255D04277190BB5FFCA742EC395D33A47FB305DDB22B9F0E904EF72'
+)
 $script:EngineEntry = 'lib/arm64-v8a/librdr.so'
-$script:RequiredDataEntries = @(
+# The same list as DATA_FILES in build.py.
+$script:RequiredDataEntries = @(@(
     'act', 'animationres', 'camera', 'flash', 'fonts', 'fragments', 'gringores', 'mapres',
     'naturalmotion', 'navres', 'shaders', 'strings', 'terrainboundres', 'terrainlodres',
     'textures', 'treeres', 'tune', 'vfx', 'vgd'
-) | ForEach-Object { "assets/data/$($_)_android.rpf" }
-$script:MinimumFreeBytes = 6GB
+) | ForEach-Object { "assets/data/$($_)_android.rpf" }) + @(@(
+    'content', 'cutscene', 'grassres', 'psocache', 'audio', 'audio2', 'base/content'
+) | ForEach-Object { "assets/game/$($_)_android.rpf" })
+$script:NetflixPackage = 'com.netflix.NGP.Kamo'
+# Packs that Google Play delivers after installation stay in the app's private storage,
+# files/assetpacks/<pack>/<versionCode>/<packVersion>/assets, which only root can read.
+# They are saved as asset-packs/<pack>/assets/... and build.py turns them into split APKs.
+$script:AssetPackFolder = 'asset-packs'
+$script:PhoneStage = '/data/local/tmp/rdrvr-export'
+$script:MinimumFreeBytes = 9GB
 $script:PlatformToolsName = 'platform-tools_r37.0.1-win.zip'
 $script:PlatformToolsUri = 'https://dl.google.com/android/repository/platform-tools_r37.0.1-win.zip'
 $script:PlatformToolsSha256 = '45F4D63113E895EBDE0C90F194099A4676B6AC653BD28D54314A9E022BBC1A99'
@@ -306,6 +319,135 @@ function Export-ExternalFolder {
     return $true
 }
 
+function Invoke-Phone {
+    param(
+        [Parameter(Mandatory = $true)][string]$Command,
+        [switch]$Root,
+        [switch]$AllowFailure
+    )
+    if ($Command.Contains("'")) { throw "Unsupported phone command: $Command" }
+    $remote = if ($Root.IsPresent) { "su -c '$Command'" } else { $Command }
+    return Invoke-NativeCapture -FilePath $script:Adb -Arguments @(
+        '-s', $script:SelectedSerial, 'shell', $remote
+    ) -AllowFailure:$AllowFailure
+}
+
+function Test-PhoneRoot {
+    Write-Host 'Checking for root access. If the phone asks to grant superuser access to Shell, allow it.' -ForegroundColor Cyan
+    $probe = Invoke-Phone -Command 'id -u' -Root -AllowFailure
+    return ($probe.ExitCode -eq 0 -and @($probe.Lines | ForEach-Object { $_.Trim() }) -contains '0')
+}
+
+function Get-PhoneDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $result = Invoke-Phone -Command "ls -1 $Path" -Root -AllowFailure
+    if ($result.ExitCode -ne 0) { return @() }
+    return @($result.Lines | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+}
+
+function Get-PrivateAssetPackFiles {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$InstalledSplits)
+    $remoteRoot = "/data/user/0/$($script:PackageName)/files/assetpacks"
+    $plan = @()
+    $packs = @(Get-PhoneDirectory -Path $remoteRoot | Where-Object {
+        $_ -cmatch '^[A-Za-z][A-Za-z0-9_]*$' -and $InstalledSplits -notcontains $_
+    })
+    foreach ($pack in $packs) {
+        $versions = @(Get-PhoneDirectory -Path "$remoteRoot/$pack" | Where-Object { $_ -match '^\d+$' })
+        $appVersion = if ($versions -contains $script:ExpectedVersionCode) { $script:ExpectedVersionCode }
+            elseif ($versions.Count -eq 1) { $versions[0] } else { $null }
+        $packVersions = @(if ($null -ne $appVersion) {
+            Get-PhoneDirectory -Path "$remoteRoot/$pack/$appVersion" | Where-Object { $_ -match '^\d+$' } |
+                Sort-Object { [int64]$_ } -Descending
+        })
+        if ($packVersions.Count -eq 0) {
+            Write-Host "WARNING: the $pack pack has no complete download for this game version on the phone." -ForegroundColor Yellow
+            continue
+        }
+        $assets = "$remoteRoot/$pack/$appVersion/$($packVersions[0])/assets"
+        $listing = Invoke-Phone -Command "cd $assets && find . -type f -exec stat -c %s:%n {} +" -Root -AllowFailure
+        if ($listing.ExitCode -ne 0) {
+            Write-Host "WARNING: the $pack pack is not fully downloaded on the phone." -ForegroundColor Yellow
+            continue
+        }
+        foreach ($line in $listing.Lines) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            if ($line -notmatch '^(\d+):\./(.+?)\s*$') { throw "Unexpected file listing from the phone: $line" }
+            $bytes = [int64]$Matches[1]
+            $relative = $Matches[2]
+            if ($relative -notmatch '^[A-Za-z0-9_+-][A-Za-z0-9_.+-]*(/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*)*$' -or
+                $relative.EndsWith('.partial')) {
+                throw "Unsupported file name in the $pack pack: $relative"
+            }
+            $plan += [pscustomobject]@{ Pack = $pack; Remote = "$assets/$relative"; Relative = $relative; Bytes = $bytes }
+        }
+    }
+    return $plan
+}
+
+function Export-PrivateAssetPacks {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$InstalledSplits
+    )
+    $plan = @(Get-PrivateAssetPackFiles -InstalledSplits $InstalledSplits)
+    if ($plan.Count -eq 0) { return @() }
+    [int64]$total = ($plan | Measure-Object -Property Bytes -Sum).Sum
+    [int64]$largest = ($plan | Measure-Object -Property Bytes -Maximum).Maximum
+    $drive = New-Object System.IO.DriveInfo ([System.IO.Path]::GetPathRoot($LocalRoot))
+    if ($drive.AvailableFreeSpace -lt $total + 512MB) {
+        throw ("Not enough free space on {0} for the downloaded game packs: {1:N1} GB free, {2:N1} GB needed." -f `
+            $drive.Name, ($drive.AvailableFreeSpace / 1GB), (($total + 512MB) / 1GB))
+    }
+    $df = Invoke-Phone -Command 'df -k /data/local/tmp' -AllowFailure
+    $fields = @((@($df.Lines | Where-Object { $_ -match '\S' }) | Select-Object -Last 1) -split '\s+')
+    if ($df.ExitCode -eq 0 -and $fields.Count -ge 4 -and $fields[3] -match '^\d+$' -and [int64]$fields[3] * 1KB -lt $largest + 256MB) {
+        throw ("The phone needs {0:N1} GB of free storage to copy the largest game pack file. Free some space on the phone and export again." -f `
+            (($largest + 256MB) / 1GB))
+    }
+    $packs = @($plan | ForEach-Object Pack | Select-Object -Unique)
+    Write-Host ("Copying {0} downloaded game pack(s) ({1}), {2:N1} GB, from the app's private storage..." -f `
+        $packs.Count, ($packs -join ', '), ($total / 1GB)) -ForegroundColor Cyan
+    $staged = "$($script:PhoneStage)/file.bin"
+    try {
+        Invoke-Phone -Command "rm -rf $($script:PhoneStage)" -Root | Out-Null
+        Invoke-Phone -Command "mkdir -p $($script:PhoneStage)" | Out-Null
+        $done = 0
+        foreach ($item in $plan) {
+            $done++
+            Write-Host ("[{0}/{1}] {2}/{3} ({4:N0} MB)" -f $done, $plan.Count, $item.Pack, $item.Relative, ($item.Bytes / 1MB))
+            $target = Join-Path (Join-Path (Join-Path $LocalRoot $item.Pack) 'assets') ($item.Relative.Replace('/', '\'))
+            $partial = "$target.partial"
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+            $hash = Invoke-Phone -Command "sha256sum $($item.Remote)" -Root
+            $expected = ([string]($hash.Lines | Select-Object -First 1)).Trim().Split(' ')[0].ToUpperInvariant()
+            if ($expected -notmatch '^[0-9A-F]{64}$') { throw "Cannot read the checksum of $($item.Remote) on the phone." }
+            Invoke-Phone -Command "cp $($item.Remote) $staged && chmod 644 $staged" -Root | Out-Null
+            try {
+                $pull = Invoke-NativeCapture -FilePath $script:Adb -Arguments @(
+                    '-s', $script:SelectedSerial, 'pull', $staged, $partial
+                ) -AllowFailure
+                if ($pull.ExitCode -ne 0) {
+                    throw "Copying $($item.Pack)/$($item.Relative) failed. Keep the phone unlocked and connected, then retry.`n$($pull.Text)"
+                }
+                if ((Get-Item -LiteralPath $partial).Length -ne $item.Bytes -or
+                    (Get-FileHash -Algorithm SHA256 -LiteralPath $partial).Hash -ne $expected) {
+                    throw "The copy of $($item.Pack)/$($item.Relative) does not match the file on the phone. Export again."
+                }
+                Move-Item -LiteralPath $partial -Destination $target
+            }
+            finally {
+                if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force }
+                Invoke-Phone -Command "rm -f $staged" -Root -AllowFailure | Out-Null
+            }
+        }
+    }
+    finally {
+        Invoke-Phone -Command "rm -rf $($script:PhoneStage)" -Root -AllowFailure | Out-Null
+    }
+    return $packs
+}
+
 function Export-Game {
     param([Parameter(Mandatory = $true)][string[]]$RemotePaths)
     $resolvedDestination = if ([string]::IsNullOrWhiteSpace($Destination)) {
@@ -324,7 +466,7 @@ function Export-Game {
             $drive.Name, ($drive.AvailableFreeSpace / 1GB), ($script:MinimumFreeBytes / 1GB))
     }
 
-    Write-Host 'The game is about 3 GB. Copying takes a few minutes; keep the phone unlocked and connected.' -ForegroundColor Cyan
+    Write-Host 'The full game is about 7 GB. Copying takes several minutes; keep the phone unlocked and connected.' -ForegroundColor Cyan
     foreach ($remotePath in $RemotePaths) {
         Write-Host "Exporting $remotePath"
         $pull = Invoke-NativeCapture -FilePath $script:Adb -Arguments @(
@@ -366,17 +508,33 @@ function Export-Game {
         finally { $archive.Dispose() }
         $apkReport += [pscustomobject]@{ Name = $apk.Name; Bytes = $apk.Length }
     }
-    if (Test-Path -LiteralPath $extraRoot) {
-        foreach ($file in @(Get-ChildItem -LiteralPath $extraRoot -Recurse -File -Filter '*_android.rpf')) {
-            $key = "assets/data/$($file.Name)"
-            if ($script:RequiredDataEntries -contains $key -and -not $foundData.ContainsKey($key)) {
-                $foundData[$key] = $file.FullName.Substring($resolvedDestination.Length + 1)
+    $missingData = @($script:RequiredDataEntries | Where-Object { -not $foundData.ContainsKey($_) })
+    $rootAccess = $null
+    $privatePacks = @()
+    if ($missingData.Count -gt 0) {
+        Write-Host "$($missingData.Count) game data file(s) are not in the installed APKs. They are in game packs downloaded after installation."
+        $rootAccess = Test-PhoneRoot
+        if ($rootAccess) {
+            $splits = @($localApks | Where-Object Name -match '^split_(.+)\.apk$' | ForEach-Object { $_.Name -replace '^split_(.+)\.apk$', '$1' })
+            # The folder gets its final name only after every pack file was copied and verified.
+            $packRoot = Join-Path $resolvedDestination $script:AssetPackFolder
+            $privatePacks = @(Export-PrivateAssetPacks -LocalRoot "$packRoot.partial" -InstalledSplits $splits)
+            if ($privatePacks.Count -gt 0) { Move-Item -LiteralPath "$packRoot.partial" -Destination $packRoot }
+            foreach ($pack in $privatePacks) {
+                $assets = Join-Path (Join-Path $packRoot $pack) 'assets'
+                foreach ($file in @(Get-ChildItem -LiteralPath $assets -Recurse -File)) {
+                    $key = 'assets/' + $file.FullName.Substring($assets.Length + 1).Replace('\', '/')
+                    if (-not $foundData.ContainsKey($key)) { $foundData[$key] = "$($script:AssetPackFolder)/$pack" }
+                }
             }
+            $missingData = @($script:RequiredDataEntries | Where-Object { -not $foundData.ContainsKey($_) })
+        }
+        else {
+            Write-Host 'No root access over USB; the downloaded game packs cannot be copied.' -ForegroundColor Yellow
         }
     }
-    $missingData = @($script:RequiredDataEntries | Where-Object { -not $foundData.ContainsKey($_) })
     $engineSha = if ($engineHashes.Count -eq 1) { $engineHashes[0].Sha256 } else { $null }
-    $engineMatches = ($engineSha -eq $script:SupportedEngineSha256)
+    $engineMatches = ($null -ne $engineSha -and $script:SupportedEngineSha256 -contains $engineSha)
 
     $report = [ordered]@{
         tool = 'export-rdr-apks'
@@ -389,6 +547,8 @@ function Export-Game {
         apks = $apkReport
         obbCopied = $gotObb
         assetPacksCopied = $gotPacks
+        rootAccess = $rootAccess
+        privateAssetPacks = $privatePacks
         engineApk = if ($engineHashes.Count -eq 1) { $engineHashes[0].Apk } else { $null }
         engineSha256 = $engineSha
         engineMatchesSupportedBuild = $engineMatches
@@ -402,7 +562,14 @@ function Export-Game {
         throw "Exported set is not usable on Quest: expected exactly one APK containing $($script:EngineEntry), found $($engineHashes.Count). Use a real 64-bit ARM Android phone/tablet (not an emulator) and export again. Report: $reportPath"
     }
     if ($missingData.Count -gt 0) {
-        throw "Export is incomplete; these game data files were not found:`n  $($missingData -join "`n  ")`nLaunch the game on the phone once and let it finish downloading all data, then export again. Report: $reportPath"
+        $list = "`n  $($missingData -join "`n  ")`n"
+        if ($script:PackageName -eq $script:NetflixPackage -and -not $rootAccess) {
+            throw ("Export is incomplete. The Netflix edition keeps its world, cutscene and audio packs (about 3.7 GB) in the app's private storage, " +
+                "and Android lets only a rooted phone copy them over USB. Missing files:$list" +
+                "Export again from a rooted phone and allow superuser access for Shell when the phone asks, " +
+                "or export the Google Play edition (com.rockstargames.rdr), which installs all data as APK files. Report: $reportPath")
+        }
+        throw "Export is incomplete; these game data files were not found:$($list)Launch the game on the phone once and let it finish downloading all data, then export again. Report: $reportPath"
     }
     Write-Host 'EXPORT COMPLETED.' -ForegroundColor Green
     Write-Host "Folder: $resolvedDestination"
@@ -414,7 +581,10 @@ function Export-Game {
         Write-Host 'The game engine does NOT match the version supported by the VR mod; the builder will refuse this export.' -ForegroundColor Yellow
         Write-Host 'Keep the files. export-report.json lists only file names, sizes and a hash, and contains no game data.' -ForegroundColor Yellow
     }
-    Write-Host 'Keep base.apk and every split_*.apk (and the external folder, if present) together. Do not rename them.' -ForegroundColor Cyan
+    if ($privatePacks.Count -gt 0) {
+        Write-Host "Downloaded game packs saved in $($script:AssetPackFolder): $($privatePacks -join ', ')" -ForegroundColor Green
+    }
+    Write-Host "Keep base.apk, every split_*.apk and the $($script:AssetPackFolder) and external folders (if present) together. Do not rename them." -ForegroundColor Cyan
     Start-Process -FilePath 'explorer.exe' -ArgumentList @($resolvedDestination)
     return $resolvedDestination
 }

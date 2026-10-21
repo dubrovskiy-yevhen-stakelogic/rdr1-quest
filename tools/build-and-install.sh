@@ -1314,6 +1314,7 @@ main() {
   echo "with EXPORT_RDR_APKS.bat on a Windows PC (the folder with base.apk and the split_*.apk files)."
   echo "FULL GAME REQUIRED: a small APK or an incomplete XAPK is not enough."
   echo "On your phone, open the game, let it download ALL additional data, and check that you can enter the game world. Then export the complete game with EXPORT_RDR_APKS.bat."
+  echo "Netflix edition: its downloaded data can be exported only from a rooted phone; EXPORT_RDR_APKS.bat saves it in the asset-packs folder of the export."
   echo "The Quest installer needs all game data in the selected input; do not rely on the Quest to download missing files."
   echo "It does not download or redistribute game APKs or game data."
   echo "Work directory: $WORK_DIR"

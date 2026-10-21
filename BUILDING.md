@@ -80,6 +80,16 @@ the package name. Unknown engines are refused with their hash and a request
 to contact the author. The original engine is retained. Packages modified by
 third parties and incomplete game data are refused.
 
+Asset packs that Google Play delivers after installation (the Netflix world,
+cutscene and audio packs) stay in the app's private storage,
+`files/assetpacks/<pack>/<versionCode>/<packVersion>/assets`. On a rooted phone
+the exporter copies them, verified by SHA-256, to
+`asset-packs/<pack>/assets/...` next to `base.apk`. `tools/build.py` packages
+each folder as `split_<pack>.apk`: the manifest of an exported install-time
+asset pack split with the split name changed, and the files stored
+uncompressed. A pack that is also exported as an APK split is taken from the
+APK.
+
 Variant 2 uses the checked source profile in `tools/engine-profiles/variant-2.json`.
 It is applied to a private copy under the build directory; source and result
 hashes prevent silently applying stale edits after a shared source change.

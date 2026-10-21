@@ -2,7 +2,8 @@
 
 Retained entries are copied with their local headers and compressed data unchanged,
 so game assets are never recompressed. Rebuilding the central directory drops the
-old APK signing block. ZIP64 archives are refused in both directions.
+old APK signing block. ZIP64 archives are refused in both directions. New asset
+pack splits are written with their files stored uncompressed.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import os
 import re
 import struct
 import zipfile
+import zlib
 from pathlib import Path
 
 ZIP32_LIMIT = 0xFFFFFFFF
@@ -174,6 +176,84 @@ def write_apk(
                 output.write(
                     struct.pack("<4s4H2IH", b"PK\x05\x06", 0, 0, len(records), len(records), size, directory, 0)
                 )
+    except BaseException:
+        if created:
+            try:
+                os.remove(target)
+            except OSError:
+                pass
+        raise
+
+
+def _dos_time(moment) -> tuple[int, int]:
+    year, month, day, hour, minute, second = moment
+    return (hour << 11) | (minute << 5) | (second // 2), ((year - 1980) << 9) | (month << 5) | day
+
+
+def write_stored_apk(
+    target: Path,
+    manifest: bytes,
+    files: list[tuple[str, Path]],
+    *,
+    limit: int = ZIP32_LIMIT,
+) -> None:
+    """Write a new APK: a deflated AndroidManifest.xml, then each file stored uncompressed.
+
+    files lists (entry name, source file); sources are streamed in blocks.
+    """
+    names = ["AndroidManifest.xml"] + [name for name, _ in files]
+    if len(names) != len(set(names)):
+        raise ApkZipError("duplicate ZIP entries")
+    if len(names) >= 0xFFFF:
+        raise ApkZipError("the APK would need ZIP64; it is not supported")
+    for name in names:
+        if signature_entry(name) or not name or name.startswith("/") or "\\" in name:
+            raise ApkZipError(f"invalid entry name for an APK: {name}")
+    time, date = _dos_time(ENTRY_TIME)
+    records = []
+    created = False
+    try:
+        with open(target, "xb") as output:
+            created = True
+            for name, source in [("AndroidManifest.xml", None), *files]:
+                encoded = name.encode("utf-8")
+                flags = 0 if encoded.isascii() else 0x800
+                offset = output.tell()
+                if source is None:
+                    compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
+                    data = compressor.compress(manifest) + compressor.flush()
+                    method, version = zipfile.ZIP_DEFLATED, 20
+                    crc, size, packed = zlib.crc32(manifest), len(manifest), len(data)
+                    output.write(struct.pack("<4s5H3I2H", b"PK\x03\x04", version, flags, method, time, date,
+                                             crc, packed, size, len(encoded), 0))
+                    output.write(encoded + data)
+                else:
+                    method, version, crc, size = zipfile.ZIP_STORED, 10, 0, 0
+                    output.write(struct.pack("<4s5H3I2H", b"PK\x03\x04", version, flags, method, time, date,
+                                             0, 0, 0, len(encoded), 0))
+                    output.write(encoded)
+                    with open(source, "rb") as stream:
+                        for block in iter(lambda: stream.read(BLOCK), b""):
+                            if output.tell() + len(block) >= limit:
+                                raise ApkZipError("the APK would exceed 4 GiB; ZIP64 is not supported")
+                            size += len(block)
+                            crc = zlib.crc32(block, crc)
+                            output.write(block)
+                    packed = size
+                    end = output.tell()
+                    output.seek(offset + 14)
+                    output.write(struct.pack("<3I", crc, packed, size))
+                    output.seek(end)
+                records.append(struct.pack("<4s6H3I5H2I", b"PK\x01\x02", 0x0300 | version, version, flags, method,
+                                           time, date, crc, packed, size, len(encoded), 0, 0, 0, 0,
+                                           0o100644 << 16, offset) + encoded)
+            directory = output.tell()
+            for record in records:
+                output.write(record)
+            size = output.tell() - directory
+            if output.tell() >= limit:
+                raise ApkZipError("the APK would need ZIP64; it is not supported")
+            output.write(struct.pack("<4s4H2IH", b"PK\x05\x06", 0, 0, len(records), len(records), size, directory, 0))
     except BaseException:
         if created:
             try:

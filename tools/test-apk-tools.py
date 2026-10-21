@@ -200,6 +200,17 @@ def split_manifest(split: str) -> bytes:
     return encode_manifest(root)
 
 
+def asset_pack_split_manifest(split: str) -> bytes:
+    module = Node("module", plain={"type": "asset-pack"}, children=[Node("delivery", children=[Node("install-time")])])
+    root = Node(
+        "manifest",
+        {"versionCode": 63226194},
+        [module, Node("application", {"hasCode": False})],
+        plain={"package": PACKAGE, "split": split},
+    )
+    return encode_manifest(root)
+
+
 def access_manifest(trade_value: int = -1) -> bytes:
     root = Node(
         "manifest",
@@ -586,6 +597,39 @@ class ApkZipTests(unittest.TestCase):
         with self.assertRaises(apkzip.ApkZipError):
             apkzip.write_apk(source, self.root / "sig.apk", {"META-INF/A.RSA": (b"", zipfile.ZIP_STORED)})
 
+    def test_write_stored_apk(self):
+        first = self.root / "a.rpf"
+        first.write_bytes(bytes(range(256)) * (apkzip.BLOCK // 256) + b"tail")
+        second = self.root / "b.bin"
+        second.write_bytes(b"")
+        target = self.root / "pack.apk"
+        apkzip.write_stored_apk(target, b"<manifest/>" * 20,
+                                [("assets/game/a.rpf", first), ("assets/game/sub/b.bin", second)])
+        with zipfile.ZipFile(target) as archive:
+            entries = apkzip.inventory(archive)
+            self.assertIsNone(archive.testzip())
+            self.assertEqual(list(entries), ["AndroidManifest.xml", "assets/game/a.rpf", "assets/game/sub/b.bin"])
+            self.assertEqual([e.compress_type for e in entries.values()],
+                             [zipfile.ZIP_DEFLATED, zipfile.ZIP_STORED, zipfile.ZIP_STORED])
+            self.assertEqual(archive.read("AndroidManifest.xml"), b"<manifest/>" * 20)
+            self.assertEqual(archive.read("assets/game/a.rpf"), first.read_bytes())
+        copy = self.root / "pack-copy.apk"
+        apkzip.write_apk(target, copy, {})
+        apkzip.verify_payload(target, copy, {})
+        again = self.root / "pack-again.apk"
+        apkzip.write_stored_apk(again, b"<manifest/>" * 20,
+                                [("assets/game/a.rpf", first), ("assets/game/sub/b.bin", second)])
+        self.assertEqual(again.read_bytes(), target.read_bytes())
+        with self.assertRaises(FileExistsError):
+            apkzip.write_stored_apk(target, b"x", [])
+        with self.assertRaisesRegex(apkzip.ApkZipError, "4 GiB"):
+            apkzip.write_stored_apk(self.root / "small.apk", b"x", [("assets/a", first)], limit=1024)
+        self.assertFalse((self.root / "small.apk").exists())
+        with self.assertRaisesRegex(apkzip.ApkZipError, "duplicate"):
+            apkzip.write_stored_apk(self.root / "dup.apk", b"x", [("assets/a", first), ("assets/a", second)])
+        with self.assertRaisesRegex(apkzip.ApkZipError, "invalid entry"):
+            apkzip.write_stored_apk(self.root / "sig.apk", b"x", [("META-INF/CERT.RSA", first)])
+
     def test_signature_entries(self):
         for name in ("META-INF/MANIFEST.MF", "META-INF/KEY0.SF", "META-INF/x.rsa", "META-INF/B.EC",
                      "stamp-cert-sha256"):
@@ -787,10 +831,70 @@ class BuildHelperTests(unittest.TestCase):
 
     def test_incomplete_world_resources_refused(self):
         from types import SimpleNamespace
-        only_data = {name: None for name in build.DATA_FILES if name.startswith("assets/data/")}
-        with self.assertRaisesRegex(build.KitError, "incomplete"):
-            build.check_game_data(SimpleNamespace(apks=[SimpleNamespace(entries=only_data)]))
-        build.check_game_data(SimpleNamespace(apks=[SimpleNamespace(entries={name: None for name in build.DATA_FILES})]))
+
+        def package(names, packs=(), name=PACKAGE):
+            return SimpleNamespace(apks=[SimpleNamespace(entries={n: None for n in names})], asset_packs=list(packs),
+                                   base=SimpleNamespace(info=SimpleNamespace(package=name)))
+
+        only_data = [name for name in build.DATA_FILES if name.startswith("assets/data/")]
+        with self.assertRaisesRegex(build.KitError, "incomplete") as caught:
+            build.check_game_data(package(only_data))
+        self.assertEqual(caught.exception.message, build.INCOMPLETE_DATA_MESSAGE)
+        self.assertIn("assets/game/base/content_android.rpf", caught.exception.details)
+        with self.assertRaises(build.KitError) as caught:
+            build.check_game_data(package(only_data, name=xrmanifest.NETFLIX_PACKAGE))
+        self.assertEqual(caught.exception.message, build.NETFLIX_DATA_MESSAGE)
+        build.check_game_data(package(build.DATA_FILES))
+        game = [(name, None) for name in build.DATA_FILES if name.startswith("assets/game/")]
+        build.check_game_data(package(only_data, [build.AssetPack("game0", game, 0)], xrmanifest.NETFLIX_PACKAGE))
+
+    def test_asset_pack_folders(self):
+        folder = self.make_set(self.root / "packs-export")
+        packs = folder / build.ASSET_PACK_FOLDER
+        self.assertIsNone(build.asset_pack_root(folder))
+        (packs / "game0" / "assets" / "game" / "base").mkdir(parents=True)
+        (packs / "game0" / "assets" / "game" / "content_android.rpf").write_bytes(b"content")
+        (packs / "game0" / "assets" / "game" / "base" / "content_android.rpf").write_bytes(b"base")
+        (packs / "data0" / "assets" / "data").mkdir(parents=True)
+        (packs / "data0" / "assets" / "data" / "act_android.rpf").write_bytes(b"act")
+        self.assertEqual(build.asset_pack_root(folder), packs)
+        self.assertEqual(build.asset_pack_root(folder / "base.apk"), packs)
+        self.assertIsNone(build.asset_pack_root(folder / "split_data0.apk"))
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            found = build.read_asset_packs(packs, {"data0", "config.arm64_v8a"})
+        self.assertIn("ignoring asset-packs/data0", log.getvalue())
+        self.assertEqual([(p.name, [n for n, _ in p.files], p.size) for p in found],
+                         [("game0", ["assets/game/content_android.rpf", "assets/game/base/content_android.rpf"], 11)])
+        for bad, message in ((packs / "game0" / "assets" / "game" / "audio_android.rpf.partial", "interrupted"),
+                             (packs / "game0" / "notes.txt", "only the assets folder"),
+                             (packs / "game 1", "unexpected item"),
+                             (packs / "game2", "only the assets folder")):
+            with self.subTest(item=bad.name):
+                if bad.suffix:
+                    bad.write_bytes(b"x")
+                else:
+                    bad.mkdir()
+                with self.assertRaisesRegex(build.KitError, message):
+                    build.read_asset_packs(packs, set())
+                if bad.is_file():
+                    bad.unlink()
+                else:
+                    bad.rmdir()
+        self.assertEqual([p.name for p in build.read_asset_packs(packs, set())], ["data0", "game0"])
+
+    def test_asset_pack_manifest(self):
+        template = asset_pack_split_manifest("data0")
+        self.assertTrue(build.is_install_time_asset_pack(template))
+        self.assertFalse(build.is_install_time_asset_pack(split_manifest("data0")))
+        self.assertFalse(build.is_install_time_asset_pack(b"not a manifest"))
+        result = build.asset_pack_manifest(template, "game0")
+        info = xrmanifest.read_package_info(result)
+        self.assertEqual((info.package, info.split, info.version_code), (PACKAGE, "game0", "63226194"))
+        self.assertTrue(build.is_install_time_asset_pack(result))
+        self.assertEqual(xrmanifest.read_package_info(template).split, "data0")
+        with self.assertRaisesRegex(build.KitError, "game0"):
+            build.asset_pack_manifest(play_manifest(), "game0")
 
     def test_corrupt_archive_reports_member_and_removes_partial(self):
         for method in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
@@ -896,6 +1000,17 @@ ALIAS_XML = """        <activity-alias android:name=".Main" android:exported="tr
 SPLIT_XML = """<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.rockstargames.rdr"
     split="{split}" android:versionCode="63226194" android:isFeatureSplit="false">
+    <application android:hasCode="false"/>
+</manifest>
+"""
+ASSET_PACK_XML = """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:dist="http://schemas.android.com/apk/distribution" package="com.rockstargames.rdr"
+    split="{split}" android:versionCode="63226194" android:isFeatureSplit="true">
+    <dist:module dist:type="asset-pack">
+        <dist:fusing dist:include="true"/>
+        <dist:delivery><dist:install-time/></dist:delivery>
+    </dist:module>
     <application android:hasCode="false"/>
 </manifest>
 """
@@ -1184,7 +1299,7 @@ public class NativeGameActivity extends android.app.NativeActivity {
         return self.compile_java(sources, name)
 
     def make_package(self, name: str, *, application=None, alias=False, single=False,
-                     native_game_mode=False) -> tuple[Path, str]:
+                     native_game_mode=False, packs=False) -> tuple[Path, str]:
         folder = self.root / name
         folder.mkdir()
         dex = self.game_dex(f"{name}-java", native_game_mode)
@@ -1204,8 +1319,16 @@ public class NativeGameActivity extends android.app.NativeActivity {
         signer = self.sign_input(target)
         if single:
             return target, signer
+        if packs:
+            # World and audio packs saved by the exporter from the app's private storage.
+            for path in [path for path in data_entries if path.startswith("assets/game/")]:
+                pack = "game1" if "audio" in path else "game0"
+                file = folder / build.ASSET_PACK_FOLDER / pack / path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_bytes(data_entries.pop(path))
         for split, entries in (("config.arm64_v8a", library_entries), ("data0", data_entries)):
-            apk = self.link_manifest(SPLIT_XML.format(split=split), f"{name}-{split}")
+            xml = ASSET_PACK_XML if packs and split == "data0" else SPLIT_XML
+            apk = self.link_manifest(xml.format(split=split), f"{name}-{split}")
             with zipfile.ZipFile(apk, "a") as archive:
                 for path, data in entries.items():
                     entry = zipfile.ZipInfo(path)
@@ -1400,6 +1523,45 @@ public class NativeGameActivity extends android.app.NativeActivity {
         self.assertIn("==> writing build-manifest.json", repeat)
         again = json.loads((options.build_dir / "build-manifest.json").read_text())
         self.assertEqual(again["outputs"], manifest["outputs"])
+
+    def test_asset_pack_folder_build(self):
+        package, signer = self.make_package("packs", packs=True)
+        validation = self.options(package, "packs-validate", validate_only=True)
+        self.run_build(validation, self.self_test())
+        report = json.loads((validation.build_dir / "validation.json").read_text())
+        self.assertEqual([(p["name"], p["files"]) for p in report["assetPacks"]], [("game0", 5), ("game1", 2)])
+        self.assertFalse((validation.build_dir / "packs").exists())
+        options = self.options(package, "packs")
+        log = self.run_build(options, self.self_test())
+        self.assertIn("==> packaging asset-packs/game0 as split_game0.apk", log)
+        self.assertFalse((options.build_dir / "packs").exists())
+        manifest = json.loads((options.build_dir / "build-manifest.json").read_text())
+        self.check_outputs(options, manifest, signer, LAUNCHER)
+        self.assertEqual([(r["file"], r["split"]) for r in manifest["outputs"]],
+                         [("base.apk", None), ("split_config.arm64_v8a.apk", "config.arm64_v8a"),
+                          ("split_data0.apk", "data0"), ("split_game0.apk", "game0"), ("split_game1.apk", "game1")])
+        out = options.build_dir / "out"
+        for pack in ("game0", "game1"):
+            files = sorted((package / build.ASSET_PACK_FOLDER / pack).rglob("*"))
+            with zipfile.ZipFile(out / f"split_{pack}.apk") as archive:
+                entries = apkzip.inventory(archive)
+                self.assertIsNone(archive.testzip())
+                for path in (p for p in files if p.is_file()):
+                    name = path.relative_to(package / build.ASSET_PACK_FOLDER / pack).as_posix()
+                    self.assertEqual(entries[name].compress_type, zipfile.ZIP_STORED)
+                    self.assertEqual(archive.read(name), path.read_bytes())
+                tree = self.xmltree(out / f"split_{pack}.apk")
+                self.assertIn(f'A: split="{pack}"', tree)
+                self.assertIn("E: http://schemas.android.com/apk/distribution:install-time", tree)
+        # A pack that is also exported as an APK split is taken from the APK.
+        shutil.copytree(package / build.ASSET_PACK_FOLDER / "game1", package / build.ASSET_PACK_FOLDER / "data0")
+        log = self.run_build(self.options(package, "packs-validate", validate_only=True), self.self_test())
+        self.assertIn("ignoring asset-packs/data0", log)
+        shutil.rmtree(package / build.ASSET_PACK_FOLDER / "data0")
+        shutil.rmtree(package / build.ASSET_PACK_FOLDER / "game1")
+        error = self.expect_failure(self.options(package, "packs-validate", validate_only=True), self.self_test())
+        self.assertEqual(error.message, build.INCOMPLETE_DATA_MESSAGE)
+        self.assertIn("assets/game/audio_android.rpf", error.details)
 
     def test_zz_archive_with_application_class(self):
         package, signer = self.make_package("app", application="com.rockstargames.rdr.GameApp", alias=True)
