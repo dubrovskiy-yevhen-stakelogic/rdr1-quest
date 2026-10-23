@@ -112,6 +112,7 @@
 #include "SceneCameraBridge.h"
 #include "HeadAnchorReader.h"
 #include "vr/VrCamera.h" // CAMERA: body anchor + roomscale rig
+#include "vr/VrComfort.h" // HORSE VIGNETTE / MOUNT TURN: mounted state + mount snap -> XR thread, report riding.vignette
 #ifdef RDRVR_NATIVE_HUD
 #include "EngineHudProducer.h"
 #endif
@@ -2466,6 +2467,7 @@ static bool cutsceneAnchor(std::uintptr_t viewport,std::uintptr_t camera,std::ui
 std::atomic<std::uint64_t> ridingSamples{},ridingNoHead{},ridingNotAttached{},ridingIdentity{},ridingTurns{},ridingTurnDeclined{};std::atomic<std::int32_t> ridingLastState{-1};
 float ridingHeading{},ridingForwardHeading{};bool ridingHeadingValid{};std::atomic<std::uint64_t> ridingRecenters{};std::atomic<float> ridingRecenterDeg{0}; // main thread: the rider's heading of the last riding sample (atan2(c.x, c.z))
 std::atomic<float> ridingTurnedDeg{0};
+bool ridingTransition{}; // main thread: the rider of the last riding sample is in a mount / dismount animation (MOUNT TURN)
 struct RidingTrace {float speed{},dy{},lf{},ls{},up{},fwd{},bodyY{},eyeY{};};std::array<RidingTrace,64> ridingTrace{};std::atomic<unsigned> ridingTraceNext{};
 #if defined(RDRVR_NATIVE_MENUS)
 namespace {int ridingViewTurn(float radians) noexcept;}
@@ -2495,6 +2497,10 @@ static bool ridingAnchorSample(std::uintptr_t reticle,std::uint64_t now,std::uin
     for(unsigned c=0;c<4;++c)for(unsigned r=0;r<3;++r)if(!std::isfinite(body[c*4+r]))return false;
     AimNativeVector head{};head.v.fill(std::numeric_limits<float>::quiet_NaN());
     if(!reticleProbeApi.head(reinterpret_cast<const void*>(actor),&head)||!std::isfinite(head.v[0]+head.v[1]+head.v[2])){ridingNoHead.fetch_add(1,std::memory_order_relaxed);return false;}
+    { // MOUNT TURN: the mount / dismount animation (sagPlayerStates mount context 1 / 5 / 6, wagon enter / leave); unreadable = none
+        LocalWeapon me{};me.player=player;me.actor=actor;me.actorGuid=guid;WeaponContext mc{};
+        ridingTransition=WeaponContextReader(api).inspectPlayer(me,mc)&&(mc.mountingHorse||mc.vehicleTransition);
+    }
     HeadCameraAnchor a{};a.actorGuid=guid;a.sampledNs=now;a.presentationRevision=revision;a.bodyCreature=creature;
     a.hatNode=readBodyHat(bodyAttachmentApi,api.read,api.context,actor);
     for(unsigned n=0;n<3;++n){a.position[n]=head.v[n];a.up[n]=body[4+n];}
@@ -2669,20 +2675,37 @@ void gameObserveReticle(void* reticle,std::uint64_t timestamp,std::uint64_t thre
            weaponObservationReady.load(std::memory_order_acquire)&&ridingLever()&&
            ridingAnchorSample(reinterpret_cast<std::uintptr_t>(reticle),timestamp,state.revision,anchor,cameraInput.facts)){
             ridingEye=true;for(unsigned n=0;n<3;++n)ridingEyePos[n]=anchor.position[n];
+            ::rdrvr::vr::comfort::observeRide(ridingTransition,timestamp); // HORSE VIGNETTE: mounted now (any level: the report counts it)
             cameraInput.sampled=true;cameraInput.settings.mode=::rdrvr::vr::camera::Mode::Head; // RIDING: head bone on a horse
             // (user: the horse turns, the view does not): the rider's heading change is applied to the native camera every frame
             // (the same setter as snap turn; stick right = negative = heading atan2(c.x,c.z) decreasing). debug.rdrvr.vr.riding.turn 0 = off.
             static float lastHeading{};static std::uint64_t lastTurnNs{};static unsigned polls{};static bool turnLever{true};
             if((polls++&255u)==0){char v[PROP_VALUE_MAX]{};turnLever=!(__system_property_get("debug.rdrvr.vr.riding.turn",v)>0&&v[0]=='0');}
+            // MOUNT TURN SNAP (user: mounting / dismounting swung the view round fast): while the rider's body swings on / off the mount
+            // the view keeps its yaw (the heading change is not followed) and the recentre below runs at the first seated sample, behind
+            // the comfort dip. A hold ends after 4 s at the latest (never a stuck view). SMOOTH = recentre on the first sample, then follow.
+            static bool recenterPending{};static float heldRad{};static std::uint64_t holdSince{};
             if(ridingHeadingValid){
+                const bool fresh=!lastTurnNs||timestamp<lastTurnNs||timestamp-lastTurnNs>500'000'000ull;
+                const bool snap=::rdrvr::vr::settings().mountTurnSnap();
+                bool hold=snap&&ridingTransition&&turnLever;
+                if(fresh){recenterPending=true;heldRad=0.f;holdSince=0;}
+                if(hold){if(!holdSince)holdSince=timestamp;if(timestamp-holdSince>4'000'000'000ull)hold=false;}else holdSince=0;
+                if(hold){
+                    if(!fresh&&timestamp-lastTurnNs<300'000'000ull){const float d=std::remainder(ridingHeading-lastHeading,2.f*3.14159265f);if(std::isfinite(d))heldRad+=d;}
+                    recenterPending=true;
+                }else if(recenterPending){
 #if defined(RDRVR_NATIVE_MENUS)
-                // (user: after mounting the view had to be recentred): on the first riding sample after >= 0.5 s on foot the view
-                // is turned once so the current head yaw faces the horse (headYawWorld += d for NativeCameraTurn(d)).
-                if(turnLever&&(!lastTurnNs||timestamp<lastTurnNs||timestamp-lastTurnNs>500'000'000ull)){float hy{};
-                    if(::rdrvr::vr::body::headYaw(hy,timestamp)){const float d=std::remainder(ridingForwardHeading-hy,2.f*3.14159265f);
-                        if(std::isfinite(d)&&ridingViewTurn(d)==1){ridingRecenters.fetch_add(1,std::memory_order_relaxed);ridingRecenterDeg.store(d*57.29578f,std::memory_order_relaxed);}}}
+                    // (user: after mounting the view had to be recentred): the view is turned once so the current head yaw faces the
+                    // horse (headYawWorld += d for NativeCameraTurn(d)): on the first riding sample after >= 0.5 s on foot, with SNAP on the
+                    // first one after the mount animation.
+                    if(turnLever){float hy{};
+                        if(::rdrvr::vr::body::headYaw(hy,timestamp)){const float d=std::remainder(ridingForwardHeading-hy,2.f*3.14159265f);
+                            if(std::isfinite(d)&&ridingViewTurn(d)==1){ridingRecenters.fetch_add(1,std::memory_order_relaxed);ridingRecenterDeg.store(d*57.29578f,std::memory_order_relaxed);
+                                if(snap)::rdrvr::vr::comfort::noteMountSnap(timestamp,heldRad);}}}
 #endif
-                if(lastTurnNs&&timestamp>lastTurnNs&&timestamp-lastTurnNs<300'000'000ull&&turnLever){
+                    recenterPending=false;heldRad=0.f;
+                }else if(lastTurnNs&&timestamp>lastTurnNs&&timestamp-lastTurnNs<300'000'000ull&&turnLever){
                     const float d=std::remainder(ridingHeading-lastHeading,2.f*3.14159265f);
 #if defined(RDRVR_NATIVE_MENUS)
                     if(std::fabs(d)>1e-4f&&std::fabs(d)<.8f){const int r=ridingViewTurn(d);
@@ -4457,7 +4480,7 @@ std::string gameXrReport() {
         out<<'['<<std::round(t.speed*100)/100<<','<<std::round(t.dy*1000)/1000<<','<<std::round(t.lf*1000)/1000<<','<<std::round(t.ls*1000)/1000<<','
            <<std::round(t.up*1000)/1000<<','<<std::round(t.fwd*1000)/1000<<','<<std::round(t.bodyY*1000)/1000<<','<<std::round(t.eyeY*1000)/1000<<']';}
      out<<"]";}
-    out<<"}";
+    out<<",\"vignette\":"<<::rdrvr::vr::comfort::report()<<"}";
     out<<",\"headCamera\":{\"enabled\":"
 #ifdef RDRVR_HEAD_CAMERA
        <<"true"

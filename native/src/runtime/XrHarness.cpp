@@ -23,6 +23,7 @@
 #include "vr/VrHud.h"         // HUD: head / wrist quads of the game's HUD
 #include "vr/VrWelcome.h"      // WELCOME: first-steps message on the menu panel
 #include "vr/VrInputRec.h"     // INPUT RECORD / REPLAY (debug.rdrvr.input.record / .replay): hooks after every OpenXR input call
+#include "vr/VrComfort.h"      // HORSE VIGNETTE: riding motion -> ring intensity / aperture
 #ifdef RDRVR_HEAD_CAMERA
 #endif
 #include "GraphicsResolution.h"
@@ -56,6 +57,7 @@ bool stereoCutscene(const PresentationMailbox* m) noexcept {
 // pdtMono of the XR frame whose predictedDisplayTime locateHands locates (XR thread; kept outside the
 // mirror XrHarness.h). -1 / 0 = no conversion.
 std::atomic<std::int64_t> xrPoseMonoNs{0};
+::rdrvr::vr::comfort::Vignette vignetteFade; // HORSE VIGNETTE intensity (XR thread)
 void configureThreads(XrPerformance& performance,XrInstance instance,XrSession session,bool supported){
     if(!supported)return;
     PFN_xrSetAndroidApplicationThreadKHR setter{};
@@ -293,6 +295,15 @@ void XrHarness::initializeBorrowed(XrInstance instance,XrSystemId system,const V
     if(hudSpace_&&XR_SUCCEEDED(xrGetSystemProperties(instance_,system_,&properties))&&properties.graphicsProperties.maxLayerCount>=3){
         try{perfOverlay_.initialize(session_,binding);perfPixels_=std::make_unique<diagnostics::PerfPanel>();perfOverlayEnabled_=true;}
         catch(const std::exception& e){perfOverlay_.destroy();__android_log_print(ANDROID_LOG_WARN,"RdrVrXR","stats unavailable: %s",e.what());}
+    }
+    { // HORSE VIGNETTE: one more quad next to projection + HUD (3) + stats (debug.rdrvr.vr.vignette 0 = no swapchain, row PROP)
+        namespace vs=::rdrvr::vr::status;using ::rdrvr::vr::Feature;
+        XrSystemProperties p{XR_TYPE_SYSTEM_PROPERTIES};
+        if(::rdrvr::vr::killed(Feature::Vignette))vs::publish(Feature::Vignette,vs::Property);
+        else if(hudSpace_&&XR_SUCCEEDED(xrGetSystemProperties(instance_,system_,&p))&&p.graphicsProperties.maxLayerCount>=8){
+            try{vignette_.initialize(session_,binding);vignetteEnabled_=true;vignetteFade.reset();vs::publish(Feature::Vignette,vs::Ready);}
+            catch(const std::exception& e){vignette_.destroy();vs::publish(Feature::Vignette,vs::Unavailable);__android_log_print(ANDROID_LOG_WARN,"RdrVrXR","vignette unavailable: %s",e.what());}
+        }else vs::publish(Feature::Vignette,vs::Unavailable);
     }
 }
 void XrHarness::invalidateTracking(){
@@ -884,8 +895,20 @@ void XrHarness::frame() {
         }
         if(!menuOpen&&!welcomeOn&&!graphicsSettings.fpsVisible()&&!heat)statsReady=false; // heat01: the warning shows with the readout OFF
     }catch(const std::exception& e){perfOverlayEnabled_=false;__android_log_print(ANDROID_LOG_WARN,"RdrVrXR","stats disabled: %s",e.what());}
-    std::array<const XrCompositionLayerBaseHeader*,6> submittedLayers{};unsigned layerCount=0; // + HUD head / wrist / map quads
-    if(rendered){submittedLayers[layerCount++]=submitted;if(hudRendered)submittedLayers[layerCount++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud);
+    // HORSE VIGNETTE: world stereo only (level 0 anywhere else: the ring is gone at once, no fade over a menu or the theater). layer() also
+    // finishes the one mask upload, so it runs every frame; it returns false while the ring is fully open.
+    XrCompositionLayerQuad vignette{XR_TYPE_COMPOSITION_LAYER_QUAD};bool vignetteReady=false;
+    if(vignetteEnabled_)try{
+        namespace vc=::rdrvr::vr::comfort;
+        const unsigned level=gameStereo?::rdrvr::vr::settings().rideVignette():0u;
+        const float intensity=vignetteFade.step(level,std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
+        vignetteReady=vignette_.layer(hudSpace_,intensity>0.f?vc::clearTan(level,intensity):0.f,vignette)&&gameStereo;
+        if(vignetteReady)vc::layerFrames.fetch_add(1,std::memory_order_relaxed);
+    }catch(const std::exception& e){vignetteEnabled_=false;vignetteReady=false;::rdrvr::vr::status::publish(::rdrvr::vr::Feature::Vignette,::rdrvr::vr::status::Failed);
+        __android_log_print(ANDROID_LOG_ERROR,"RdrVrXR","vignette disabled: %s",e.what());}
+    std::array<const XrCompositionLayerBaseHeader*,7> submittedLayers{};unsigned layerCount=0; // + vignette, HUD head / wrist / map quads
+    if(rendered){submittedLayers[layerCount++]=submitted;if(vignetteReady)submittedLayers[layerCount++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&vignette);
+        if(hudRendered)submittedLayers[layerCount++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud);
         if(gameStereo&&vrHud.headValid)submittedLayers[layerCount++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&vrHud.head);
         if(gameStereo&&vrHud.wristValid)submittedLayers[layerCount++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&vrHud.wrist);
         if(gameStereo&&vrHud.mapValid)submittedLayers[layerCount++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&vrHud.map);
@@ -897,15 +920,18 @@ void XrHarness::frame() {
     namespace tf=::rdrvr::vr::tploco::fade;
     const auto blinkNs=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     const auto blink=tf::xrFrame(blinkNs,!presentation_||presentationGate_.world());
-    std::array<XrCompositionLayerColorScaleBiasKHR,6> blinkScale{}; // One per submitted layer
+    // MOUNT TURN dip (vr/VrComfort.h) through the same colour scale; the darker of the two wins, the teleport player is not touched.
+    const float dip=::rdrvr::vr::comfort::dipAlpha(blinkNs);
+    const bool scaled=blink.active||dip<1.f;const float scale=std::min(blink.active?blink.alpha:1.f,dip);
+    std::array<XrCompositionLayerColorScaleBiasKHR,7> blinkScale{}; // One per submitted layer
     XrCompositionLayerColorScaleBiasKHR wristScale{XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR}; // Opaque wrist minimap
-    if(gameStereo&&vrHud.wristValid&&!blink.active&&tf::extensionEnabled.load(std::memory_order_relaxed)==1&&vrHud.wristAlphaScale>1.001f){
+    if(gameStereo&&vrHud.wristValid&&!scaled&&tf::extensionEnabled.load(std::memory_order_relaxed)==1&&vrHud.wristAlphaScale>1.001f){
         const float k=vrHud.wristAlphaScale;wristScale.colorScale={k,k,k,k};wristScale.colorBias={0,0,0,0};wristScale.next=vrHud.wrist.next;vrHud.wrist.next=&wristScale;}
-    if(blink.active&&tf::extensionEnabled.load(std::memory_order_relaxed)==1)for(unsigned i=0;i<layerCount;++i){
+    if(scaled&&tf::extensionEnabled.load(std::memory_order_relaxed)==1)for(unsigned i=0;i<layerCount;++i){
         auto* base=const_cast<XrCompositionLayerBaseHeader*>(submittedLayers[i]);auto& sc=blinkScale[i];
-        sc.type=XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR;sc.colorScale={blink.alpha,blink.alpha,blink.alpha,1.f};sc.colorBias={0,0,0,0};
+        sc.type=XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR;sc.colorScale={scale,scale,scale,1.f};sc.colorBias={0,0,0,0};
         sc.next=base->next;base->next=&sc;
-        if(submittedLayers[i]==reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cinema))::rdrvr::vr::tploco::linkBump(tf::stats.cinemaDuringFade);
+        if(blink.active&&submittedLayers[i]==reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cinema))::rdrvr::vr::tploco::linkBump(tf::stats.cinemaDuringFade);
     }
     end.layerCount=layerCount;end.layers=layerCount?submittedLayers.data():nullptr;
     workTiming.finish();
@@ -970,6 +996,7 @@ XrHarness::~XrHarness() {
     gpu_.waitIdle();
     ::rdrvr::vr::hud::xrSessionEnded(); // HUD swapchain before the session (its consumer copies finished: idle above)
     perfOverlay_.destroy();
+    vignette_.destroy();
     if(stereo_) {
         // On a failed fence wait, leave uncertain GPU handles alive until device
         // destruction. Never throw from the session destructor or free in-flight images.

@@ -2,6 +2,7 @@
 #include "VulkanBridge.h"
 #include "XrPerformance.h"
 #include "PerfOverlay.h"
+#include "ComfortVignette.h"
 #include "GraphicsMenu.h"
 #include <memory>
 #include "Policies.h"
@@ -35,6 +36,7 @@ class XrHarness {
     XrPerformance performance_;
     PerformanceSupport performanceSupport_;
     PerfOverlay perfOverlay_;bool perfOverlayEnabled_{};
+    ComfortVignette vignette_;bool vignetteEnabled_{}; // HORSE VIGNETTE quad (vr/VrComfort.h)
     GraphicsMenu graphicsMenu_;
     std::unique_ptr<diagnostics::PerfPanel> perfPixels_;
     std::uint64_t perfStamp_{},perfFrame_{};

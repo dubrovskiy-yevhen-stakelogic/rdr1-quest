@@ -34,7 +34,8 @@ namespace rdrvr::vr {
 // ---- keys (vr.cfg key = cfg, menu row = label, value index = position in names) ----
 enum class Key : unsigned {Locomotion,MoveSpeed,Roomscale,Camera,EyeHeight,BumpReactions,Stumble,Hands,Holsters,WeaponGrip,HolsterMarkers,
     TwoHandAim,Melee,MeleeSpeed,MeleeFists,Laser,AutoCover,DualWield,Body,BodyUp,BodyBack,ThrowWeapon,FistBlock,
-    TeleportFade,TeleportRange,LassoThrow,LassoAssist,ReloadMode,CylinderClose,Chambers,Hammer,FanSpread,GunSpin,QuestMarker,Cutscenes,Hud,HudSize,Subtitles,RideUp,RideFwd,TurnMode,Count};
+    TeleportFade,TeleportRange,LassoThrow,LassoAssist,ReloadMode,CylinderClose,Chambers,Hammer,FanSpread,GunSpin,QuestMarker,Cutscenes,Hud,HudSize,Subtitles,RideUp,RideFwd,TurnMode,
+    RideVignette,MountTurn,Count};
 // variable-width packing - each key takes ceil(log2(count)) bits (2 values = 1 bit, 3..4 = 2, 5..8 = 3), offsets in key order
 // . 22 keys = 31 bits; FIST BLOCK: 23 keys = 32 bits. vr.cfg (key=value text) is unchanged.
 // tp: LOCOMOTION widened in place to 3 values (2 bits) + TELEPORT FADE (1) + TELEPORT RANGE (2) = 25 keys / 36 bits.
@@ -47,14 +48,17 @@ enum class Key : unsigned {Locomotion,MoveSpeed,Roomscale,Camera,EyeHeight,BumpR
 // + QUEST MARKER (OFF / ON, 1 bit, cfg "questMarker", appended) = 34 keys / 49 bits.
 // + CUTSCENES (SCREEN / CINEMATIC / FIRST PERSON, 2 bits) last = 35 keys / 51 bits.
 // + HUD (OFF / HEAD / HAND, 2 bits) + HUD SIZE (SMALL / MEDIUM / LARGE, 2 bits) = 37 keys / 55 bits (cfg "hud", "hudSize").
+// ... + SUBTITLES, HORSE CAM UP / FWD, TURN = 41 keys / 64 bits: the first word is full.
+// + HORSE VIGNETTE (OFF / LOW / MEDIUM / HIGH, 2 bits, cfg "rideVignette") = 42 keys, the first key of the second word.
+// + MOUNT TURN (SNAP / SMOOTH, 1 bit, cfg "mountTurn") = 43 keys.
 inline constexpr unsigned keyCount=unsigned(Key::Count);
 // Kill-switch features (debug.rdrvr.vr.<name>) = the status slots of the modules.
 enum class Feature : unsigned {Menu,Loco,Bump,Stumble,Camera,Roomscale,Hands,Holsters,TwoHand,Cheats,Melee,Laser,Cover,Dual,Body,Throw,
-    Arc,TpLoco,Lasso,Reload,Hammer,Spin,Marker,Cutscene,Hud,Count};
+    Arc,TpLoco,Lasso,Reload,Hammer,Spin,Marker,Cutscene,Hud,Vignette,Count};
 inline constexpr unsigned featureCount=unsigned(Feature::Count);
 inline constexpr std::array<const char*,featureCount> featureNames{"menu","loco","bump","stumble","camera","roomscale","hands","holsters",
     "twohand","cheats","melee","laser","cover","dual","body","throw",
-    "arc","tploco","lasso","reload","hammer","spin","marker","cutscene","hud"}; // Feature::Reload = the property VrReload reads itself (same name / meaning)
+    "arc","tploco","lasso","reload","hammer","spin","marker","cutscene","hud","vignette"}; // Feature::Reload = the property VrReload reads itself (same name / meaning)
 
 struct KeyInfo {
     const char* cfg;const char* label;unsigned count,defaultValue;
@@ -164,30 +168,46 @@ inline constexpr std::array<KeyInfo,keyCount> keyInfo{{
     {"rideFwd5",      "HORSE CAM FWD",  8,4,Feature::Camera,  -1,false,{"-10 CM","-5 CM","0 CM","+5 CM","+10 CM","+15 CM","+20 CM","+25 CM"}},
     // TURN (user): SNAP (30 deg steps, default - for those who get sick) / SMOOTH (stick-proportional, debug.rdrvr.vr.turn.speed deg/s)
     {"turnMode",      "TURN",           2,0,Feature::Camera,  -1,false,{"SNAP","SMOOTH"}},
+    // HORSE VIGNETTE (user: riding was nauseating): a dark head-locked ring for as long as the player sits on a horse / wagon (vr/VrComfort.h,
+    // runtime/ComfortVignette). The level = how far it closes (clear 42 / 33 / 25 deg). debug.rdrvr.vr.vignette 0 -> PROP, OFF (no layer).
+    {"rideVignette",  "HORSE VIGNETTE", 4,0,Feature::Vignette, 0,true, {"OFF","LOW","MEDIUM","HIGH"}},
+    // MOUNT TURN: SNAP (default) = while the rider's body swings on / off the mount (mount context 1 / 5 / 6, wagon enter / leave) the
+    // view keeps its yaw; once seated it turns ONCE to the mount's heading behind a short dip to black. SMOOTH = the view follows the
+    // animation (the riding heading follow without a hold).
+    {"mountTurn",     "MOUNT TURN",     2,0,Feature::Camera,  -1,false,{"SNAP","SMOOTH"}},
 }};
 // ---- variable-width packing ----
+// Two 64-bit words: keys in order, a key that would straddle a word boundary starts the next word. Each word is its own atomic in
+// the store; only RESET ALL rewrites both at once, so a concurrent reader can at most see a key from just before that reset.
+inline constexpr unsigned packedWords=2;
+struct Packed {std::array<std::uint64_t,packedWords> w{};constexpr bool operator==(const Packed&) const noexcept = default;};
 inline constexpr unsigned bitsFor(unsigned count) noexcept {unsigned b=0;while(b<32&&(1u<<b)<count)++b;return b;}
 inline constexpr std::array<unsigned,keyCount> keyWidths=[]{std::array<unsigned,keyCount> w{};for(unsigned i=0;i<keyCount;++i)w[i]=bitsFor(keyInfo[i].count);return w;}();
-inline constexpr std::array<unsigned,keyCount> keyShifts=[]{std::array<unsigned,keyCount> s{};unsigned at=0;for(unsigned i=0;i<keyCount;++i){s[i]=at;at+=keyWidths[i];}return s;}();
-inline constexpr unsigned packedBits=[]{unsigned n=0;for(unsigned w:keyWidths)n+=w;return n;}();
-inline constexpr unsigned keyShift(unsigned k) noexcept {return keyShifts[k];}
+// Bit offset of each key over both words (word = offset / 64, shift = offset % 64)
+inline constexpr std::array<unsigned,keyCount> keyOffsets=[]{std::array<unsigned,keyCount> s{};unsigned at=0;
+    for(unsigned i=0;i<keyCount;++i){if(at%64+keyWidths[i]>64)at=(at/64+1)*64;s[i]=at;at+=keyWidths[i];}return s;}();
+inline constexpr unsigned packedBits=keyOffsets[keyCount-1]+keyWidths[keyCount-1];
+inline constexpr unsigned keyWord(unsigned k) noexcept {return keyOffsets[k]/64;}
+inline constexpr unsigned keyShift(unsigned k) noexcept {return keyOffsets[k]%64;}
 inline constexpr std::uint64_t keyMaskOf(unsigned k) noexcept {return (std::uint64_t(1)<<keyWidths[k])-1u;}
 // value v of key k written into p (the other keys untouched)
-inline constexpr std::uint64_t withValue(std::uint64_t p,unsigned k,unsigned v) noexcept {
-    return (p&~(keyMaskOf(k)<<keyShift(k)))|((std::uint64_t(v)&keyMaskOf(k))<<keyShift(k));}
-static_assert(packedBits<=64,"Snapshot packs every key (variable width) into 64 bits");
+inline constexpr Packed withValue(Packed p,unsigned k,unsigned v) noexcept {
+    auto& w=p.w[keyWord(k)];w=(w&~(keyMaskOf(k)<<keyShift(k)))|((std::uint64_t(v)&keyMaskOf(k))<<keyShift(k));return p;}
+static_assert(packedBits<=64*packedWords,"Snapshot packs every key (variable width) into packedWords x 64 bits");
+static_assert(keyOffsets[unsigned(Key::TurnMode)]+keyWidths[unsigned(Key::TurnMode)]==64&&keyWord(unsigned(Key::RideVignette))==1,
+    "the first word keeps its layout; HORSE VIGNETTE opens the second");
 static_assert(keyCount<=64,"vr.cfg parse tracks the seen keys in 64 bits");
 inline constexpr bool keyCountsFit() noexcept {for(unsigned i=0;i<keyCount;++i){const auto& k=keyInfo[i];
     if(k.count<2||k.count>(1u<<keyWidths[i])||k.defaultValue>=k.count||keyWidths[i]<1||keyWidths[i]>4)return false;}return true;} // 4 bits (16 values) allowed
 static_assert(keyCountsFit(),"every key value must fit its packed width");
 inline constexpr const KeyInfo& info(Key k) noexcept {return keyInfo[unsigned(k)];}
-inline constexpr std::uint64_t defaultPacked() noexcept {
-    std::uint64_t p{};for(unsigned i=0;i<keyCount;++i)p=withValue(p,i,keyInfo[i].defaultValue);return p;}
+inline constexpr Packed defaultPacked() noexcept {
+    Packed p{};for(unsigned i=0;i<keyCount;++i)p=withValue(p,i,keyInfo[i].defaultValue);return p;}
 
 // One consistent menu state. Typed getters are what the modules read.
 struct Snapshot {
-    std::uint64_t packed{defaultPacked()};
-    constexpr unsigned operator[](Key k) const noexcept {return unsigned((packed>>keyShift(unsigned(k)))&keyMaskOf(unsigned(k)));}
+    Packed packed{defaultPacked()};
+    constexpr unsigned operator[](Key k) const noexcept {const unsigned i=unsigned(k);return unsigned((packed.w[keyWord(i)]>>keyShift(i))&keyMaskOf(i));}
     constexpr bool freeLocomotion() const noexcept {return (*this)[Key::Locomotion]==0;}             // LOCOMOTION FREE
     constexpr bool teleportLocomotion() const noexcept {return (*this)[Key::Locomotion]==2;}         // LOCOMOTION TELEPORT
     constexpr bool locoOwnsCapsule() const noexcept {const unsigned v=(*this)[Key::Locomotion];return v==0||v==2;} // FREE / TELEPORT: LOCO mover path (roomscale, escape walk)
@@ -232,6 +252,8 @@ struct Snapshot {
     constexpr float rideUpMeters() const noexcept {return .05f*(float((*this)[Key::RideUp])-6.f);}   // HORSE CAM UP -30..+40 cm
     constexpr float rideFwdMeters() const noexcept {return .05f*(float((*this)[Key::RideFwd])-2.f);} // HORSE CAM FWD -10..+25 cm
     constexpr bool smoothTurn() const noexcept {return (*this)[Key::TurnMode]==1;}
+    constexpr unsigned rideVignette() const noexcept {return (*this)[Key::RideVignette];}            // HORSE VIGNETTE 0 OFF, 1 LOW, 2 MEDIUM, 3 HIGH
+    constexpr bool mountTurnSnap() const noexcept {return (*this)[Key::MountTurn]==0;}               // MOUNT TURN SNAP
     constexpr float hudWidthDeg() const noexcept {const unsigned v=(*this)[Key::HudSize];return v==0?40.f:v==2?62.f:50.f;}
     constexpr bool operator==(const Snapshot&) const noexcept = default;
 };
@@ -252,7 +274,7 @@ inline constexpr std::array<WeaponPresetValue,5> weaponPresetKeys{{
 inline constexpr bool weaponPresetsFit() noexcept {for(const auto& p:weaponPresetKeys){
     if(p.realistic>=info(p.key).count||p.casual>=info(p.key).count)return false;}return true;}
 static_assert(weaponPresetsFit(),"every preset value must be a value of its key");
-inline constexpr std::uint64_t withWeaponPreset(std::uint64_t p,unsigned preset) noexcept {
+inline constexpr Packed withWeaponPreset(Packed p,unsigned preset) noexcept {
     if(preset>=PresetCustom)return p;
     for(const auto& v:weaponPresetKeys)p=withValue(p,unsigned(v.key),preset==PresetRealistic?v.realistic:v.casual);return p;}
 inline constexpr unsigned weaponPresetOf(const Snapshot& s) noexcept {
@@ -363,8 +385,8 @@ inline std::string_view trim(std::string_view s) noexcept {
 }
 using SeenMask=std::uint64_t; // One bit per key (keyCount <= 64)
 static_assert(sizeof(SeenMask)*8>=keyCount);
-inline bool parse(std::string_view text,std::uint64_t& out) noexcept {
-    std::uint64_t result=defaultPacked();SeenMask seen{};bool version{}; // 64-bit seen mask
+inline bool parse(std::string_view text,Packed& out) noexcept {
+    Packed result=defaultPacked();SeenMask seen{};bool version{}; // 64-bit seen mask
     int legacyHammer=-1; // Legacy "hammer" key (0 OFF, 1 FAN, 2 FAN W/ TRIGGER, 3 SINGLE ACTION), at most once
     int legacyRideFwd=-1;
     while(!text.empty()){
@@ -410,7 +432,7 @@ public:
     bool loadOnce() noexcept {
         detail::PreserveErrno preserve;std::lock_guard lock(mutex_);
         if(loaded_)return loadResult_;
-        loaded_=true;loadResult_=false;std::uint64_t value=defaultPacked();
+        loaded_=true;loadResult_=false;Packed value=defaultPacked();
         try{
             if(!path_.empty()){
                 errno=0;auto* file=detail::openFile(detail::utf8Path(path_),false);
@@ -420,18 +442,18 @@ public:
                     const auto size=std::fread(data.data(),1,data.size(),file);
                     const bool good=!std::ferror(file)&&size<=maxFileBytes;
                     const bool closed=std::fclose(file)==0;
-                    std::uint64_t parsed{};
+                    Packed parsed{};
                     loadResult_=good&&closed&&detail::parse(std::string_view(data.data(),size),parsed);
                     if(loadResult_)value=parsed;
                 }
             }
         }catch(...){loadResult_=false;value=defaultPacked();}
-        packed_.store(value,std::memory_order_release);
+        storePacked(value);
         persistenceOk_.store(loadResult_,std::memory_order_release);
         loadedFlag_.store(true,std::memory_order_release);
         return loadResult_;
     }
-    Snapshot requested() const noexcept {return {packed_.load(std::memory_order_acquire)};}
+    Snapshot requested() const noexcept {return {loadPacked()};}
     // Kill switches applied: what the modules must act on.
     Snapshot effective() const noexcept {
         Snapshot s=requested();
@@ -450,7 +472,7 @@ public:
     bool set(Key k,unsigned v) noexcept {
         detail::PreserveErrno preserve;std::lock_guard lock(mutex_);
         if(!loaded_||unsigned(k)>=keyCount||v>=info(k).count)return false;
-        packed_.store(withValue(packed_.load(std::memory_order_relaxed),unsigned(k),v),std::memory_order_release);
+        storePacked(withValue(loadPacked(),unsigned(k),v));
         return saveLocked();
     }
     // Menu rule (GraphicsMenu::cycle): the stick (adjust +-1) clamps at both ends, A (adjust 0) wraps.
@@ -463,12 +485,12 @@ public:
     bool applyWeaponPreset(unsigned preset) noexcept {
         detail::PreserveErrno preserve;std::lock_guard lock(mutex_);
         if(!loaded_||preset>=PresetCustom)return false;
-        packed_.store(withWeaponPreset(packed_.load(std::memory_order_relaxed),preset),std::memory_order_release);return saveLocked();
+        storePacked(withWeaponPreset(loadPacked(),preset));return saveLocked();
     }
     bool restoreDefaults() noexcept {
         detail::PreserveErrno preserve;std::lock_guard lock(mutex_);
         if(!loaded_)return false;
-        packed_.store(defaultPacked(),std::memory_order_release);return saveLocked();
+        storePacked(defaultPacked());return saveLocked();
     }
     bool save() noexcept {detail::PreserveErrno preserve;std::lock_guard lock(mutex_);return saveLocked();}
     // The configured vr.cfg path ("" before configurePath) - weapons.cfg (VrWeaponCalib.h) lives next to it.
@@ -491,10 +513,14 @@ public:
 private:
     mutable std::mutex mutex_;
     std::string path_;
-    std::atomic<std::uint64_t> packed_{defaultPacked()};
+    static_assert(packedWords==2,"packed_ initializer");
+    std::array<std::atomic<std::uint64_t>,packedWords> packed_{defaultPacked().w[0],defaultPacked().w[1]};
     std::atomic<bool> persistenceOk_{true},loadedFlag_{false};
     std::atomic<std::uint32_t> saves_{0},saveFailures_{0};
     bool loaded_{},loadResult_{};
+    // Writers hold mutex_; a word that does not change is stored unchanged (one key per edit, the presets all in word 0).
+    Packed loadPacked() const noexcept {Packed p{};for(unsigned i=0;i<packedWords;++i)p.w[i]=packed_[i].load(std::memory_order_acquire);return p;}
+    void storePacked(const Packed& p) noexcept {for(unsigned i=0;i<packedWords;++i)packed_[i].store(p.w[i],std::memory_order_release);}
     bool saveLocked() noexcept {
         persistenceOk_.store(false,std::memory_order_release);
         if(!loaded_||path_.empty()){saveFailures_.fetch_add(1,std::memory_order_relaxed);return false;}

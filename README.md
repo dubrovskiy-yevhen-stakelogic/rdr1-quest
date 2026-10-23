@@ -88,6 +88,13 @@ which deletes its saved games. Copy them to the PC first with
   crouch toggles.
 - Horseback riding with a stable seat camera (adjustable height and
   distance), spurring by tapping A, jumping with B.
+- Optional comfort vignette for riding (MOVEMENT > HORSE VIGNETTE: OFF, LOW,
+  MEDIUM, HIGH; default OFF): the edges of the view stay dark for as long as
+  you sit on a horse or wagon, and clear again after you get off. It is drawn
+  by the headset compositor at the display rate, so it stays fixed to the view.
+- MOVEMENT > MOUNT TURN: SNAP (default) keeps the view still while getting on
+  or off a horse or wagon and then turns it once to the riding direction behind
+  a short fade; SMOOTH lets the view turn with the animation.
 - Weapon presets: REALISTIC (gun spin, manual reload one round at a time,
   hammer cocking) or CASUAL (default: the trigger just fires, B reloads, no spin).
   CASUAL forwards the held firearm trigger without VR hammer or cylinder gates;

@@ -93,8 +93,12 @@ inline unsigned firstVisibleRow(unsigned selected,unsigned rows) noexcept {
     return std::min(selected-menuBodyRows+1,rows-menuBodyRows);
 }
 
-inline constexpr std::array<Key,16> movementKeys{Key::Locomotion,Key::MoveSpeed,Key::TurnMode,Key::TeleportFade,Key::TeleportRange,Key::Roomscale,Key::Camera,
-    Key::Cutscenes,Key::EyeHeight,Key::BodyUp,Key::BodyBack,Key::RideUp,Key::RideFwd,Key::BumpReactions,Key::Stumble,Key::AutoCover}; // BODY OFFSET UP / BACK under EYE HEIGHT; tp: TELEPORT FADE / RANGE after MOVE SPEED
+inline constexpr std::array<Key,18> movementKeys{Key::Locomotion,Key::MoveSpeed,Key::TurnMode,Key::TeleportFade,Key::TeleportRange,Key::Roomscale,Key::Camera,
+    Key::Cutscenes,Key::EyeHeight,Key::BodyUp,Key::BodyBack,Key::RideUp,Key::RideFwd,Key::RideVignette,Key::MountTurn,Key::BumpReactions,Key::Stumble,Key::AutoCover}; // BODY OFFSET UP / BACK under EYE HEIGHT; tp: TELEPORT FADE / RANGE after MOVE SPEED
+// HORSE VIGNETTE / MOUNT TURN: what the row does (panel glyphs, <= 52 columns); SAVE FAILED always wins.
+inline constexpr const char* rideVignetteFooter="DARK EDGES FOR AS LONG AS YOU RIDE";
+inline constexpr const char* mountTurnSnapFooter="VIEW HOLDS WHILE MOUNTING - THEN TURNS ONCE";
+inline constexpr const char* mountTurnSmoothFooter="VIEW TURNS WITH THE RIDER WHILE MOUNTING";
 // tp: MOVEMENT footer while LOCOMOTION is effectively TELEPORT and the cursor is on LOCOMOTION / TELEPORT FADE /
 // TELEPORT RANGE (44 glyphs; the save-state text SAVE FAILED always wins). The roomscale tip waits for the device confirmation (STATUS).
 inline constexpr const char* teleportFooter="L STICK FWD: AIM  RELEASE: GO  HOLD L3: WALK";
@@ -208,6 +212,8 @@ struct VrPage {
         const Key sel=keyAt(page,selected);
         if(store.persistenceOk()&&page==PageMovement&&store.effective().teleportLocomotion()&&
            (sel==Key::Locomotion||sel==Key::TeleportFade||sel==Key::TeleportRange)){out+=teleportFooter;return;}
+        if(store.persistenceOk()&&page==PageMovement&&sel==Key::RideVignette&&!keyKilled(Key::RideVignette)){out+=rideVignetteFooter;return;}
+        if(store.persistenceOk()&&page==PageMovement&&sel==Key::MountTurn){out+=store.requested().mountTurnSnap()?mountTurnSnapFooter:mountTurnSmoothFooter;return;}
         if(store.persistenceOk()&&page==PageHands&&sel==Key::LassoThrow&&!keyKilled(Key::LassoThrow)){
             const char* note=status::noteOf(Feature::Lasso);
             if(note&&std::strcmp(note,"NOT OWNED")==0&&status::code(Feature::Lasso)==status::Ready){out+=lassoNotOwnedFooter;return;}}
@@ -356,7 +362,7 @@ struct CalibPage {
 
 // ---- CONTROLS page: how the VR controls work (read only; the stick scrolls) ----
 struct HelpPage {
-    static constexpr std::array<const char*,50> lines{ // + 2 WEAPON PRESET lines
+    static constexpr std::array<const char*,51> lines{ // + 2 WEAPON PRESET lines, + HORSE VIGNETTE
         "\x03ON FOOT - DEFAULT BUTTONS, CHANGE THEM IN BUTTONS",
         "  A JUMP    B RELOAD / INTERACT    X WHISTLE",
         "  Y USE / MOUNT    L3 SPRINT    R3 CROUCH",
@@ -367,6 +373,7 @@ struct HelpPage {
         "  Y MOUNT / DISMOUNT    LEFT STICK STEER",
         "  A TAP REPEATEDLY: SPUR / GALLOP    B JUMP",
         "  CAMERA HEIGHT: MOVEMENT > HORSE CAM UP / FWD",
+        "  MOTION SICKNESS: HORSE VIGNETTE / MOUNT TURN",
         "  REVOLVER, RIFLES AND THROWN WORK IN THE SADDLE",
         "\x03HOLSTERS - REACH AND GRIP TO DRAW",
         "  REVOLVER: RIGHT HIP    LASSO: LEFT HIP",
