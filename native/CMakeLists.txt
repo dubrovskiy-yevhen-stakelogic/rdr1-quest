@@ -38,6 +38,7 @@ add_library(rdrvr SHARED
   src/runtime/GraphicsSettings.cpp
   src/runtime/XrHarness.cpp
   src/runtime/PerfOverlay.cpp
+  src/runtime/ComfortVignette.cpp
   src/runtime/ControllerActions.cpp
   src/runtime/GameTheater.cpp
   src/runtime/StereoMailbox.cpp

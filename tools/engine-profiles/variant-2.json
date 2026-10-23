@@ -11627,12 +11627,12 @@
     },
     {
       "path": "native/src/engine/GameXr.cpp",
-      "sourceSha256": "0f84ac45f2db57433433415045523a246f42f40146f681ce9b29602dba410ba2",
-      "resultSha256": "74c936b33091384cac957af2c689fd2eb9629b63b7449c8be9b4fb7d03e02b7e",
+      "sourceSha256": "40ee0137d3c29ce4702e698d54c50dda43260ede276b5a7824edd0ca3ff0fc7a",
+      "resultSha256": "25d88bdfe36722698b0d583766db072616698ce59b79c76be990055a79a709ab",
       "edits": [
         {
-          "start": 1078,
-          "end": 1079,
+          "start": 1079,
+          "end": 1080,
           "lines": [
             "        const bool crouched=(posture&0xf00u)==0x100u; // sagPlayerInputFoot::IsCrouching 0x26c88c4\n"
           ]
