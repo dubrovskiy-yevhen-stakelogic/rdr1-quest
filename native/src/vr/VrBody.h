@@ -29,12 +29,18 @@
 #include "VrSettings.h"
 #include "VrMainThread.h"
 #include "VrHolsters.h"
+#include "VrReins.h" // REINS: both arms follow the controllers on a horse
+#include "VrReinRope.h" // REINS: the game's rein rope to the VR hand(s) that hold the reins (rein+0x190, hook A)
 #include "VrBodyLink.h"
 #include "VrLocomotion.h"
 #include "VrHandBox.h" // ARC: handBox (the IK hands of this frame for arc::Context::startPoint)
 #include "VrTeleportLink.h" // TELEPORT: warp::bodySerial (head-lock / freeze snap after a warp)
 #include "VrForearm.h" // Left forearm in the grip frame -> HUD wrist map
 #include "VrCutscene.h" // Cutscene presentation -> arms gate CUTSCENE, head collapse off unless FIRST PERSON
+#include "VrRideSteadyLink.h" // RIDE STEADY: the horse under the eye (VrMotionActors)
+#include "VrMotionBodyLink.h" // John's AppSW parts + this frame's LOCAL -> world map (VrMotionActors)
+#include "VrHorseChains.h" // the horse part chains (legs / neck / head)
+#include "VrSeat.h" // SEAT: John's upper body seated upright under the VR head on a horse (before the arm IK)
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -63,6 +69,7 @@ namespace A=::rdrvr::vr::armik;namespace H=::rdrvr::vr::holsters;namespace mt=::
 
 inline constexpr std::uintptr_t broadcastAttachOffset=0x1e495a4,broadcastAttachGotOffset=0x2e33718, // aActor::Broadcast(stdMsgUpdateAttachments)
     attachReturnPostPhysOffset=0x1d3d484,attachReturnComposeOffset=0x1d3d234,
+    makeHardStopOffset=0x269461c,makeHardStopSimGot=0x2e07110,horseComponentVtable=0x2d24f10,                                                                    // rdrHorseScriptControl::MakeHardStop(sagActor*)
     broadcastIkOffset=0x1e486e4,broadcastIkGotOffset=0x2e33510,                                     // aActor::Broadcast(animMsgUpdateIK)
     ikReturnPostPhysOffset=0x1d3d49c,ikReturnComposeOffset=0x1d3d24c,
     matrixSetUpdateOffset=0x1b02c08,matrixSetUpdateGotOffset=0x2e22ad0,                              // grmMatrixSet::Update
@@ -136,6 +143,15 @@ struct Config {
     float breakDeg{40.f},reengageDeg{8.f},lockBreakCm{15.f},beltCoreM{.22f};
     float nearSocketM{.30f},halfGripLo{.15f},halfGripHi{.65f},holdS{.5f},lockKnee{.8f};
     bool headShadow{true}; // Head back in the shadow (collapsed only for the eye draws); .headshadow 0 = no head in the shadow
+    // Support hand on a long gun: palm roll towards the gun's middle, the fore-end centre below the bore line, the hand slides along
+    // the barrel between these fractions of grip -> muzzle. LEFT hold: the right hand's animated grip mirrored onto the left fingers.
+    float supportTiltDeg{35.f},supportYawDeg{40.f},supportDropM{.025f},supportMin{.2f},supportMax{.6f};bool leftMirror{true};
+    bool supportLock{true},supportWorldUp{true}; // .body.supportlock 0 = the hand slides with the controller, .body.supportworldup 0 = gun up
+    // RIDING: reinsArm = both arms follow the controllers with REINS on (0 = rein hands); mountRel = the mounted arm memory in
+    // the rider frame (0 = world, no hold / crossfade); a missing hand pose holds mountHoldMs, a target-source switch crossfades mountFadeMs;
+    // rope = the rein rope mode follows the holding hands (VrReinRope.h: 0 never touch, 1 LEFT / RIGHT / BOTH, 2 no BOTH); ropeFree = no VR
+    // hand on the reins -> NONE (the rope on the saddle) instead of the game's own value.
+    bool reinsArm{true},mountRel{true};float mountHoldMs{200.f},mountFadeMs{120.f};int rope{1};bool ropeFree{true};
 };
 inline Config config{};
 // HEAD SHADOW state (see matrixSetHook): live = hook C keeps the player set uncollapsed; fillInstalled = GameXr wired the eye-scope fill
@@ -165,8 +181,31 @@ inline void startup() noexcept {
     parseFloat(H::property("debug.rdrvr.vr.body.lockbreak"),3.f,60.f,c.lockBreakCm);
     {float cm=c.beltCoreM*100.f;if(parseFloat(H::property("debug.rdrvr.vr.body.beltcore"),5.f,40.f,cm))c.beltCoreM=cm*.01f;}
     c.headShadow=flag("debug.rdrvr.vr.body.headshadow",true); // 0 = the head collapsed in the skinning task (no head in the shadow)
+    // .support "tiltDeg yawDeg dropCm" (35 40 2.5), .leftmirror 0 (left hold: procedural grip curl instead of the mirrored right-hand pose)
+    {float v[3]{};const auto t=H::property("debug.rdrvr.vr.body.support");
+     if(std::sscanf(t.c_str(),"%f %f %f",&v[0],&v[1],&v[2])==3&&std::fabs(v[0])<=90&&std::fabs(v[1])<=90&&v[2]>=-5&&v[2]<=10){
+        c.supportTiltDeg=v[0];c.supportYawDeg=v[1];c.supportDropM=v[2]*.01f;}}
+    c.leftMirror=flag("debug.rdrvr.vr.body.leftmirror",true);
+    c.supportLock=flag("debug.rdrvr.vr.body.supportlock",true);c.supportWorldUp=flag("debug.rdrvr.vr.body.supportworldup",true);
+    // RIDING: .reins.arm 0 (rein hands), .body.mountrel 0 (world arm memory on a horse), .body.mounthold <ms 0..1000> (200,
+    // 0 = no drop-out hold), .body.mountfade <ms 0..1000> (120, 0 = instant source switch), .reins.rope 0 / 1 / 2, .reins.ropefree 1
+    c.reinsArm=flag("debug.rdrvr.vr.reins.arm",true);c.mountRel=flag("debug.rdrvr.vr.body.mountrel",true);
+    parseFloat(H::property("debug.rdrvr.vr.body.mounthold"),0.f,1000.f,c.mountHoldMs);parseFloat(H::property("debug.rdrvr.vr.body.mountfade"),0.f,1000.f,c.mountFadeMs);
+    {const auto v=H::property("debug.rdrvr.vr.reins.rope");c.rope=v.empty()?1:v[0]=='0'?0:v[0]=='2'?2:1;}
+    c.ropeFree=flag("debug.rdrvr.vr.reins.ropefree",true); // the rope rests on the horse until a VR hand grabs it, the left hand never holds the reins by itself; 0 = the native value comes back
     {float v[2]{};const auto t=H::property("debug.rdrvr.vr.body.neckmodel");
      if(std::sscanf(t.c_str(),"%f %f",&v[0],&v[1])==2&&v[0]>=0&&v[0]<=20&&v[1]>=0&&v[1]<=30){c.neckBack=v[0]*.01f;c.neckDown=v[1]*.01f;}}
+    { // SEAT (VrSeat.h): .seat 0 (off), .seat.ref 1 (capture), .seat.follow <0..1>, .seat.lean <deg 0..60>, .seat.twist <deg 0..90>,
+      // .seat.tau <ms 0..1000>, .seat.ramp <ms 0..2000>, .seat.wait <ms 0..20000, 0 = forever> (a capture not taken by then -> the bind),
+      // .seat.reassert 0, .seat.eye 0 (the riding eye keeps a fixed 0.10 m seat)
+        namespace S=::rdrvr::vr::seat;S::Config s{};
+        s.on=flag("debug.rdrvr.vr.body.seat",true);s.capture=H::property("debug.rdrvr.vr.body.seat.ref")=="1";
+        s.reassert=flag("debug.rdrvr.vr.body.seat.reassert",true);s.eye=flag("debug.rdrvr.vr.body.seat.eye",true);
+        parseFloat(H::property("debug.rdrvr.vr.body.seat.follow"),0.f,1.f,s.follow);parseFloat(H::property("debug.rdrvr.vr.body.seat.lean"),0.f,60.f,s.leanDeg);
+        parseFloat(H::property("debug.rdrvr.vr.body.seat.twist"),0.f,90.f,s.twistDeg);parseFloat(H::property("debug.rdrvr.vr.body.seat.tau"),0.f,1000.f,s.tauMs);
+        {float ms=s.rampS*1000.f;if(parseFloat(H::property("debug.rdrvr.vr.body.seat.ramp"),0.f,2000.f,ms))s.rampS=ms*.001f;}
+        {float ms=s.waitS*1000.f;if(parseFloat(H::property("debug.rdrvr.vr.body.seat.wait"),0.f,20000.f,ms))s.waitS=ms*.001f;}
+        S::config=s;}
     if(H::property("debug.rdrvr.vr.body.headroot")=="head")c.headRoot=HeadRoot::Head;
     parseFloat(H::property("debug.rdrvr.vr.body.stretch"),0.f,30.f,c.stretchCm);
     parseFloat(H::property("debug.rdrvr.vr.body.yawtau"),0.f,2000.f,c.yawTauMs);
@@ -213,6 +252,8 @@ struct Frame {
     std::uint64_t headSampledNs{}; // The plan's head sample = the camera anchor key (sampledNs) the eye comes from; 0 unknown
     int hold{-1},support{-1};std::uintptr_t weapon{};bool firearm{},barrel{},placed{},alt{};
     A::Mat34 attachment{};A::Vec3 muzzle{},barrelDir{};
+    // DUAL: the phantom (second item) in the other VR hand, its BARREL placement under the same side rule (GameXr bodyPrePhantom)
+    int phantomHand{-1};std::uintptr_t phantomWeapon{};bool phantomFirearm{},phantomBarrel{},phantomPlaced{},phantomAlt{};A::Mat34 phantomAttachment{};
     const char* why{""};
 };
 using FrameFn=bool(*)(Frame& out,std::uintptr_t actor,std::uint64_t serial,std::uint64_t now) noexcept;
@@ -220,11 +261,15 @@ inline std::atomic<FrameFn> frameFn{};
 
 // Hook scope (thread_local, set while hook A's original runs): the weapon pose of the same scope reuses the BODY placement
 // (VrWeapon bodyPre) or leaves a HAND-held item to the engine's native attachment.
-struct Scope {std::uint64_t serial{};std::uintptr_t nativeWeapon{};};
+// leftWeapon: a HAND-held item in the LEFT VR hand - the engine attaches every item to its RIGHT bone, so the weapon pose of the scope
+// hands it leftAttachment = the IK'd left wrist_l_attachment global (the item hangs in the left skeletal hand like a native hold).
+struct Scope {std::uint64_t serial{};std::uintptr_t nativeWeapon{},leftWeapon{};A::Mat34 leftAttachment{};};
 inline thread_local Scope scope{};
 inline thread_local std::uint64_t lastAttachSerial{}; // hook A of this thread -> hook B
 inline std::uint64_t scopeSerial() noexcept {return scope.serial;}
 inline bool nativeHold(std::uintptr_t weapon) noexcept {return scope.serial&&weapon&&scope.nativeWeapon==weapon;}
+inline bool leftHold(std::uintptr_t weapon,A::Mat34& attachment) noexcept {
+    if(!scope.serial||!weapon||scope.leftWeapon!=weapon)return false;attachment=scope.leftAttachment;return true;}
 
 // ============================== state ==============================
 enum Gate : unsigned {GateOk,GateOff,GateNotInstalled,GateNotInGame,GateNoPlayer,GateDead,GateRagdoll,GateMounted,GateSuspended,GateLadder,
@@ -244,17 +289,26 @@ struct Rig {
     std::array<std::int16_t,maxBones> parent{};
     A::BodyBones bones{};
     std::array<A::ArmRig,2> arm{};std::array<bool,2> armOk{};std::array<float,2> upperCm{},foreCm{};std::array<int,2> fingerChains{};
+    bool fingerMirror{}; // The finger chains are mirror images (VrArmIk FingersMirror): the left hold copies the right hand's pose
     int collapseFirst{-1},collapseEnd{-1},collapsePivot{-1};
     // the character's real eyes (facial rig eyePivot_l / _r) and their bind offset from
     // the head joint (head frame, metres)
     std::array<int,2> eyePivot{-1,-1};A::Vec3 eyeBind{};bool eyeBindValid{};
+    // The character's RIGHT axis in the head joint's frame (bind pose): up x right = where the head faces, a nod does not change it
+    // (FIRST PERSON cutscenes, GameXr cutsceneJohn). headRightFrom = the bones it came from; bindFwdEyeCm = the eyes' bind offset along that forward.
+    A::Vec3 headRight{};bool headRightValid{};const char* headRightFrom{"NONE"};float bindFwdEyeCm{};
+    ::rdrvr::vr::seat::Chain seat{}; // SEAT: spine00..neck, the bind reference, the spine00 subtree (VrSeat.h BuildChain)
+    ::rdrvr::runtime::spacewarp::BoneKeyMap mvKeys{}; // the AppSW part joints (SpaceWarpBones.h names: head .. toe_r)
     const char* state{"NOT_RUN"};
 };
 inline std::array<Rig,4> rigSlots{};inline std::atomic<unsigned> rigNext{};
 struct Published {
     std::uintptr_t actor{},skel{},data{};const Rig* rig{};std::uint32_t count{},generation{};unsigned gate{GateNotInstalled};
     bool armsWanted{},collapse{};std::uint64_t ns{};
-    bool mountedArm{}; // RIDING: on a horse only the arm whose VR hand holds a weapon follows its controller
+    bool mountedArm{}; // RIDING: on a horse the arm whose VR hand holds a weapon follows its controller (REINS on = both arms)
+    // SEAT: seat = hold John's upper body seated (a horse after the mount animation); seatCut = the native pose at once (ragdoll,
+    // cutscene, dead, no player / skeleton) instead of the ramp out
+    bool seat{},seatCut{};
 };
 inline ::rdrvr::vr::body::Seqlock<Published> published;
 inline std::atomic<std::uintptr_t> hookActor{},collapseSkeleton{};
@@ -271,8 +325,11 @@ inline void bump(Counter& c,std::uint64_t n=1) noexcept {c.fetch_add(n,std::memo
 inline void maxOf(std::atomic<float>& a,float v) noexcept {float m=a.load(std::memory_order_relaxed);while(v>m&&!a.compare_exchange_weak(m,v)){}}
 struct ArmStats {
     Counter applied{},clamped{},stretched{},clavicle{},derived{},support{},free{},nativeHold{},noTarget{},poseFailed{},fingers{};
+    Counter holdMirror{},holdGrip{},itemAttach{}; // LEFT hold: fingers mirrored / procedural grip, item on the left attachment bone
     std::atomic<float> weight{},clampCmMax{},stretchCmMax{},clavicleDegMax{},targetErrMmMax{},lastClampCm{},lastTwistDeg{};
     Counter driftFrames{},driftOver1cm{},reasserted{};std::atomic<float> driftCmMax{},driftDegMax{},lastDriftCm{};
+    // RIDING (rider-frame memory only): wanted but no hand pose, held, holds that ran out, blend-out frames, crossfades + their frames
+    Counter mountNone{},mountHold{},mountHoldExpired{},mountBlendOut{},mountFades{},mountFadeFrames{};
 };
 // oscillation of a signal (cm) in 2 s windows: peak-to-peak and frequency (crossings of its 1 s running mean, 0.3 cm hysteresis).
 struct OscOut {std::atomic<float> ptpCm{},hz{},ptpMaxCm{},meanCm{},lastCm{};Counter windows{};};
@@ -334,10 +391,16 @@ inline void noteThread() noexcept {
 }
 
 // ============================== per-frame IK state (one writer: the thread that runs the player's hook A) ==============================
-struct ArmMemory {float weight{};A::Vec3 lastPerp{},hingeLocal{};A::Mat34 lastTarget{};A::FingerMode lastFingers{A::FingerMode::Native};bool haveLast{};};
+// RIDING: the target source (a switch crossfades on a horse); Hold = a drop-out hold or a blend-out of the last target
+enum ArmSource : unsigned {SourceNone,SourceFree,SourceDerived,SourceSupport,SourceHold};
+struct ArmMemory {float weight{};A::Vec3 lastPerp{},hingeLocal{};A::Mat34 lastTarget{};A::FingerMode lastFingers{A::FingerMode::Native};bool haveLast{};
+    // the last target in the rider frame (yawFrame), the last live frame, the source + its crossfade start (rider frame), grip
+    A::Mat34 lastRel{},fadeFrom{};std::uint64_t liveNs{};unsigned source{SourceNone},liveSource{SourceNone};float fadeT{1.f},lastGrip{},lastTrigger{};
+    bool haveRel{},holding{},wanted{};};
 struct Saved { // what hook A wrote, for hook B
     std::uint64_t serial{};std::uintptr_t skel{};bool valid[2]{};int first[2]{},count[2]{};
     std::array<std::array<A::Mat34,A::kMaxArm>,2> local{};std::array<A::Mat34,2> wrist{};
+    ::rdrvr::vr::seat::Saved seat{}; // SEAT: the chain locals hook A wrote
 };
 struct IkState {
     std::uint64_t lastNs{};std::array<ArmMemory,2> arm{};float yawWeight{};
@@ -439,20 +502,26 @@ inline unsigned contextGate(const H::PlayerBlocks& b) noexcept {
 }
 // Skeleton chain (VrWeapon deriveHandBone / VrMelee deriveChain): actor+0x50 entity -> +0x88 inst -> +0x88 cache -> +0x1a0 crSkeleton.
 struct SkelRead {std::uintptr_t skel{},data{},locals{},globals{},root{};std::uint32_t count{};};
-inline bool readSkeleton(std::uintptr_t actor,SkelRead& s) noexcept {
-    using namespace detail;const auto& ea=detail::api;
-    std::uintptr_t ent{},vt{},inst{},slot{},cache{};std::uint8_t frag{};std::uint16_t dataCount{};
-    if(!get(actor,off::actorEntity,ent)||!ent||!get(ent,0,vt)||vt!=ea.entityVtable)return false;
-    if(!get(ent,off::entityInst,inst)||!inst||!get(inst,0,vt)||!vt||!get(vt,off::instSkeletonSlot,slot)||slot!=ea.instSkeletonFn)return false;
-    if(!get(inst,off::instIsFrag,frag)||!frag||!get(inst,off::instCache,cache)||!cache||!get(cache,off::cacheSkeleton,s.skel)||!s.skel)return false;
+// The fields of a crSkeleton (s.skel set).
+inline bool readSkeletonFields(SkelRead& s) noexcept {
+    using namespace detail;std::uint16_t dataCount{};
     if(!get(s.skel,off::skelData,s.data)||!s.data||!get(s.skel,off::skelLocals,s.locals)||!s.locals||!get(s.skel,off::skelGlobals,s.globals)||!s.globals||
        !get(s.skel,off::skelRoot,s.root)||!s.root||!get(s.skel,off::skelCount,s.count)||!get(s.data,off::dataCount,dataCount))return false;
     return s.count>0&&s.count<=std::uint32_t(maxBones)&&dataCount==s.count;
 }
-// Default (bind) transform of `bone` in the frame of `ancestor` (composed default locals).
+inline bool readSkeleton(std::uintptr_t actor,SkelRead& s) noexcept {
+    using namespace detail;const auto& ea=detail::api;
+    std::uintptr_t ent{},vt{},inst{},slot{},cache{};std::uint8_t frag{};
+    if(!get(actor,off::actorEntity,ent)||!ent||!get(ent,0,vt)||vt!=ea.entityVtable)return false;
+    if(!get(ent,off::entityInst,inst)||!inst||!get(inst,0,vt)||!vt||!get(vt,off::instSkeletonSlot,slot)||slot!=ea.instSkeletonFn)return false;
+    if(!get(inst,off::instIsFrag,frag)||!frag||!get(inst,off::instCache,cache)||!cache||!get(cache,off::cacheSkeleton,s.skel)||!s.skel)return false;
+    return readSkeletonFields(s);
+}
+// Default (bind) transform of `bone` in the frame of `ancestor` (composed default locals). ancestor -1 = the model frame: bone 0 is the top whatever
+// its parent index says (crSkeleton::Update 0x1b04904 never reads parents[0]; a weapon skeleton's is 0, a self loop, log vr.weapon.reload.bones).
 inline bool composeTo(int bone,int ancestor,const Rig& r,const A::Mat34* defaults,A::Mat34& out) noexcept {
     out=A::Mat34{};int b=bone;
-    for(int guard=0;guard<16;++guard){if(b==ancestor)return true;if(b<0||b>=r.count)return false;out=defaults[b]*out;b=r.parent[std::size_t(b)];}
+    for(int guard=0;guard<16;++guard){if(b==ancestor)return true;if(b<0||b>=r.count)return false;out=defaults[b]*out;b=b==0?-1:r.parent[std::size_t(b)];}
     return false;
 }
 inline bool resolveRig(const SkelRead& s,Rig& r) noexcept {
@@ -477,6 +546,8 @@ inline bool resolveRig(const SkelRead& s,Rig& r) noexcept {
     const auto parentAt=[&](int i){return i>=0&&i<r.count?int(r.parent[std::size_t(i)]):-1;};
     const auto nameAt=[&](int i)->const char*{return i>=0&&i<r.count&&names[std::size_t(i)][0]?names[std::size_t(i)].data():nullptr;};
     r.bones=A::ResolveBones(r.count,nameAt,parentAt);r.bones.indexOrder=indexOrder;
+    {static thread_local std::array<const char*,maxBones> ptrs{};for(int i=0;i<r.count;++i)ptrs[std::size_t(i)]=nameAt(i); // part joints
+     r.mvKeys=::rdrvr::runtime::spacewarp::resolveBoneKeys(ptrs.data(),unsigned(r.count));}
     if(!indexOrder){r.state="INDEX_ORDER";return false;}
     static thread_local std::array<A::Mat34,maxBones> defaults{};
     for(int i=0;i<r.count;++i)defaults[std::size_t(i)]=A::LoadMat34(defaultRaw[std::size_t(i)].data());
@@ -507,6 +578,7 @@ inline bool resolveRig(const SkelRead& s,Rig& r) noexcept {
         const bool lengths=r.upperCm[std::size_t(s2)]>=15.f&&r.upperCm[std::size_t(s2)]<=45.f&&r.foreCm[std::size_t(s2)]>=15.f&&r.foreCm[std::size_t(s2)]<=45.f;
         r.armOk[std::size_t(s2)]=lengths&&rig.hand.valid;
     }
+    r.fingerMirror=r.arm[0].fingersValid&&r.arm[1].fingersValid&&A::FingersMirror(r.arm[0].curl,r.arm[1].curl,12.f);
     // the eye pivots (left, right) by name; their bind midpoint in the head joint's frame
     for(int i=0;i<r.count;++i){const char* n=nameAt(i);if(!n)continue;
         if(std::strcmp(n,"eyePivot_l")==0||(r.eyePivot[0]<0&&std::strcmp(n,"eye_l")==0))r.eyePivot[0]=i;
@@ -514,6 +586,23 @@ inline bool resolveRig(const SkelRead& s,Rig& r) noexcept {
     if(r.eyePivot[0]>=0&&r.eyePivot[1]>=0&&r.bones.head>=0){A::Mat34 el{},er{};
         if(composeTo(r.eyePivot[0],r.bones.head,r,defaults.data(),el)&&composeTo(r.eyePivot[1],r.bones.head,r,defaults.data(),er)){
             r.eyeBind=(el.d+er.d)*.5f;r.eyeBindValid=A::Finite(r.eyeBind);}}
+    // the head's right axis: the eyes' left-right line of the bind pose, else the clavicles'. Sign from the anatomy, not from a name or a
+    // bone axis: up (pelvis / neck -> head) x right must point to the side of the head joint the eyes are on.
+    if(r.bones.head>=0){A::Mat34 hm{},pa{},pb{},from{};A::Vec3 right{};const int cr=r.bones.arm[0].clavicle,cl=r.bones.arm[1].clavicle;
+        const int upBone=r.bones.pelvis>=0?r.bones.pelvis:r.bones.neck;const auto* d=defaults.data();
+        const bool head=composeTo(r.bones.head,-1,r,d,hm),eyes=head&&r.eyePivot[0]>=0&&r.eyePivot[1]>=0&&composeTo(r.eyePivot[1],-1,r,d,pa)&&composeTo(r.eyePivot[0],-1,r,d,pb);
+        if(eyes&&A::Length(pa.d-pb.d)>.01f){right=pa.d-pb.d;r.headRightFrom="EYES";}
+        else if(head&&cr>=0&&cl>=0&&composeTo(cr,-1,r,d,pa)&&composeTo(cl,-1,r,d,pb)&&A::Length(pa.d-pb.d)>.01f){right=pa.d-pb.d;r.headRightFrom="CLAVICLES";}
+        if(A::Length(right)>.01f&&A::Finite(right)){right=A::Normalize(right);
+            if(eyes&&upBone>=0&&composeTo(upBone,-1,r,d,from)){A::Mat34 el{},er{};
+                if(composeTo(r.eyePivot[0],-1,r,d,el)&&composeTo(r.eyePivot[1],-1,r,d,er)){
+                    float fwd=A::Dot(A::Normalize(A::Cross(hm.d-from.d,right)),(el.d+er.d)*.5f-hm.d);
+                    if(fwd<0.f){right=right*-1.f;fwd=-fwd;r.headRightFrom="EYES_FLIPPED";}
+                    r.bindFwdEyeCm=fwd*100.f;}}
+            r.headRight=A::Normalize(A::Transpose(hm.Rot())*right);r.headRightValid=A::Finite(r.headRight);}}
+    // SEAT: the head's ancestors down to the root bone / pelvis (spine00..neck), their bind reference, the spine00 subtree
+    ::rdrvr::vr::seat::BuildChain(r.count,r.bones.head,r.bones.neck,r.bones.pelvis,r.bones.hip[0],r.bones.hip[1],r.bones.arm[0].clavicle,r.bones.arm[1].clavicle,
+                                  parentAt,defaults.data(),r.seat);
     // head collapse range: the neck subtree about the neck joint (default) or the head subtree about the head joint
     const bool neck=config.headRoot==HeadRoot::Neck&&r.bones.neck>=0&&r.bones.head>r.bones.neck&&r.bones.head<r.bones.neckEnd;
     if(neck){r.collapseFirst=r.bones.neck;r.collapseEnd=r.bones.neckEnd;r.collapsePivot=r.bones.neck;}
@@ -532,6 +621,49 @@ inline void publishStatus(unsigned gate) noexcept {
 }
 inline void tick(const mt::Frame& frame) noexcept {
     const auto t0=detail::now();++tickIndex;bump(stats.ticks);
+    { // hard-stop decel boost (VrReins.h hsSoftDecel): the mount's brake tune x .hardmult while the hard stop runs, put back after
+        namespace rn=::rdrvr::vr::reins;static std::uintptr_t boostTune{};static float boostOrig{};static float mult{15.f};static std::uint64_t multNs{};
+        if(!multNs||t0-multNs>1'000'000'000ull){multNs=t0;char v[PROP_VALUE_MAX]{};mult=__system_property_get("debug.rdrvr.vr.reins.hardmult",v)>0?
+            std::clamp(float(std::atof(v)),1.f,40.f):15.f;} // x15: at x4 (1.0 -> 4.0) a stop from a gallop takes over 2 s
+        const auto until=rn::hardStopUntil.load(std::memory_order_relaxed);const bool on=until&&t0<until;
+        const auto horse=::rdrvr::vr::steadylink::mountActor.load(std::memory_order_relaxed);
+        if(on&&horse&&detail::api.base&&!boostTune){const auto comp=detail::raw<std::uintptr_t>(horse+0x68);
+            if(comp&&detail::raw<std::uintptr_t>(comp)==detail::api.base+horseComponentVtable+0x10){const auto tune=detail::raw<std::uintptr_t>(comp+0x1170);
+                const float soft=tune?detail::raw<float>(tune):-1.f,hard=tune?detail::raw<float>(tune+4):-1.f;
+                rn::hsSoftDecel.store(soft,std::memory_order_relaxed);rn::hsHardDecel.store(hard,std::memory_order_relaxed);
+                if(tune&&std::isfinite(hard)&&hard>0.f&&hard<200.f){boostTune=tune;boostOrig=hard;const float w=hard*mult;std::memcpy(reinterpret_cast<void*>(tune+4),&w,4);
+                    rn::hsHardUsed.store(w,std::memory_order_relaxed);rn::hsTuneBoosts.fetch_add(1,std::memory_order_relaxed);}else rn::hsTuneBad.fetch_add(1,std::memory_order_relaxed);}
+            else rn::hsTuneBad.fetch_add(1,std::memory_order_relaxed);}
+        if(!on&&boostTune){std::memcpy(reinterpret_cast<void*>(boostTune+4),&boostOrig,4);boostTune=0;}
+        // DECAY DELAY: without this the brake starts a couple of seconds after the gesture.
+        // hrsSpeedControl::Update 0x21f62a8 (the speed control = hrsHorseComponent+0x50, tune [+0x10] = [comp+0x60] = hrsSimTune+0x10):
+        // released input sets the decay timer +0x30 = tune fDecayDelay (+0x10, the game's 2.0 s) and while it is > 0 the speed is NOT
+        // decayed at all. While the stop runs: the timer 0 every frame and fDecayDelay 0 (put back after) - the brake starts at the gesture.
+        static std::uintptr_t decayTune{};static float decayOrig{};
+        if(on&&horse&&detail::api.base){const auto comp=detail::raw<std::uintptr_t>(horse+0x68);
+            if(comp&&detail::raw<std::uintptr_t>(comp)==detail::api.base+horseComponentVtable+0x10){
+                const auto stune=detail::raw<std::uintptr_t>(comp+0x60);const float dd=stune?detail::raw<float>(stune+0x10):-1.f;
+                if(!decayTune&&stune&&std::isfinite(dd)&&dd>=0.f&&dd<20.f){decayTune=stune;decayOrig=dd;rn::hsDecayDelay.store(dd,std::memory_order_relaxed);
+                    const float z=0.f;std::memcpy(reinterpret_cast<void*>(stune+0x10),&z,4);}
+                const float timer=detail::raw<float>(comp+0x50+0x30);
+                if(std::isfinite(timer)&&timer>0.f&&timer<20.f){const float z=0.f;std::memcpy(reinterpret_cast<void*>(comp+0x50+0x30),&z,4);
+                    rn::hsDecayTimerZeroed.fetch_add(1,std::memory_order_relaxed);rn::hsDecayTimerSeen.store(timer,std::memory_order_relaxed);}}}
+        if(!on&&decayTune){std::memcpy(reinterpret_cast<void*>(decayTune+0x10),&decayOrig,4);decayTune=0;}}
+    { // HARD STOP (VrReins.h hardStopUntil): the game's rdrHorseScriptControl::MakeHardStop on the mount, every main-thread frame
+        namespace rn=::rdrvr::vr::reins;const auto until=rn::hardStopUntil.load(std::memory_order_relaxed);
+        if(until&&t0<until){const auto horse=::rdrvr::vr::steadylink::mountActor.load(std::memory_order_relaxed);
+            const auto player=hookActor.load(std::memory_order_relaxed);
+            if((horse||player)&&detail::api.base){using Fn=void(*)(void*);const auto fn=reinterpret_cast<Fn>(detail::api.base+makeHardStopOffset);
+                // the rider too - MakeHardStop accepts either guid the player horse sim keeps (+0xad8 / +0xadc)
+                if(horse)fn(reinterpret_cast<void*>(horse));if(player)fn(reinterpret_cast<void*>(player));
+                rn::hardStopCalls.fetch_add(1,std::memory_order_relaxed);
+                const auto got=detail::raw<std::uintptr_t>(detail::api.base+makeHardStopSimGot);const auto sim=got?detail::raw<std::uintptr_t>(got):0;
+                rn::hsSim.store(sim,std::memory_order_relaxed);
+                if(sim){rn::hsSimAd8.store(detail::raw<std::uint32_t>(sim+0xad8),std::memory_order_relaxed);rn::hsSimAdc.store(detail::raw<std::uint32_t>(sim+0xadc),std::memory_order_relaxed);
+                    if(detail::raw<std::uint8_t>(sim+0xb74)&1u)rn::hardStopBitSeen.fetch_add(1,std::memory_order_relaxed);}
+                if(horse)rn::hsHorseGuid.store(detail::raw<std::uint32_t>(horse+8),std::memory_order_relaxed);
+                if(player)rn::hsPlayerGuid.store(detail::raw<std::uint32_t>(player+8),std::memory_order_relaxed);}
+            else rn::hardStopNoHorse.fetch_add(1,std::memory_order_relaxed);}}
     const bool on=::rdrvr::vr::settings().body()&&installed.load(std::memory_order_acquire);
     ::rdrvr::vr::status::bodyHidesHands.store(on,std::memory_order_relaxed);
     Published p{};p.ns=frame.now;unsigned gate=GateOk;
@@ -551,22 +683,33 @@ inline void tick(const mt::Frame& frame) noexcept {
             p.actor=pl.actor;p.skel=sk.skel;p.data=sk.data;p.count=sk.count;p.rig=currentRig;p.generation=currentRig->generation;
             // no head collapse in cutscenes unless the FIRST PERSON stereo cutscene needs John's head hidden (CINEMATIC / SCREEN /
             // the debug .headshadow 0 skinning-task collapse must never show a headless John)
-            p.collapse=on&&config.head&&currentRig->collapseFirst>=0&&!::rdrvr::vr::cutscene::suppressCollapse.load(std::memory_order_relaxed);
+            p.collapse=on&&config.head&&currentRig->collapseFirst>=0&&!::rdrvr::vr::cutscene::suppressCollapse.load(std::memory_order_relaxed)&&
+                !(::rdrvr::vr::settings().rideThirdPerson()&&::rdrvr::vr::steadylink::thirdActive(frame.now)); // John's head shows in THIRD PERSON
         }else if(gate==GateOk)gate=GateNoSkeleton;
         if(gate==GateOk&&currentRig&&!currentRig->armOk[0]&&!currentRig->armOk[1])gate=GateNoRig;
         if(gate==GateOk)gate=moverGate(pl);
-        if(gate==GateOk){
+        const auto refreshBlocks=[&]{
             if(!blocksValid||tickIndex-blocksTick>=4){
                 H::PlayerBlocks b{};bool ok=false;const auto& api=detail::api;
                 try{ok=api.context&&api.context(api.contextUser,pl.player,pl.actor,pl.guid,b);}catch(...){ok=false;}
                 blocksValid=ok;blocksTick=tickIndex;if(ok)lastBlocks=b;
-            }
-            gate=blocksValid?contextGate(lastBlocks):GateContext;
-        }
+            }};
+        if(gate==GateOk){refreshBlocks();gate=blocksValid?contextGate(lastBlocks):GateContext;}
+        // SEAT: a HORSE only (player state 5; a wagon / stagecoach seat is 3 and its mover is attached too) after the mount animation,
+        // outside cutscenes / linked animations. moverGate stops at MOUNTED (the mover attachment) before the context gate, so the seat
+        // reads the player blocks itself (same cache, every 4th tick).
+        if(gate==GateMounted&&on&&::rdrvr::vr::seat::config.on&&currentRig&&currentRig->seat.ok&&pl.state==5u){refreshBlocks();
+            const auto& b=lastBlocks;
+            if(blocksValid&&b.linkedAnimation)p.seatCut=true;
+            p.seat=blocksValid&&b.alive&&b.riding&&!b.mountingHorse&&!b.linkedAnimation&&!b.ridingVehicle&&!b.vehicleTransition&&!b.mountedWeapon;}
     }
     if(gate==GateOk&&::rdrvr::vr::cutscene::inCutscene.load(std::memory_order_relaxed))gate=GateCutscene; // Native pose in cutscenes
     if(gate==GateOk&&!on)gate=GateOff;
     p.gate=gate;p.armsWanted=gate==GateOk&&config.arms;p.mountedArm=gate==GateMounted&&config.arms&&config.mountedArm;
+    { // SEAT: the hold cuts at once (no ramp) where any write would fight the engine or show in a cutscene
+        const bool cs=::rdrvr::vr::cutscene::inCutscene.load(std::memory_order_relaxed);if(cs)p.seat=false;
+        p.seatCut=p.seatCut||cs||gate==GateRagdoll||gate==GateCutscene||gate==GateDead||gate==GateNotInGame||gate==GateNoPlayer||gate==GateNoSkeleton||
+            gate==GateNoRig||gate==GateNotInstalled||gate==GateStale;}
     published.store(p);
     hookActor.store(p.actor,std::memory_order_release);
     collapseSkeleton.store(p.collapse?p.skel:0,std::memory_order_release);
@@ -623,6 +766,7 @@ inline float applyYaw(A::Mat34* g,A::Mat34& l0,const A::Mat34& root,int count,co
 // One arm: load [clavicle, end) from the skeleton memory, solve, write back. Returns false (nothing written) on any failure.
 struct ArmJob {
     int side{};A::Mat34 target{};float weight{};A::FingerMode fingers{A::FingerMode::Native};float grip{},trigger{};bool write{true};
+    const A::Quat* fingerPose{};std::uint16_t fingerPoseMask{}; // per-joint finger locals replacing the curl (ArmPoseInput)
 };
 // g = this frame's globals (after the body yaw), the source of the solve; globals / locals = the skeleton memory written.
 inline bool solveArm(const Rig& r,int side,const A::Mat34* g,float* globals,unsigned char* locals,const ArmJob& job,ArmMemory& mem,const Basis& basis,
@@ -639,6 +783,7 @@ inline bool solveArm(const Rig& r,int side,const A::Mat34* g,float* globals,unsi
     p.rollShare=c.rollShare;p.stretchMax=c.stretchCm*.01f;p.right=basis.right;p.forward=basis.forward;p.up=basis.up;
     in.lastPerp=mem.lastPerp;in.hingeLocal=mem.hingeLocal;in.clavicleReach=c.clavicle;in.clavicleMaxRadians=c.clavicleDeg*A::kDegToRad;
     in.fingers=c.fingers?job.fingers:A::FingerMode::Native;in.grip=job.grip;in.trigger=job.trigger;
+    in.fingerPose=job.fingerPose;in.fingerPoseMask=job.fingerPoseMask;
     if(!A::PoseArm(rig,in,obj.data(),loc.data(),modified.data(),out))return false;
     mem.lastPerp=out.ik.perp;mem.hingeLocal=out.ik.hingeLocal;
     if(job.write){
@@ -656,29 +801,73 @@ inline A::Mat34 wristFromAttachment(const A::Mat34& attachment,const A::Mat34& w
     const A::Mat34 rel=A::InverseAffine(wrist)*attach;   // attachment bone in the wrist frame
     return attachment*A::InverseAffine(rel);
 }
-// Support hand on a long gun: the support controller's wrist moved so its grip origin sits on the foregrip (45 % from the
-// attachment origin to the muzzle on the barrel line, gta5-quest WeaponPose.h fallback).
-inline A::Mat34 supportTarget(const A::Mat34& freeWrist,const HandPose& h,const Frame& f) noexcept {
-    const A::Vec3 grip=f.attachment.d;const A::Vec3 along=f.muzzle-grip;
-    const float len=A::Dot(along,A::Normalize(f.barrelDir,{0,0,1}));
-    const A::Vec3 fore=grip+A::Normalize(f.barrelDir,{0,0,1})*(std::max(len,0.f)*.45f);
-    A::Mat34 t=freeWrist;t.d=t.d+(fore-h.gripPos);return t;
+// Support hand on a long gun: the hand under the fore-end in the gun's frame (VrArmIk SupportWrist: index side along the barrel,
+// palm up towards the bore, rolled towards the gun's middle; the controller's own rotation is not used - a free-hand wrist moved
+// onto the barrel put the fist across it). Where along the barrel: the support controller's grip projected onto the barrel line,
+// kept between supportMin..supportMax of grip -> muzzle; the gun's up = the holding controller's grip up normal to the barrel
+// (the BARREL hold takes its roll from that grip).
+inline A::Mat34 supportTarget(const HandPose& h,const A::HandFrame& hf,bool right,const Frame& f,const Config& c) noexcept {
+    const A::Vec3 dir=A::Normalize(f.barrelDir,{0,0,1});
+    // slide along the BORE (authored muzzle + barrel dir),
+    // not the attachment-bone line through the holding palm - that line runs the gun's grip->bore height (sniper 10 cm, rifles ~8 cm)
+    // under the bore, so the support hand would hang that far under the fore-end
+    const float len=std::max(A::Dot(f.muzzle-f.attachment.d,dir),0.f); // holding grip -> muzzle along the bore
+    const A::Vec3 grip=f.muzzle-dir*len;                                 // the bore point level with the holding grip
+    float along=std::clamp(A::Dot(h.gripPos-grip,dir),len*c.supportMin,len*c.supportMax);
+    // the place along the barrel is latched when the support grip
+    // starts (as a fraction of grip -> muzzle) and kept while it holds; a new grip / another gun / a gap > 250 ms latches again
+    {struct Lock {std::uintptr_t weapon{};std::uint64_t ns{};float frac{};};static Lock lock[2]{};auto& k=lock[right?1:0];
+     const std::uint64_t now=f.headSampledNs;
+     if(c.supportLock&&len>1e-4f&&now){
+        if(k.weapon!=f.weapon||!k.ns||now<k.ns||now-k.ns>250'000'000ull)k.frac=along/len;
+        along=k.frac*len;k.weapon=f.weapon;k.ns=now;}}
+    // the palm faces WORLD up under the barrel (a
+    // cradling hand), not the gun's own up - a canted gun does not twist the support wrist with it
+    A::Vec3 up=f.up;
+    if(!c.supportWorldUp&&f.hold>=0&&f.hold<2&&f.hand[std::size_t(f.hold)].valid)up=f.hand[std::size_t(f.hold)].frame.b;
+    if(std::fabs(A::Dot(A::Normalize(up,f.up),dir))>.95f)up=f.up;
+    up=A::Normalize(up-dir*A::Dot(up,dir),f.up);
+    const float s=std::max(f.upm,1e-3f);
+    const A::Vec3 fore=grip+dir*along-up*(c.supportDropM*s);
+    return A::SupportWrist(hf,dir,up,fore,right,c.supportTiltDeg*A::kDegToRad,c.supportYawDeg*A::kDegToRad,c.wristBack*s,c.wristDepth*s);
 }
 inline float stepWeight(float w,bool wanted,float dt,float seconds) noexcept {
     const float step=seconds>0.f?std::max(dt,0.f)/seconds:1.f;return A::Clamp01(wanted?w+step:w-step);}
+// RIDING: the rider frame of the mounted arm memory = the skeleton root's translation + heading about `up` only (the rider matrix
+// pitches / rolls with the gait; a held hand must not bob with it - GameXr's riding eye refuses that matrix for the same reason). The
+// root axis closest to `up` is its up, the next one (cyclic) its heading: stable while the rider tilts < 45 deg.
+inline A::Mat34 yawFrame(const A::Mat34& m,A::Vec3 up) noexcept {
+    const A::Vec3 ax[3]{m.a,m.b,m.c};int k=0;float best=-1.f;
+    for(int i=0;i<3;++i){const float d=std::fabs(A::Dot(A::Normalize(ax[i],up),up));if(d>best){best=d;k=i;}}
+    A::Vec3 h=ax[(k+1)%3];h=h-up*A::Dot(h,up);
+    if(A::Length(h)<1e-4f){h=ax[(k+2)%3];h=h-up*A::Dot(h,up);}
+    h=A::Normalize(h,{0,0,1});
+    return A::MakeMat34(A::Mat33{A::Cross(up,h),up,h},A::Finite(m.d)?m.d:A::Vec3{});
+}
+// crossfade of two wrist targets (position lerp, rotation slerp, column lengths lerped); a mirrored / broken input -> b
+inline A::Mat34 blendTarget(const A::Mat34& a,const A::Mat34& b,float t) noexcept {
+    const auto det=[](const A::Mat34& m){return A::Dot(m.a,A::Cross(m.b,m.c));};
+    if(!(det(a)>1e-9f)||!(det(b)>1e-9f))return b;
+    const A::Mat33 r=A::FromQuat(A::Slerp(A::ToQuat(A::Orthonormalize(a.Rot())),A::ToQuat(A::Orthonormalize(b.Rot())),t));
+    const auto len=[t](A::Vec3 x,A::Vec3 y){return A::Length(x)+(A::Length(y)-A::Length(x))*t;};
+    const A::Mat34 out=A::MakeMat34(A::Mat33{r.a*len(a.a,b.a),r.b*len(a.b,b.b),r.c*len(a.c,b.c)},A::Lerp(a.d,b.d,t));
+    return A::Finite(out)?out:b;
+}
 // where the character's head joint belongs, horizontally. The HMD is modelled as a rigid head that
 // pitches / yaws about a NECK pivot P = eye - fwd * neckBack - headUp * neckDown (the standard VR neck model, 8 / 7.5 cm). A pivot at
 // eye - fwd * BACK - up * BODY LOWER would move ~5-10 cm forward when looking down 50 deg, and the
 // whole body with it. The head joint goes BACK behind the eye along the head's heading:
 // target = P + heading * (neckBack - BACK) (upright: exactly eye - heading * BACK).
-// heading = horizontal(fwd + headUp): valid from looking straight up to straight down.
+// heading = horizontal(fwd), the smoothed forward within 6 deg of straight up / down. horizontal(fwd + headUp) with headUp
+// made from world up = (cos - sin) * forward would flip 180 deg looking UP past 45 deg (a 2 * (BACK - neckBack) target jump; the seat's twist
+// reads it too); identical direction for every other pitch.
 inline bool neckTarget(const Frame& f,A::Vec3 smoothFwd,const Config& c,A::Vec3& out) noexcept {
     const A::Vec3 up=A::Normalize(f.up,{0,1,0});const A::Vec3 fw=A::Normalize(f.headFwd,{0,0,1});
     A::Vec3 hu=up-fw*A::Dot(fw,up);
     if(A::Length(hu)<.1f){hu=smoothFwd-up*A::Dot(smoothFwd,up);if(A::Length(hu)<1e-3f)hu=up;}
     hu=A::Normalize(hu,up);
-    A::Vec3 heading=fw+hu;heading=heading-up*A::Dot(heading,up);
-    if(A::Length(heading)<1e-3f){heading=smoothFwd-up*A::Dot(smoothFwd,up);}
+    A::Vec3 heading=fw-up*A::Dot(fw,up);
+    if(A::Length(heading)<.1f){heading=smoothFwd-up*A::Dot(smoothFwd,up);}
     heading=A::Normalize(heading,{0,0,1});
     const float s=std::max(f.upm,1e-3f);
     const A::Vec3 pivot=f.eye-fw*(c.neckBack*s)-hu*(c.neckDown*s);
@@ -719,7 +908,9 @@ inline constexpr std::array<SocketSpec,7> socketSpecs{{
     {5, .02f, .08f,-.16f},  // LONGARM: behind the right shoulder (reach over the shoulder)
     {6,-.02f, .08f,-.16f},  // SHOTGUN: behind the left shoulder
 }};
-inline constexpr std::uint32_t socketItemSlots=0b0001111u; // MELEE / SIDEARM / THROWN / LASSO: the holstered item's own position
+// THROWN uses the chest spec - the
+// game does not draw a holstered thrown item, its 'holstered' point is not at the chest
+inline constexpr std::uint32_t socketItemSlots=0b0001011u; // MELEE / SIDEARM / LASSO: the holstered item's own position
 inline void publishSockets(const Rig& r,const A::Mat34* g,int count,const Frame& f,bool open,std::uint64_t now,float dt,std::uintptr_t skel) noexcept {
     if(ik.socketSkel!=skel){ik.socketSkel=skel;ik.itemValid={};ik.havePrevPelvis=false;}
     const auto bone=[&](int i){return i>=0&&i<count;};
@@ -759,10 +950,359 @@ inline void publishSockets(const Rig& r,const A::Mat34* g,int count,const Frame&
     stats.socketMask.store(out.mask,std::memory_order_relaxed);stats.socketFromItem.store(out.fromItem,std::memory_order_relaxed);
 }
 
+// SEAT (VrSeat.h): John's upper body seated upright under the VR head on a horse, BEFORE the arm IK (the arms solve from the new
+// shoulders). mode 2 = hold, 1 = ramp out (dismount / gate change), 0 = cut (the native pose at once, nothing written). g = this frame's
+// globals (updated in place for the arm IK / sockets); the chain locals + the spine00 subtree globals are written. True = written.
+inline bool seatStep(const Rig& r,A::Mat34* g,float* globals,unsigned char* locals,const A::Mat34& root,int count,const Frame& f,bool frameOk,
+                     float dt,std::uint64_t now,int mode,const Config& c) noexcept {
+    namespace S=::rdrvr::vr::seat;auto& st=S::state;auto& ss=S::stats;const auto& sc=S::config;const auto& ch=r.seat;
+    const auto t0=detail::now();
+    if(st.data!=r.data||st.generation!=r.generation){st=S::State{};st.data=r.data;st.generation=r.generation;} // a new skeleton: from scratch
+    const auto idle=[&](bool cut){if(cut&&st.weight>0.f)bump(ss.cuts);if(cut){st.weight=0.f;st.haveFollow=false;st.haveAim=false;}
+        ss.active.store(false,std::memory_order_relaxed);ss.wanted.store(false,std::memory_order_relaxed);ss.weight.store(st.weight,std::memory_order_relaxed);};
+    if(!sc.on&&mode>1)mode=1;
+    if(mode!=2){if(st.lastWantNs&&!st.offNs)st.offNs=now?now:1;}else if(st.offNs&&now>=st.offNs&&now-st.offNs<=1'000'000'000ull)st.offNs=0; // < 1 s off: the same ride
+    if(mode==0||!ch.ok){idle(true);return false;}
+    if(mode==1&&st.weight<=0.f){idle(false);return false;}
+    for(int k=0;k<ch.n;++k)if(ch.bone[std::size_t(k)]>=count){idle(true);ss.skipWhy.store("BONE_RANGE",std::memory_order_relaxed);bump(ss.skipped);return false;}
+    if(ch.head>=count||ch.baseParent<0||ch.baseParent>=count){idle(true);ss.skipWhy.store("BONE_RANGE",std::memory_order_relaxed);bump(ss.skipped);return false;}
+    // a new mount (the hold wanted again after it was seen off for > 1 s - a dismount, not a pause / menu gap where hook A does not run):
+    // the capture, the eye latch, the held upright frame and the follow start over
+    if(mode==2){if(!st.lastWantNs||st.offNs){bump(ss.mounts);st.captured=false;st.bindFallback=false;st.maxHead=-1e9f;st.calmS=0.f;st.waitS=0.f;
+            st.eyeLatched=false;st.eyeSum=0.f;st.eyeS=0.f;S::eyeFwdOk.store(false,std::memory_order_relaxed);st.haveF=false;st.haveAim=false;st.followK=1.f;
+            st.twistSide=0.f;}
+        st.lastWantNs=now;st.offNs=0;}
+    const A::Vec3 up=A::Normalize(f.up,{0,1,0});const float s=std::max(f.upm,1e-3f),cmPer=100.f/s;
+    // the upright frame (the root's b onto up); past 70 deg of tilt (a rear / a buck) the last one of this mount is held
+    float upDot=1.f;A::Mat33 F=S::UprightFrame(root,up,upDot);
+    {const float tilt=std::acos(std::clamp(upDot,-1.f,1.f))/A::kDegToRad;S::put(ss.tiltDeg,tilt);if(std::isfinite(tilt))S::maxOf(ss.tiltDegMax,tilt);}
+    if(!(upDot>S::tiltHoldDot)){bump(ss.tiltFrames);
+        if(!st.haveF){idle(true);ss.skipWhy.store("TILT",std::memory_order_relaxed);bump(ss.skipped);return false;}F=A::FromQuat(st.lastF);}
+    else{st.lastF=A::ToQuat(F);st.haveF=true;}
+    const A::Mat33 Ft=A::Transpose(F);const A::Vec3 fwd=S::RiderForward(F,up),side=A::Cross(up,fwd);
+    const int b0=ch.bone[0],top=ch.bone[std::size_t(ch.n-1)];
+    const auto rel=[&](A::Vec3 p,std::atomic<float>& fo,std::atomic<float>* so,std::atomic<float>* uo){const A::Vec3 d=(p-root.d)*cmPer;
+        S::put(fo,A::Dot(d,fwd));if(so)S::put(*so,A::Dot(d,side));if(uo)S::put(*uo,A::Dot(d,up));};
+    rel(g[std::size_t(ch.head)].d,ss.nativeFwd,&ss.nativeSide,&ss.nativeUp);rel(g[std::size_t(b0)].d,ss.baseFwd,&ss.baseSide,nullptr);
+    // reference: the vertical bind, or the capture (.seat.ref 1, or a bind > 26 deg off the root up) - no capture within .seat.wait -> the bind
+    const bool wantCapture=sc.capture||!ch.bindUpright;
+    { // the calm detector: rider speed (root, horizontal) < 0.3 m/s, the native head within 3 cm of the highest CALM head this mount, centred, 0.5 s
+        if(st.haveRoot&&dt>1e-4f){A::Vec3 v=(root.d-st.prevRoot)*(1.f/dt);v=v-up*A::Dot(v,up);const float sp=A::Length(v)/s;
+            if(std::isfinite(sp))st.speedS+=(std::min(sp,20.f)-st.speedS)*A::SmoothFactor(dt,.3f);}
+        st.prevRoot=root.d;st.haveRoot=true;
+        if(wantCapture&&!st.bindFallback&&!st.captured&&mode==2&&st.weight<=0.f){ // only the genuine native pose (nothing of ours in it yet)
+            bump(ss.captureWait);st.waitS+=dt;
+            const A::Vec3 hd=(g[std::size_t(ch.head)].d-root.d)*(1.f/s);const float h=A::Dot(hd,up),hf=A::Dot(hd,fwd),hs=A::Dot(hd,side);
+            const bool calm=st.speedS<.3f;if(calm)st.maxHead=std::max(st.maxHead,h); // the moving upright seat is higher than every standing idle
+            // centred (standstill idles reach 36 cm sideways / 52 cm forward, the look-back is the highest steady head):
+            // the head over the saddle's centre line (|side| < 6 cm, forward -5..+20 cm of the root), the shoulders square to the rider (< 15 deg)
+            bool square=true;
+            {const int ar=r.bones.arm[0].arm,al=r.bones.arm[1].arm;
+             if(ar>=0&&al>=0&&ar<count&&al<count){A::Vec3 sl=g[std::size_t(ar)].d-g[std::size_t(al)].d;sl=sl-up*A::Dot(sl,up);const float L=A::Length(sl);
+                 square=L>1e-3f*s&&std::fabs(A::Dot(sl,fwd))<.26f*L;}}
+            const bool high=calm&&h>st.maxHead-.03f,centred=std::fabs(hs)<.06f&&hf>-.05f&&hf<.20f&&square;
+            if(high&&!centred)bump(ss.captureRejects);
+            st.calmS=high&&centred?st.calmS+dt:0.f;
+            if(st.calmS>=.5f){ // its spine00 -> head line made vertical as well (an UPRIGHT seat), kept in the upright frame
+                const A::Vec3 sp=A::Normalize(Ft*(g[std::size_t(ch.head)].d-g[std::size_t(b0)].d),{0,1,0});
+                st.capBase=A::Normalize(A::FromTo(sp,{0,1,0})*A::ToQuat(Ft*A::Orthonormalize(g[std::size_t(b0)].Rot())));
+                for(int k=1;k<ch.n;++k)st.capLocal[std::size_t(k)]=A::ToQuat(A::Orthonormalize(A::LoadMat34(reinterpret_cast<const float*>(locals+std::size_t(ch.bone[std::size_t(k)])*off::localStride)).Rot()));
+                st.captured=true;bump(ss.captures);}
+            else if(sc.waitS>0.f&&st.waitS>=sc.waitS){st.bindFallback=true;bump(ss.captureTimeouts);}}
+    }
+    const bool useCapture=wantCapture&&!st.bindFallback,refReady=!useCapture||st.captured;
+    ss.refSource.store(!wantCapture?"BIND":!useCapture?"BIND_AFTER_WAIT":st.captured?(sc.capture?"CAPTURE":"CAPTURE_BIND_NOT_UPRIGHT"):"WAIT_CAPTURE",
+                       std::memory_order_relaxed);
+    ss.refOk.store(refReady,std::memory_order_relaxed);
+    const bool wanted=mode==2&&refReady;ss.wanted.store(wanted,std::memory_order_relaxed);if(wanted)bump(ss.wantedFrames);
+    st.weight=stepWeight(st.weight,wanted,dt,sc.rampS);ss.weight.store(st.weight,std::memory_order_relaxed);
+    if(st.weight<=0.f){idle(false);return false;}
+    if(!wanted)bump(ss.rampOutFrames);
+    // this frame's reference, else (a ramp out whose capture was reset by a new mount) the last one applied - never an unset one
+    A::Quat refBase{};
+    if(refReady){refBase=useCapture?st.capBase:ch.bindBase;st.useLocal=useCapture?st.capLocal:ch.bindLocal;st.useBase=refBase;st.haveUse=true;}
+    else if(st.haveUse){refBase=st.useBase;bump(ss.lastRefFrames);}
+    else{idle(true);ss.skipWhy.store("NO_REF",std::memory_order_relaxed);bump(ss.skipped);return false;}
+    const A::Quat* ref=st.useLocal.data();
+    // native inputs: bone[0]'s parent global (native: the root bone / pelvis stay), the chain locals, the head joint in the neck frame
+    S::Pose pose{};pose.parent=g[std::size_t(ch.baseParent)];
+    for(int k=0;k<ch.n;++k)pose.local[std::size_t(k)]=A::LoadMat34(reinterpret_cast<const float*>(locals+std::size_t(ch.bone[std::size_t(k)])*off::localStride));
+    pose.headLocal=A::TransformPoint(A::InverseAffine(g[std::size_t(top)]),g[std::size_t(ch.head)].d);
+    const A::Mat33 base=F*A::FromQuat(refBase);
+    S::Out o{};S::Fk(ch,pose,base,ref,up,0.f,{},1.f,o);const A::Vec3 refHead=o.head; // the rigid upright reference
+    rel(refHead,ss.refFwd,nullptr,&ss.refUp);
+    // ---- follow the VR head: the twist toward the HMD heading, the lean that puts the head joint on the neck-model target ----
+    const bool headNow=frameOk&&f.headValid;A::Vec3 target{};bool haveTarget=false;A::Vec3 heading=fwd;
+    if(headNow){
+        heading=S::HeadHeading(f.headFwd,up,fwd);
+        // VrBody's neck-model target of the head joint (BODY BACK behind the eye), less HORSE CAM FWD (that setting moves the camera, not John)
+        if(neckTarget(f,ik.smoothFwd,c,target)){target=target-fwd*(::rdrvr::vr::settings().rideFwdMeters()*s);haveTarget=A::Finite(target);}
+    }
+    bool tc=false,lc=false;
+    if(haveTarget){
+        // .seat.tau smooths the TARGET in the rider frame (F about the root: it turns / moves with the horse, also through a hold); the lean
+        // below is solved every frame against the native spine base, so the gait's hip motion is cancelled without lag
+        const A::Vec3 tr=Ft*(target-root.d);const float k=st.haveAim?A::SmoothFactor(dt,sc.tauMs*.001f):1.f;
+        st.aimR=st.haveAim?st.aimR+(tr-st.aimR)*k:tr;st.followK=st.haveAim?st.followK+(1.f-st.followK)*A::SmoothFactor(dt,.3f):1.f;st.haveAim=true;
+        const float twistWant=S::TwistFor(A::SignedAngleAbout(fwd,heading,up),sc.twistDeg*A::kDegToRad,st.twistSide,tc)*sc.follow;
+        st.twist+=(twistWant-st.twist)*(st.haveFollow?k:1.f);st.haveFollow=true;st.lastHeadNs=now;
+    }else{
+        bump(ss.noHead);
+        // no head this frame: the follow (rider-frame target, twist) held holdS, then it relaxes to the upright reference (tau 0.3 s)
+        if(st.haveAim&&st.lastHeadNs&&now>=st.lastHeadNs&&now-st.lastHeadNs<std::uint64_t(double(c.holdS)*1e9))bump(ss.holdFrames);
+        else{const float k=A::SmoothFactor(dt,.3f);st.twist-=st.twist*k;st.followK-=st.followK*k;}
+    }
+    if(!std::isfinite(st.twist)||!A::Finite(st.aimR)||!std::isfinite(st.followK)){st.twist=0.f;st.aimR={};st.followK=1.f;st.haveFollow=st.haveAim=false;}
+    A::Vec3 lean{};
+    if(st.haveAim){const A::Vec3 aim=refHead+(root.d+F*st.aimR-refHead)*(sc.follow*std::clamp(st.followK,0.f,1.f));
+        lean=S::SolveLean(ch,pose,base,ref,up,st.twist,aim,sc.leanDeg*A::kDegToRad,lc);}
+    if(tc)bump(ss.twistClamped);if(lc)bump(ss.leanClamped);if(tc||lc)bump(ss.clampFrames);
+    st.lean=lean;
+    S::Fk(ch,pose,base,ref,up,st.twist,lean,st.weight,o);
+    bool finite=A::Finite(o.head);for(int k=0;k<ch.n;++k)finite=finite&&A::Finite(o.global[std::size_t(k)])&&A::Finite(o.local[std::size_t(k)]);
+    if(!finite){idle(true);ss.skipWhy.store("NOT_FINITE",std::memory_order_relaxed);bump(ss.skipped);return false;}
+    // ---- the riding eye's forward seat: the reference head forward of the root LATCHED once per mount (the mean of the first 1 s at full
+    // weight; a running mean creeps with the native hip motion) + BODY BACK (metres) ----
+    if(wanted&&st.weight>=1.f&&!st.eyeLatched&&dt>0.f){const float lf=A::Dot(refHead-root.d,fwd)/s;
+        if(std::isfinite(lf)){st.eyeSum+=lf*dt;st.eyeS+=dt;if(st.eyeS>=1.f){st.eyeRef=st.eyeSum/st.eyeS;st.eyeLatched=true;bump(ss.eyeLatches);}}}
+    if(st.eyeLatched&&std::isfinite(st.eyeRef+f.eyeBack)){S::eyeFwdM.store(st.eyeRef+f.eyeBack,std::memory_order_relaxed);S::eyeFwdOk.store(true,std::memory_order_release);}
+    // ---- write: the chain (locals + globals), the rest of the spine00 subtree carried rigidly with its nearest chain bone ----
+    const bool write=!c.dry;
+    if(write){
+        std::array<A::Mat34,S::maxChain> delta{};
+        for(int k=0;k<ch.n;++k){const int b=ch.bone[std::size_t(k)];delta[std::size_t(k)]=o.global[std::size_t(k)]*A::InverseAffine(g[std::size_t(b)]);
+            g[std::size_t(b)]=o.global[std::size_t(k)];A::StoreMat34(globals+std::size_t(b)*16,o.global[std::size_t(k)]);
+            A::StoreMat34(reinterpret_cast<float*>(locals+std::size_t(b)*off::localStride),o.local[std::size_t(k)]);}
+        for(int i=0;i<ch.subCount;++i){const int b=ch.sub[std::size_t(i)];if(b<0||b>=count)continue;
+            g[std::size_t(b)]=delta[std::size_t(ch.anchor[std::size_t(i)])]*g[std::size_t(b)];A::StoreMat34(globals+std::size_t(b)*16,g[std::size_t(b)]);}
+        auto& sv=ik.saved.seat;sv.valid=true;sv.local=o.local;
+        S::activeNs.store(now?now:1,std::memory_order_release);
+    }else bump(ss.dryFrames);
+    // ---- report ----
+    bump(ss.frames);ss.active.store(true,std::memory_order_relaxed);
+    S::put(ss.leanDeg,A::Length(lean)/A::kDegToRad);S::put(ss.twistDeg,st.twist/A::kDegToRad);
+    rel(o.head,ss.headFwd,&ss.headSide,&ss.headUp);
+    if(haveTarget){A::Vec3 e=o.head-target;e=e-up*A::Dot(e,up);const float cm=A::Length(e)*cmPer;S::put(ss.neckErrCm,cm);
+        if(st.weight>=1.f&&std::isfinite(cm))S::maxOf(ss.neckErrCmMax,cm);}
+    if(headNow){const A::Vec3 d=f.eye-o.global[std::size_t(ch.n-1)].d;S::put(ss.stumpBelow,A::Dot(d,up)*cmPer);S::put(ss.stumpBehind,A::Dot(d,heading)*cmPer);}
+    S::maxOf(ss.usMax,float(double(detail::now()-t0)/1000.0));
+    return write;
+}
+// SEAT hook B: the engine IK (aim / rein 'spine+' chains) may have bent the held chain after hook A -> drift counted and (default
+// .seat.reassert 1) the chain re-asserted, the rest of the spine00 subtree carried rigidly from where the engine left it (the arm re-assert
+// below then starts from the restored shoulders).
+inline void seatAfterEngineIk(const Rig& r,float* globals,unsigned char* locals,const Config& c) noexcept {
+    namespace S=::rdrvr::vr::seat;const auto& sv=ik.saved.seat;const auto& ch=r.seat;auto& ss=S::stats;
+    if(!sv.valid||!ch.ok||ch.baseParent<0)return;
+    // the wanted chain from its saved locals under the CURRENT base parent (the root bone / pelvis are the engine's: never detached)
+    std::array<A::Mat34,S::maxChain> now{},want{};float cm=0.f,deg=0.f;A::Mat34 gp=A::LoadMat34(globals+std::size_t(ch.baseParent)*16);
+    for(int k=0;k<ch.n;++k){now[std::size_t(k)]=A::LoadMat34(globals+std::size_t(ch.bone[std::size_t(k)])*16);want[std::size_t(k)]=gp*sv.local[std::size_t(k)];gp=want[std::size_t(k)];
+        cm=std::max(cm,A::Length(now[std::size_t(k)].d-want[std::size_t(k)].d)*100.f);deg=std::max(deg,S::AngleDeg(now[std::size_t(k)].Rot(),want[std::size_t(k)].Rot()));}
+    if(!(cm>.05f||deg>.2f))return;
+    bump(ss.driftFrames);if(cm>1.f)bump(ss.driftOver1cm);S::maxOf(ss.driftCmMax,cm);S::maxOf(ss.driftDegMax,deg);
+    if(!S::config.reassert||c.dry)return;
+    std::array<A::Mat34,S::maxChain> delta{};
+    for(int k=0;k<ch.n;++k){const int b=ch.bone[std::size_t(k)];delta[std::size_t(k)]=want[std::size_t(k)]*A::InverseAffine(now[std::size_t(k)]);
+        A::StoreMat34(globals+std::size_t(b)*16,want[std::size_t(k)]);A::StoreMat34(reinterpret_cast<float*>(locals+std::size_t(b)*off::localStride),sv.local[std::size_t(k)]);}
+    for(int i=0;i<ch.subCount;++i){const int b=ch.sub[std::size_t(i)];float* m=globals+std::size_t(b)*16;
+        A::StoreMat34(m,delta[std::size_t(ch.anchor[std::size_t(i)])]*A::LoadMat34(m));}
+    bump(ss.reasserted);
+}
+
 // The whole hook-A body for the player (no engine calls). frameOk = the provider gave this frame's poses.
-struct ApplyResult {bool wrote{};int arms{};std::uintptr_t nativeWeapon{};};
+struct ApplyResult {bool wrote{};int arms{};std::uintptr_t nativeWeapon{},leftWeapon{};A::Mat34 leftAttachment{};};
+// ============================== RIDE STEADY ==============================
+// The riding eye stays level while the body and the horse shake, which makes players motion sick.
+// The riding eye is Holt-smoothed (GameXr ridingAnchorSample, 350 ms) while John's root (on the saddle) and the horse's back bounce
+// ~18 cm p-p at a gallop. Each hook A call shifts the WHOLE skeleton of John (applyBody, mounted, before the seat hold) and of the horse
+// (attachHook, mountActor from VrMotionActors: the race-1 actor under the eye) along up by (smoothed - raw) of its own reference height:
+// John = the root (entity) height, the horse = the bone nearest under John's root, > 0.8 m above the horse root. Globals + L0 as the
+// head lock (sticky L0 = the shift persisted: the measured bone height minus the baked shift is the raw one). Attachments (hat,
+// holstered guns, the rein rope) follow in the engine's own update after hook A; skinning / shadows read these globals.
+// debug.rdrvr.vr.riding.steady 0 = off (unwinds), .steadyms (Holt tau, ms, 350), .steadycm (max shift, cm, 15).
+namespace steady {
+inline std::atomic<std::uintptr_t>& mountActor=::rdrvr::vr::steadylink::mountActor; // VrMotionActors: the horse under the eye (0 = none)
+inline std::atomic<std::uint64_t> riderNs{0};           // the last mounted rider shift (the horse shifts only while it is fresh)
+inline std::atomic<float> riderX{0.f},riderZ{0.f};      // John's root (horizontal) for the horse's reference bone
+inline std::atomic<std::uint64_t> riderFrames{0},horseFrames{0},horseNoBone{0},horseMismatch{0};
+inline std::atomic<std::uint64_t> riderHorseBase{0},riderHeldBase{0},riderOwnBase{0}; // which height John's steady is measured against
+inline std::atomic<float> riderShiftCm{0.f},horseShiftCm{0.f},riderBobCm{0.f},horseBobCm{0.f}; // bob = 1 s mean of |shift|
+inline void noteBob(std::atomic<float>& a,float cm,float dt) noexcept {const float k=dt>0.f?1.f-std::exp(-dt/1.f):0.f;
+    a.store(a.load(std::memory_order_relaxed)+(std::fabs(cm)-a.load(std::memory_order_relaxed))*k,std::memory_order_relaxed);}
+struct Lever{bool on{true};float tau{.35f},maxM{.15f};};
+inline Lever lever(std::uint64_t now) noexcept {
+    static std::atomic<std::uint64_t> readNs{0};static std::atomic<int> on{1},tauMs{350},maxCm{15};
+    const auto last=readNs.load(std::memory_order_relaxed);
+    if(!last||now<last||now-last>1'000'000'000ull){readNs.store(now,std::memory_order_relaxed);char v[PROP_VALUE_MAX]{};
+        on.store(!(__system_property_get("debug.rdrvr.vr.riding.steady",v)>0&&v[0]=='0'),std::memory_order_relaxed);
+        tauMs.store(__system_property_get("debug.rdrvr.vr.riding.steadyms",v)>0?std::clamp(std::atoi(v),50,3000):350,std::memory_order_relaxed);
+        maxCm.store(__system_property_get("debug.rdrvr.vr.riding.steadycm",v)>0?std::clamp(std::atoi(v),0,40):15,std::memory_order_relaxed);}
+    // HORSE > HORSE SHAKE ON = the game's bounce (no ride steady)
+    return {on.load(std::memory_order_relaxed)!=0&&!::rdrvr::vr::settings().rideShake(),float(tauMs.load(std::memory_order_relaxed))*1e-3f,
+        float(maxCm.load(std::memory_order_relaxed))*.01f};
+}
+struct State{std::uintptr_t locals{};bool haveL0{};A::Mat34 writtenL0{};float baked{};bool have{};float y{},vy{};std::uint64_t ns{};
+    int bone{-1};std::uintptr_t boneSkel{};std::uint64_t boneNs{};int head{-1};std::uint64_t headNs{};};
+// One call: the new shift (m along up) for the shift-free reference height raw, Holt-smoothed; repeated calls within 2 ms keep the
+// filter (the post-physics + compose calls of one frame)
+inline float target(State& s,float raw,bool want,std::uint64_t now,const Lever& lv) noexcept {
+    if(!want||!lv.on||!std::isfinite(raw)){s.have=false;return 0.f;}
+    const bool fresh=!s.have||now<s.ns||now-s.ns>500'000'000ull;
+    if(fresh){s.y=raw;s.vy=0.f;s.ns=now;s.have=true;}
+    else if(now-s.ns>=2'000'000ull){const float dt=float(double(now-s.ns)*1e-9);s.ns=now;
+        const float ka=1.f-std::exp(-dt/lv.tau),kb=1.f-std::exp(-dt/(2.f*lv.tau));const float pr=s.y+s.vy*dt,level=pr+(raw-pr)*ka;
+        s.vy+=((level-s.y)/std::max(dt,1e-4f)-s.vy)*kb;s.y=level;}
+    // rider / horse / head shifts can sit at the clamp: an error past the clamp is a real height change (a
+    // mount, a dismount, a step) - the filter re-seeds there instead of holding the body off by the clamp for seconds
+    if(!std::isfinite(s.y)||!std::isfinite(s.vy)||std::fabs(s.y-raw)>lv.maxM){s.y=raw;s.vy=0.f;}
+    return std::clamp(s.y-raw,-lv.maxM,lv.maxM);
+}
+// Moves every global by (want - baked) along up and rewrites L0 = inverse(root) * g0; g (optional) = the caller's copy of the globals
+inline bool apply(State& s,float* globals,unsigned char* locals,const A::Mat34& root,int count,const A::Vec3& upv,float want,A::Mat34* g) noexcept {
+    const float d=want-s.baked;
+    if(std::fabs(d)<1e-5f||count<=0)return false;
+    const A::Vec3 dv=upv*d;
+    for(int i=0;i<count;++i){float* m=globals+std::size_t(i)*16;A::Mat34 x=A::LoadMat34(m);x.d=x.d+dv;A::StoreMat34(m,x);if(g)g[i]=x;}
+    float* l0p=reinterpret_cast<float*>(locals);const A::Mat34 g0=A::LoadMat34(globals);A::StoreMat34(l0p,A::InverseAffine(root)*g0);
+    s.baked=want;s.writtenL0=A::LoadMat34(l0p);s.haveL0=true;s.locals=reinterpret_cast<std::uintptr_t>(locals);return true;
+}
+// At entry: the shift still baked into this skeleton's L0 (else the engine rebuilt the pose: nothing baked)
+inline void entry(State& s,unsigned char* locals) noexcept {
+    const A::Mat34 l0=A::LoadMat34(reinterpret_cast<const float*>(locals));
+    if(!(s.haveL0&&s.locals==reinterpret_cast<std::uintptr_t>(locals)&&std::memcmp(&l0,&s.writtenL0,sizeof l0)==0)){s.baked=0.f;s.haveL0=false;}
+}
+inline State rider{},horse{},horseHead{};
+inline std::atomic<float> headShiftCm{0.f},headBobCm{0.f};
+// HORSE PARTS (VrRideSteadyLink.h, debug.rdrvr.vr.riding.horseparts 1):
+// the mount's 4 legs, neck and head as capsules along its skeleton CHAINS (VrHorseChains.h: the selection, from the current pose of a
+// STANDING horse), chosen ONCE per skeleton data (bone indices; retried every 0.5 s until it works). Per frame: the capsules from this
+// frame's globals (the drawn pose after the steady shifts / head smoothing), world, each carried by its upper joint's bone (bone id = the
+// engine index: a re-selection is a layout change for SpaceWarp); a segment longer than x1.5 its selected length drops the whole frame.
+struct HorseChains {std::uintptr_t data{};int count{};std::uint64_t retryNs{};::rdrvr::vr::horsechains::Chains c{};};
+inline HorseChains horseChains{}; // under horsePartsBusy
+inline std::atomic<bool> horsePartsBusy{false};
+inline std::atomic<const char*> horseChainState{"NOT_RUN"};
+inline std::atomic<std::uint64_t> horseSelects{0},horseSelectFails{0},horsePartFrames{0},horsePartDrops{0};
+inline std::atomic<unsigned> horseLegSegs{0},horseNeckSegs{0};
+inline bool selectHorseChains(std::uintptr_t data,int count,const float* globals,const A::Mat34& root,std::uint64_t now) noexcept {
+    namespace hcn=::rdrvr::vr::horsechains;auto& hc=horseChains;
+    if(hc.data==data&&hc.count==count&&(hc.c.ok||now<hc.retryNs))return hc.c.ok;
+    hc=HorseChains{};hc.data=data;hc.count=count;hc.retryNs=now+500'000'000ull;
+    static std::array<std::int32_t,hcn::maxBones> par{};std::uintptr_t parents{};
+    if(count<8||count>hcn::maxBones||!detail::get(data,off::dataParents,parents)||!parents||
+       !detail::block(parents,par.data(),sizeof(std::int32_t)*std::size_t(count)))hc.c.why="PARENTS";
+    else hc.c=hcn::select(par.data(),count,globals,root);
+    horseChainState.store(hc.c.why,std::memory_order_relaxed);
+    if(!hc.c.ok){horseSelectFails.fetch_add(1,std::memory_order_relaxed);return false;}
+    horseLegSegs.store(hc.c.legSegs,std::memory_order_relaxed);horseNeckSegs.store(hc.c.neckSegs,std::memory_order_relaxed);
+    horseSelects.fetch_add(1,std::memory_order_relaxed);return true;
+}
+inline void horseMotionParts(std::uintptr_t actor,std::uintptr_t data,const float* globals,int count,const A::Mat34& root,std::uint64_t now) noexcept {
+    namespace sl=::rdrvr::vr::steadylink;
+    if(!::rdrvr::vr::bodylink::horseProp.load(std::memory_order_relaxed)||!data)return;
+    bool f=false;if(!horsePartsBusy.compare_exchange_strong(f,true,std::memory_order_acquire))return;
+    struct Release{~Release(){horsePartsBusy.store(false,std::memory_order_release);}} release;
+    if(!selectHorseChains(data,count,globals,root,now))return;
+    const auto& hc=horseChains.c;static thread_local sl::HorseParts out{};out.ns=now;out.actor=actor;out.count=0; // ~1.2 KB: off the stack
+    for(unsigned k=0;k<hc.segs&&k<sl::maxHorseParts;++k){const auto& sg=hc.seg[k];
+        if(sg.a<0||sg.b<0||sg.a>=count||sg.b>=count){horsePartDrops.fetch_add(1,std::memory_order_relaxed);return;}
+        const A::Mat34 G=A::LoadMat34(globals+std::size_t(sg.a)*16);const A::Vec3 a=G.d;A::Vec3 b=A::LoadMat34(globals+std::size_t(sg.b)*16).d;
+        // bones do not stretch: longer than selected = a swapped / broken pose (a merged segment may fold shorter: a tucked hoof)
+        const float l=A::Length(b-a);if(!(l<1.5f*sg.len+.02f)||!A::Finite(G)||!A::Finite(b)){horsePartDrops.fetch_add(1,std::memory_order_relaxed);return;}
+        if(sg.extend>0.f&&l>.01f)b=b+(b-a)*(sg.extend/l);
+        auto& p=out.part[out.count++];p.a[0]=a.x;p.a[1]=a.y;p.a[2]=a.z;p.b[0]=b.x;p.b[1]=b.y;p.b[2]=b.z;p.radius=sg.radius;p.bone=sg.a;
+        const A::Vec3 rows[4]{G.a,G.b,G.c,G.d};for(int r=0;r<4;++r){p.m[r*3]=rows[r].x;p.m[r*3+1]=rows[r].y;p.m[r*3+2]=rows[r].z;}}
+    sl::publishParts(out);horsePartFrames.fetch_add(1,std::memory_order_relaxed);
+}
+// the mount's root height read at the CALLER's hook time (a published stamp races across hook threads, and a cross-thread
+// value lets John jitter against the saddle on a slope) - false when the mount is unknown or its root is > 1 m from John horizontally
+inline bool mountRootY(float rx,float rz,float& y) noexcept {
+    // guarded reads only (another actor: it may be gone - VrMotionActors validates it once per main tick, this runs on hook threads)
+    const auto actor=mountActor.load(std::memory_order_relaxed);if(!actor)return false;
+    std::uintptr_t ent{},inst{},cache{},skel{},rp{};float m[16]{};
+    if(!detail::get(actor,off::actorEntity,ent)||!ent||!detail::get(ent,off::entityInst,inst)||!inst||!detail::get(inst,off::instCache,cache)||!cache||
+       !detail::get(cache,off::cacheSkeleton,skel)||!skel||!detail::get(skel,off::skelRoot,rp)||!rp||!detail::block(rp,m,sizeof m))return false;
+    const A::Mat34 root=A::LoadMat34(m);if(!A::Finite(root))return false;
+    const float dx=root.d.x-rx,dz=root.d.z-rz;if(dx*dx+dz*dz>1.f)return false;
+    y=root.d.y;return true;
+}
+// The horse (attachHook, before the original): its own chain, no Published check
+inline void horseStep(std::uintptr_t actor,std::uint64_t now) noexcept {
+    using detail::raw;
+    const auto rn=riderNs.load(std::memory_order_relaxed);const Lever lv=lever(now);
+    const bool want=rn&&now>=rn&&now-rn<300'000'000ull;
+    const auto ent=raw<std::uintptr_t>(actor+off::actorEntity);
+    const auto inst=ent?raw<std::uintptr_t>(ent+off::entityInst):0;
+    const auto cache=inst?raw<std::uintptr_t>(inst+off::instCache):0;
+    const auto skel=cache?raw<std::uintptr_t>(cache+off::cacheSkeleton):0;
+    if(!skel){horseMismatch.fetch_add(1,std::memory_order_relaxed);return;}
+    const auto gp=raw<std::uintptr_t>(skel+off::skelGlobals),lp=raw<std::uintptr_t>(skel+off::skelLocals),rp=raw<std::uintptr_t>(skel+off::skelRoot);
+    const int count=int(raw<std::uint32_t>(skel+off::skelCount));
+    if(!gp||!lp||!rp||count<=0||count>400){horseMismatch.fetch_add(1,std::memory_order_relaxed);return;}
+    float* globals=reinterpret_cast<float*>(gp);unsigned char* locals=reinterpret_cast<unsigned char*>(lp);
+    const A::Mat34 root=A::LoadMat34(reinterpret_cast<const float*>(rp));if(!A::Finite(root))return;
+    auto& s=horse;entry(s,locals);
+    const A::Vec3 upv{0.f,1.f,0.f};
+    if(s.boneSkel!=skel||s.bone<0||s.bone>=count||now<s.boneNs||now-s.boneNs>2'000'000'000ull){ // the back bone under John
+        const float rx=riderX.load(std::memory_order_relaxed),rz=riderZ.load(std::memory_order_relaxed);int best=-1;float bd=.25f; // (0.5 m)^2
+        for(int i=0;i<count;++i){const float* m=globals+std::size_t(i)*16;const float dx=m[12]-rx,dz=m[14]-rz,h=m[13]-s.baked-root.d.y;
+            const float d2=dx*dx+dz*dz;if(h>.8f&&d2<bd&&std::isfinite(d2)){bd=d2;best=i;}}
+        s.bone=best;s.boneSkel=skel;s.boneNs=now;}
+    const auto data=raw<std::uintptr_t>(skel+off::skelData); // horse parts: the chain selection's key
+    if(s.bone<0){horseNoBone.fetch_add(1,std::memory_order_relaxed);apply(s,globals,locals,root,count,upv,0.f,nullptr);
+        horseMotionParts(actor,data,globals,count,root,now);return;}
+    const float rawY=globals[std::size_t(s.bone)*16+13]-s.baked-root.d.y; // above the horse root (hills)
+    const float t=target(s,rawY,want,now,lv);
+    apply(s,globals,locals,root,count,upv,t,nullptr);
+    // the neck nods on top of the back's bounce. The head = the bone farthest
+    // from John horizontally (> 0.5 m above the horse root); every bone ahead of John by > 0.4 m gets w * (smoothed - raw) of the head
+    // height, w ramping 0..1 to the head (the neck bends smoothly). Globals only, fresh each frame (the engine rebuilds them from locals).
+    {const float rx=riderX.load(std::memory_order_relaxed),rz=riderZ.load(std::memory_order_relaxed);
+        if(s.head<0||s.head>=count||s.boneNs!=s.headNs){int hb=-1;float hd=.8f; // AHEAD along the root's forward (-c), never the tail
+            float ax=-root.c.x,az=-root.c.z;const float al=std::sqrt(ax*ax+az*az);if(al>1e-3f){ax/=al;az/=al;}else{ax=0.f;az=1.f;}
+            for(int i=0;i<count;++i){const float* m=globals+std::size_t(i)*16;const float f=(m[12]-rx)*ax+(m[14]-rz)*az,h=m[13]-root.d.y;
+                if(h>.5f&&f>hd&&std::isfinite(f)){hd=f;hb=i;}}
+            s.head=hb;s.headNs=s.boneNs;}
+        if(s.head>=0){const float* hm=globals+std::size_t(s.head)*16;float fx=hm[12]-rx,fz=hm[14]-rz;const float fl=std::sqrt(fx*fx+fz*fz);
+            if(fl>.8f&&fl<4.f){fx/=fl;fz/=fl;
+                const Lever hl{lv.on,lv.tau,lv.maxM+.05f};const float e=target(horseHead,hm[13]-root.d.y,want,now,hl); // above the root
+                // HEAD POSE: the height shift above leaves the NOD (a rotation) in.
+                // Every bone ahead of John (the neck / head chain) keeps a low-passed copy of its whole pose in the horse ROOT frame (position +
+                // axes, tau .riding.headms 250 ms) and is drawn at w * smoothed + (1 - w) * live, w 0..1 along the neck - the head moves with
+                // the body, the gallop nod is gone. debug.rdrvr.vr.riding.headsteady 0 = the height-only shift.
+                static std::array<A::Mat34,400> relS{};static std::array<bool,400> haveS{};static std::uintptr_t sKey{};static std::uint64_t sNs{};
+                static int headOn{1},headMs{250};static std::uint64_t propNs{};
+                if(!propNs||now-propNs>1'000'000'000ull){propNs=now;char v[PROP_VALUE_MAX]{};
+                    headOn=!(__system_property_get("debug.rdrvr.vr.riding.headsteady",v)>0&&v[0]=='0');
+                    headMs=__system_property_get("debug.rdrvr.vr.riding.headms",v)>0?std::clamp(std::atoi(v),30,3000):250;}
+                const std::uintptr_t key=reinterpret_cast<std::uintptr_t>(globals);
+                // HORSE SHAKE ON (lv.on false) = the head's own nod back
+                // too; the cached poses are dropped while it is on (toggling OFF again must not resume from minutes-old poses)
+                const bool headLive=headOn&&lv.on;
+                if(key!=sKey||!want||!headLive||now<sNs||now-sNs>500'000'000ull){haveS.fill(false);sKey=key;}
+                const float hdt=sNs&&now>sNs?std::min(float(double(now-sNs)*1e-9),.1f):0.f;sNs=now;
+                const float k=headLive&&hdt>0.f?1.f-std::exp(-hdt/(float(headMs)*1e-3f)):1.f;
+                const A::Mat34 inv=A::InverseAffine(root);
+                const auto ortho=[](A::Mat34 m,const A::Mat34& ref){m.a=A::Normalize(m.a,ref.a);m.b=A::Normalize(m.b-m.a*A::Dot(m.a,m.b),ref.b);
+                    A::Vec3 c=A::Cross(m.a,m.b);if(A::Dot(c,ref.c)<0.f)c=-c;m.c=c*A::Length(ref.c);return m;};
+                for(int i=0;i<count&&i<400;++i){float* m=globals+std::size_t(i)*16;const float f=(m[12]-rx)*fx+(m[14]-rz)*fz;
+                    const float w=std::clamp((f-.4f)/(fl-.4f),0.f,1.f);if(w<=0.f){haveS[std::size_t(i)]=false;continue;}
+                    if(!headLive){m[13]+=w*e;continue;}
+                    const A::Mat34 g=A::LoadMat34(m),rel=inv*g;auto& r=relS[std::size_t(i)];
+                    if(!haveS[std::size_t(i)]){r=rel;haveS[std::size_t(i)]=true;}
+                    else{r.d=r.d+(rel.d-r.d)*k;r.a=r.a+(rel.a-r.a)*k;r.b=r.b+(rel.b-r.b)*k;r.c=r.c+(rel.c-r.c)*k;r=ortho(r,rel);}
+                    if(!A::Finite(r))r=rel; // one bad frame never poisons the rest of the ride
+                    A::Mat34 o=root*r;o.d=g.d+(o.d-g.d)*w;o.a=g.a+(o.a-g.a)*w;o.b=g.b+(o.b-g.b)*w;o.c=g.c+(o.c-g.c)*w;o=ortho(o,g);
+                    if(A::Finite(o))A::StoreMat34(m,o);}
+                headShiftCm.store(e*100.f,std::memory_order_relaxed);
+                {static std::uint64_t last{};const float dt=last&&now>last?std::min(float(double(now-last)*1e-9),.1f):0.f;last=now;noteBob(headBobCm,e*100.f,dt);}}}}
+    horseMotionParts(actor,data,globals,count,root,now); // after every write of this call (the drawn pose)
+    horseFrames.fetch_add(1,std::memory_order_relaxed);horseShiftCm.store(t*100.f,std::memory_order_relaxed);
+    {static std::uint64_t last{};const float dt=last&&now>last?std::min(float(double(now-last)*1e-9),.1f):0.f;last=now;noteBob(horseBobCm,t*100.f,dt);}
+}
+} // namespace steady
 inline ApplyResult applyBody(const Rig& r,float* globals,unsigned char* locals,const A::Mat34& root,int count,const Frame& f,bool frameOk,
-                             bool gateOpen,std::uint64_t now,std::uint64_t serial,const Config& c,bool mountedArm=false) noexcept {
+                             bool gateOpen,std::uint64_t now,std::uint64_t serial,const Config& c,bool mountedArm=false,int seatMode=0) noexcept {
     ApplyResult res{};
     const float dt=ik.lastNs&&now>ik.lastNs?std::min(float(double(now-ik.lastNs)/1e9),.1f):0.f;ik.lastNs=now;
     const bool write=!c.dry;
@@ -945,36 +1485,129 @@ inline ApplyResult applyBody(const Rig& r,float* globals,unsigned char* locals,c
                     stats.eyeAboveShoulderMean.store(ik.upShoulder,std::memory_order_relaxed);stats.eyeAboveNeckMean.store(ik.upNeck,std::memory_order_relaxed);}
             }}
     }
+    // ---- RIDE STEADY (steady:: above): John's skeleton follows the smoothed saddle height - before the seat hold ----
+    // John's ROOT is smooth on the saddle, his bounce is the riding animation's PELVIS: the reference
+    // is the pelvis joint height minus the shift baked into it (the root when the rig has no pelvis)
+    {namespace st=steady;const auto lv=st::lever(now);const bool riding=seatMode==2||mountedArm;
+        st::entry(st::rider,locals);
+        // the pelvis height ABOVE THE ROOT - a slope moves the root, the
+        // gait bounce the pelvis; filtering the world height would make a hill a ramp the filter chases (and re-seeds past the clamp)
+        // John's pelvis moves rigidly with HIS root, which rides the saddle, so when seated the height is measured above the HORSE's root
+        // (the frame the horse steady and the head pose use; a slope moves both
+        // roots), John's own root when no fresh horse root (on foot, a wagon)
+        // the horse base only when SEATED (seatMode 2); the climb (mountedArm, seatMode 1) keeps John's own root; the
+        // mount's root read now (st::mountRootY), raw .y for both heights; a short miss (<= 300 ms) keeps the last horse-vs-John offset (a base
+        // flip re-seeds the filter = a one-frame snap); the read only while the shift runs
+        static float lastOff{};static std::uint64_t lastOffNs{};float hy=0.f;bool useHorse=false;
+        if(seatMode==2&&riding&&write&&lv.on){
+            if(st::mountRootY(root.d.x,root.d.z,hy)){useHorse=true;lastOff=hy-root.d.y;lastOffNs=now;st::riderHorseBase.fetch_add(1,std::memory_order_relaxed);}
+            else if(lastOffNs&&now>=lastOffNs&&now-lastOffNs<300'000'000ull){useHorse=true;hy=root.d.y+lastOff;st::riderHeldBase.fetch_add(1,std::memory_order_relaxed);}
+            else st::riderOwnBase.fetch_add(1,std::memory_order_relaxed);}
+        const int pb=r.bones.pelvis;
+        const float refY=pb<0||pb>=count?0.f:useHorse?g[std::size_t(pb)].d.y-st::rider.baked*upv.y-hy:A::Dot(g[std::size_t(pb)].d,upv)-st::rider.baked-A::Dot(root.d,upv);
+        const float t=st::target(st::rider,refY,riding&&write,now,lv);st::noteBob(st::riderBobCm,t*100.f,dt);
+        if(st::apply(st::rider,globals,locals,root,count,upv,t,g.data()))res.wrote=true;
+        if(riding){st::riderNs.store(now,std::memory_order_relaxed);st::riderX.store(root.d.x,std::memory_order_relaxed);st::riderZ.store(root.d.z,std::memory_order_relaxed);
+            st::riderFrames.fetch_add(1,std::memory_order_relaxed);}
+        st::riderShiftCm.store(st::rider.baked*100.f,std::memory_order_relaxed);} // the shift in the skeleton now (0 once unwound)
+    // ---- SEAT: the upper body seated under the VR head (horse; ramp out after) - before the arms, which solve from its shoulders ----
+    if(seatStep(r,g.data(),globals,locals,root,count,f,frameOk,dt,now,seatMode,c))res.wrote=true;
     // ---- arms ----
     const Basis basis=bodyBasis(g.data(),r,f.up);
+    // RIDING: on a horse the arm memory (last target, drop-out hold, blend-out, source crossfade) lives in the RIDER frame (root
+    // translation + heading): a held / blending target rides along with the horse instead of staying behind in world (~20-30 cm per
+    // frame at a canter, the "yank"). On foot (and .body.mountrel 0): the world memory, no hold, no crossfade.
+    const bool riderRel=mountedArm&&c.mountRel;
+    const A::Mat34 rider=yawFrame(root,upv),riderInv=A::InverseOrtho(rider);
+    const std::uint64_t holdNs=std::uint64_t(double(c.mountHoldMs)*1e6);const float fadeS=c.mountFadeMs*.001f;
     HandBox box{};bool boxAny=false; // ARC: published below when an arm was solved
+    // LEFT hold: the engine holds every item in its RIGHT hand (the right arm's animation grips it, the left one's does not), so the
+    // left fingers get the right hand's animated pose mirrored (read before the right arm's own finger curl overwrites it).
+    std::array<A::Quat,A::kFingers*A::kJoints> leftPose{};std::uint16_t leftPoseMask=0;
+    if(frameOk&&c.fingers&&c.leftMirror&&r.fingerMirror&&((f.hold==0&&f.weapon)||(f.hold!=0&&f.phantomHand==0&&f.phantomWeapon))){
+        const auto& br=r.bones.arm[0];
+        for(int fi=0;fi<A::kFingers;++fi)for(int j=0;j<A::kJoints;++j){const int bone=br.finger[fi][j];if(bone<0||bone>=count)continue;
+            const A::Quat q=A::MirrorLocalX(A::ToQuat(A::Orthonormalize(A::LoadMat34(reinterpret_cast<const float*>(locals+std::size_t(bone)*off::localStride)).Rot())));
+            if(std::isfinite(q.x+q.y+q.z+q.w)){leftPose[std::size_t(fi*A::kJoints+j)]=q;leftPoseMask=std::uint16_t(leftPoseMask|(1u<<unsigned(fi*A::kJoints+j)));}}
+    }
     for(int side=0;side<2;++side){
         auto& mem=ik.arm[std::size_t(side)];auto& st=stats.arm[std::size_t(side)];
         const int vr=side==0?1:0; // VR hand of this engine side (VR 0 = left)
         ArmJob job{};job.side=side;job.write=write;bool have=false;
         const auto& b=r.bones.arm[std::size_t(side)];const auto& rig=r.arm[std::size_t(side)];
         const bool armOk=r.armOk[std::size_t(side)]&&c.arms;
-        const bool weaponArm=mountedArm&&f.hold==vr&&f.weapon; // RIDING: the gun arm only (the other hand keeps the reins)
+        // RIDING: the gun arm only (the other hand keeps the reins).
+        // with REINS on BOTH arms always follow their controllers (free hand / derived weapon / support exactly as on foot) and the game's rope
+        // comes to the holding hand(s) instead (ropeStep: rein+0x190 - the rope reads the rider's LIVE wrist_l / wrist_r after this hook).
+        // .reins.arm 0 = rein hands: the right hand on the reins next to the native left hand (10 cm to the rider's right, the controller's
+        // rotation), a left hand on the reins = native pose.
+        const bool reinsOn=mountedArm&&::rdrvr::vr::reins::armsFollow(now);
+        const bool reinsRight=!c.reinsArm&&reinsOn&&side==0&&::rdrvr::vr::reins::holds(1u)&&r.bones.arm[1].wrist>=0&&basis.valid;
+        const bool weaponArm=mountedArm&&((f.hold==vr&&f.weapon)||(c.reinsArm?reinsOn:(reinsRight||(reinsOn&&!::rdrvr::vr::reins::holds(unsigned(vr))))));
+        // the arm should be driven - a missing hand pose then holds instead of ramping out (a failed frame keeps last frame's wish)
+        const bool wanted=armOk&&(gateOpen||weaponArm||(riderRel&&!frameOk&&mem.wanted));mem.wanted=wanted;
+        unsigned source=SourceNone;
         if(armOk&&frameOk&&(gateOpen||weaponArm)){
             const auto& h=f.hand[std::size_t(vr)];
-            const bool holding=f.hold==vr&&f.weapon;
+            // what this hand holds: the engine item or the DUAL phantom (the same rules)
+            const bool engineHeld=f.hold==vr&&f.weapon,phantomHeld=!engineHeld&&f.phantomHand==vr&&f.phantomWeapon;
+            const bool holding=engineHeld||phantomHeld;
+            const bool placed=engineHeld?f.placed:phantomHeld&&f.phantomPlaced,alt=engineHeld?f.alt:f.phantomAlt;
+            const A::Mat34& attachment=engineHeld?f.attachment:f.phantomAttachment;
             if(weaponArm)bump(stats.mountedArmFrames);
-            if(holding&&f.placed&&c.derive&&b.attach>=0&&f.alt==(side==1)){ // the weapon's own attachment side = this arm
-                job.target=wristFromAttachment(f.attachment,g[std::size_t(b.wrist)],g[std::size_t(b.attach)]);
-                job.fingers=A::FingerMode::Native;have=true;bump(st.derived);
+            if(reinsRight&&!holding&&h.valid){
+                job.target=freeHandTarget(h,rig.hand,true,f.upm,c);job.target.d=g[std::size_t(r.bones.arm[1].wrist)].d+basis.right*(.10f*f.upm);
+                job.fingers=A::FingerMode::Free;job.grip=h.squeeze;job.trigger=h.trigger;have=true;bump(st.free);source=SourceFree;
+            }else if(holding&&placed&&c.derive&&b.attach>=0&&alt==(side==1)){ // the weapon's own attachment side = this arm
+                job.target=wristFromAttachment(attachment,g[std::size_t(b.wrist)],g[std::size_t(b.attach)]);
+                job.fingers=A::FingerMode::Native;have=true;bump(st.derived);source=SourceDerived;
             }else if(h.valid){
-                const A::Mat34 free=freeHandTarget(h,rig.hand,side==0,f.upm,c);
-                if(f.support==vr&&f.placed&&f.hold>=0&&f.hold!=vr){job.target=supportTarget(free,h,f);job.fingers=A::FingerMode::Support;bump(st.support);}
-                else{job.target=free;job.fingers=holding?A::FingerMode::Native:A::FingerMode::Free;bump(holding?st.nativeHold:st.free);}
+                if(f.support==vr&&f.placed&&f.hold>=0&&f.hold!=vr){job.target=supportTarget(h,rig.hand,side==0,f,c);job.fingers=A::FingerMode::Support;bump(st.support);source=SourceSupport;}
+                else{job.target=freeHandTarget(h,rig.hand,side==0,f.upm,c);job.fingers=holding?A::FingerMode::Native:A::FingerMode::Free;bump(holding?st.nativeHold:st.free);source=SourceFree;}
                 job.grip=h.squeeze;job.trigger=h.trigger;have=true;
-                if(holding&&f.placed&&!(b.attach>=0&&f.alt==(side==1)))bump(stats.weaponDerivedMismatch);
+                if(holding&&placed&&!(b.attach>=0&&alt==(side==1)))bump(stats.weaponDerivedMismatch);
             }else bump(st.noTarget);
+            // LEFT hold (derived firearm or a hand-held item): the left animation does not grip it - the right hand's grip mirrored,
+            // else a procedural grip (the index on the trigger of a firearm, curled round a knife / lasso / thrown item)
+            if(have&&holding&&side==1&&c.fingers){
+                const bool gun=engineHeld?f.firearm:f.phantomFirearm;
+                job.fingers=A::FingerMode::Grip;job.trigger=gun?(h.valid?h.trigger:0.f):1.f;
+                if(leftPoseMask){job.fingerPose=leftPose.data();job.fingerPoseMask=leftPoseMask;bump(st.holdMirror);}else bump(st.holdGrip);
+            }
         }
         const bool live=have; // ARC: solved to this frame's controller target (not the blend-out of the last one)
-        mem.weight=stepWeight(mem.weight,have,dt,c.rampS);st.weight.store(mem.weight,std::memory_order_relaxed);
-        if(have){mem.lastTarget=job.target;mem.lastFingers=job.fingers;mem.haveLast=true;}
-        else if(armOk&&mem.weight>0.f&&mem.haveLast){job.target=mem.lastTarget;job.fingers=mem.lastFingers;have=true;} // blend out from the last target
-        if(!armOk||mem.weight<=0.f||!have){if(mem.weight<=0.f)mem.haveLast=false;continue;}
+        bool held=false;
+        if(riderRel){
+            if(have){ // crossfade over mountFadeMs: a new target source (free / derived / support), or back from a hold / blend-out
+                      // of > 100 ms since the last live frame (a 1-2 frame drop-out at 36 Hz resumes directly: a fade there would only make
+                      // the hand lag the controller)
+                const bool switched=mem.liveSource!=SourceNone&&source!=mem.liveSource;
+                const bool resumed=mem.source==SourceHold&&now>=mem.liveNs&&now-mem.liveNs>100'000'000ull;
+                if(fadeS>0.f&&mem.haveRel&&(switched||resumed)){mem.fadeFrom=mem.lastRel;mem.fadeT=0.f;bump(st.mountFades);}
+                mem.source=source;
+                if(mem.fadeT<1.f){mem.fadeT=fadeS>0.f?std::min(1.f,mem.fadeT+dt/fadeS):1.f;const float t=mem.fadeT*mem.fadeT*(3.f-2.f*mem.fadeT);
+                    job.target=blendTarget(rider*mem.fadeFrom,job.target,t);bump(st.mountFadeFrames);}
+            }else{
+                if(wanted)bump(st.mountNone);
+                // hold: a missing hand pose (no frame / no controller sample / mapRay miss) keeps the weight and the rider-relative last
+                // target for mountHoldMs, only then the arm ramps out (still rider-relative)
+                if(wanted&&mem.haveLast&&mem.haveRel&&holdNs&&now>=mem.liveNs&&now-mem.liveNs<holdNs){
+                    job.target=rider*mem.lastRel;job.fingers=mem.lastFingers;job.grip=mem.lastGrip;job.trigger=mem.lastTrigger;held=true;bump(st.mountHold);}
+                else{if(mem.holding)bump(st.mountHoldExpired);if(armOk&&mem.weight>0.f&&mem.haveLast)bump(st.mountBlendOut);}
+                if(mem.haveLast)mem.source=SourceHold;
+            }
+            mem.holding=held;
+        }else{mem.fadeT=1.f;mem.holding=false;mem.source=have?source:SourceNone;} // on foot: no hold / crossfade (unchanged)
+        if(!held)mem.weight=stepWeight(mem.weight,have,dt,c.rampS);
+        st.weight.store(mem.weight,std::memory_order_relaxed);
+        if(have){mem.lastTarget=job.target;mem.lastRel=riderInv*job.target;mem.haveRel=true;mem.lastFingers=job.fingers;mem.lastGrip=job.grip;
+            mem.lastTrigger=job.trigger;mem.liveNs=now;mem.liveSource=source;mem.haveLast=true;}
+        else if(held)have=true;
+        else if(armOk&&mem.weight>0.f&&mem.haveLast){ // blend out from the last target (on a horse: rider-relative, with the last grip)
+            if(riderRel&&mem.haveRel){job.target=rider*mem.lastRel;job.grip=mem.lastGrip;job.trigger=mem.lastTrigger;}else job.target=mem.lastTarget;
+            job.fingers=mem.lastFingers;have=true;}
+        if(!armOk||mem.weight<=0.f||!have){
+            if(mem.weight<=0.f){mem.haveLast=mem.haveRel=mem.holding=false;mem.source=mem.liveSource=SourceNone;mem.fadeT=1.f;}continue;}
         job.weight=mem.weight;
         A::ArmPoseOutput out{};
         if(!solveArm(r,side,g.data(),globals,locals,job,mem,basis,c,out,ik.saved)){bump(st.poseFailed);continue;}
@@ -1005,10 +1638,16 @@ inline ApplyResult applyBody(const Rig& r,float* globals,unsigned char* locals,c
         if(out.fingersPosed)bump(st.fingers);
         st.lastTwistDeg.store(out.twist/A::kDegToRad,std::memory_order_relaxed);
         if(mem.weight>=1.f)maxOf(st.targetErrMmMax,A::Length(out.ik.hand.d-job.target.d)*1000.f/std::max(f.upm,1e-3f)-out.ik.clampedBy*1000.f/std::max(f.upm,1e-3f));
-        // The engine attaches a native-held item to its RIGHT attachment bone, so only the right VR
-        // hand may use the native hold; a left-hand item is placed by VrWeapon (HAND mode, left
-        // anatomy) and the left arm is derived from that placement.
+        // The engine attaches a native-held item to its RIGHT attachment bone, so only the right VR hand may use the native hold; a
+        // LEFT-hand item gets the IK'd left wrist_l_attachment global (just written) as its attachment in the weapon pose of this scope:
+        // it hangs in the left skeletal hand exactly like the right hand's native hold (the VrWeapon HAND placement onto the controller
+        // disagreed with the free-hand mapped skeletal hand by the anatomy roll + a few cm).
         if(frameOk&&f.hold==vr&&f.weapon&&!f.barrel&&side==0)res.nativeWeapon=f.weapon; // HAND-held item: native attachment to this (IK'd) hand
+        if(frameOk&&write&&side==1&&b.attach>=0&&b.attach<count){
+            const std::uintptr_t item=f.hold==vr&&f.weapon?(f.barrel?0:f.weapon):f.phantomHand==vr&&f.phantomWeapon&&!f.phantomBarrel?f.phantomWeapon:0;
+            const A::Mat34 at=A::LoadMat34(globals+std::size_t(b.attach)*16);
+            if(item&&A::Finite(at)){res.leftWeapon=item;res.leftAttachment=at;bump(st.itemAttach);}
+        }
     }
     if(boxAny){box.serial=serial;box.ns=now;box.referenceSpace=f.space;box.upm=f.upm;handBox.store(box);bump(handBoxPublished);}
     if(!write)bump(stats.dryFrames);
@@ -1021,6 +1660,7 @@ inline ApplyResult applyBody(const Rig& r,float* globals,unsigned char* locals,c
 // Hook B core: drift of the wrists the engine IK caused after hook A's write, re-assert the arm
 // subtree (locals + globals from the clavicle's current parent).
 inline void afterEngineIk(const Rig& r,float* globals,unsigned char* locals,const Config& c) noexcept {
+    seatAfterEngineIk(r,globals,locals,c); // SEAT: the held chain first (the arms re-assert from its shoulders)
     for(int side=0;side<2;++side){
         const auto& s=ik.saved;if(!s.valid[side])continue;
         auto& st=stats.arm[std::size_t(side)];
@@ -1058,42 +1698,99 @@ inline bool hookSkeleton(std::uintptr_t actor,const Published& p,float*& globals
     return A::Finite(root);
 }
 // Hook A body for the player (path 0 post-physics, 1 compose). Sets the hook scope; the caller runs the original and clears it.
-inline void beforeAttachments(std::uintptr_t actor) noexcept {
+// REIN ROPE (VrReinRope.h): after the arm IK of the post-physics hook A (under `busy`), the rein mode follows the VR hands that
+// hold the reins (only on a horse with REINS on and the arms following the controllers); anything else puts an overridden mode back.
+inline void ropeStep(std::uintptr_t actor,const Published& p,const float* globals,bool mountedArm,float upm,std::uint64_t now) noexcept {
+    namespace rr=::rdrvr::vr::reinrope;namespace rn=::rdrvr::vr::reins;
+    if(config.rope<=0||!rr::available.load(std::memory_order_acquire))return;
+    rr::Input in{};in.read=detail::api.read;in.base=detail::api.base;in.guid=detail::raw<std::uint32_t>(actor+off::actorGuid);in.skel=p.skel;
+    in.globals=globals;in.bones=p.count;in.upm=upm;in.now=now;in.freeNone=config.ropeFree;
+    // a rein hand counts only while its arm is IK'd to the controller (BODY arms on, rig arm OK, weight > .5 after this
+    // frame's applyBody): a wrist left in the native pose (.body.arms 0 / no rig arm / a drop-out past the hold + ramp) is not where the VR
+    // hand is - the rope must not go there. Engine side 1 = VR left (bit 0), side 0 = VR right (bit 1).
+    const auto driven=[&](int side){return config.arms&&p.rig&&p.rig->armOk[std::size_t(side)]&&ik.arm[std::size_t(side)].weight>.5f;};
+    const unsigned drivenMask=(driven(1)?1u:0u)|(driven(0)?2u:0u);
+    in.heldRaw=(rn::holds(0u)?1u:0u)|(rn::holds(1u)?2u:0u);in.held=in.heldRaw&drivenMask;
+    in.want=mountedArm&&config.reinsArm&&!config.dry&&rn::armsFollow(now)&&drivenMask!=0u;
+    rr::rope.step(in);
+}
+// this frame's LOCAL -> world map (VrMotionBodyLink.h: the one the arms were just placed with) and - with debug.rdrvr.mvbody 1 -
+// John's AppSW parts in world: the pose applyBody just wrote (head lock, seat, ride steady, IK'd arms); <10 parts = the map only.
+inline void publishMotionParts(const Rig& r,const float* globals,int count,const A::Mat34& root,const Frame& f,std::uint64_t serial,std::uint64_t now) noexcept {
+    namespace bl=::rdrvr::vr::bodylink;namespace sw=::rdrvr::runtime::spacewarp;
+    if(!f.mapValid){bump(bl::noMap);return;}
+    static thread_local bl::Record rec{}; // ~1.4 KB: never on a hook thread's stack
+    static thread_local std::array<std::array<float,12>,sw::KeyCount> km{};
+    rec.ns=now;rec.serial=serial;rec.third=::rdrvr::vr::steadylink::thirdActive(now);rec.parts.count=0;
+    const A::Vec3 rows[4]{f.localToWorld.a,f.localToWorld.b,f.localToWorld.c,f.localToWorld.d};
+    for(int k=0;k<4;++k){rec.map[k*3]=rows[k].x;rec.map[k*3+1]=rows[k].y;rec.map[k*3+2]=rows[k].z;}
+    if(bl::bodyProp.load(std::memory_order_relaxed)){
+        auto& b=rec.parts;
+        if(r.mvKeys.humanoid()){
+            std::array<const float*,sw::KeyCount> mp{};std::array<std::int16_t,sw::KeyCount> bi{};bi.fill(-1);
+            for(unsigned k=0;k<sw::KeyCount;++k){const int bone=r.mvKeys.index[k];if(bone<0||bone>=count)continue;const float* g=globals+std::size_t(bone)*16;
+                for(int row=0;row<4;++row)for(int col=0;col<3;++col)km[k][std::size_t(row*3+col)]=g[row*4+col]; // w lanes are padding
+                mp[k]=km[k].data();bi[k]=std::int16_t(bone);}
+            const float rootPos[3]{root.d.x,root.d.y,root.d.z};
+            sw::makeParts(mp,bi,rootPos,f.upm,b);
+            unsigned w=0; // first person: the head is collapsed around the eyes (no head pixels; its capsule would hold the camera)
+            for(unsigned k=0;k<b.count;++k){if(b.part[k].spec==0&&!rec.third)continue;if(w!=k)b.part[w]=b.part[k];++w;}
+            b.count=w>=10?w:0u;b.guid=sw::playerBodyGuid;b.layout=sw::playerBodyLayout;}
+        if(!b.count)bump(bl::noParts);
+        bl::lastParts.store(b.count,std::memory_order_relaxed);}
+    bl::publish(rec);
+}
+inline void beforeAttachments(std::uintptr_t actor,bool postPhys=true) noexcept {
     const auto t0=detail::now();
     bump(stats.playerCalls);noteThread();
     Published p{};
     if(!published.load(p)||p.actor!=actor||!p.rig||p.rig->generation!=p.generation||p.rig->data!=p.data)return;
-    if(!(::rdrvr::vr::settings().body()||ik.arm[0].weight>0.f||ik.arm[1].weight>0.f||ik.yawWeight>0.f||ik.acc!=0.f))return;
+    const bool bodyOn=::rdrvr::vr::settings().body()||ik.arm[0].weight>0.f||ik.arm[1].weight>0.f||ik.yawWeight>0.f||ik.acc!=0.f||
+        ::rdrvr::vr::seat::state.weight>0.f; // SEAT: BODY off ramps the seat hold out too
+    if(!bodyOn&&!(postPhys&&::rdrvr::vr::reinrope::overriding()))return; // BODY off still puts an overridden rope mode back
     if(busy.exchange(true,std::memory_order_acquire)){bump(stats.busy);return;}
     struct Release{~Release(){busy.store(false,std::memory_order_release);}} release;
     float* globals{};unsigned char* locals{};A::Mat34 root{};
     if(!hookSkeleton(actor,p,globals,locals,root)){bump(stats.skelMismatch);return;}
+    if(!bodyOn){ropeStep(actor,p,globals,false,1.f,t0);return;}
     bool gateOpen=p.armsWanted&&(t0<p.ns||t0-p.ns<300'000'000ull); // a gate older than 300 ms counts as closed
     if(gateOpen&&(detail::raw<std::uint8_t>(actor+off::actorRagdoll)&3u)){gateOpen=false;bump(stats.ragdollByte);}
     const std::uint64_t serial=serialCounter.fetch_add(1,std::memory_order_relaxed);
-    scope.serial=serial;scope.nativeWeapon=0;
+    scope.serial=serial;scope.nativeWeapon=0;scope.leftWeapon=0;
     Frame f{};bool frameOk=false;
-    const bool mountedArm=!gateOpen&&p.mountedArm&&(t0<p.ns||t0-p.ns<300'000'000ull)&&!(detail::raw<std::uint8_t>(actor+off::actorRagdoll)&3u);
-    if(gateOpen||mountedArm){const auto fn=frameFn.load(std::memory_order_acquire);
+    const bool fresh=t0<p.ns||t0-p.ns<300'000'000ull,ragdoll=(detail::raw<std::uint8_t>(actor+off::actorRagdoll)&3u)!=0;
+    const bool mountedArm=!gateOpen&&p.mountedArm&&fresh&&!ragdoll;
+    // SEAT: 2 = hold (horse, after the mount animation), 1 = ramp out (dismount / gate change / BODY off), 0 = cut at once (stale gate,
+    // ragdoll byte, cutscene, dead, no skeleton: the native pose, nothing written)
+    const int seatMode=!fresh||ragdoll||p.seatCut?0:p.seat&&::rdrvr::vr::settings().body()?2:1;
+    const bool seatRun=seatMode==2||(seatMode==1&&::rdrvr::vr::seat::state.weight>0.f);
+    if(gateOpen||mountedArm||seatRun){const auto fn=frameFn.load(std::memory_order_acquire);
         try{frameOk=fn&&fn(f,actor,serial,t0)&&f.valid;}catch(...){frameOk=false;}
         if(frameOk)bump(stats.frameOk);else{bump(stats.frameFail);stats.frameWhy.store(f.why?f.why:"",std::memory_order_relaxed);}}
     { // The head lock only under the BODY camera (HEAD camera = the head bone itself: a lock would chase its own view)
         using namespace ::rdrvr::vr;const auto s=settings();
         f.cameraBody=s.bodyCamera()&&enabled(Feature::Camera);f.eyeUp=s.bodyEyeUpMeters();f.eyeBack=s.bodyBackMeters();}
-    const auto res=applyBody(*p.rig,globals,locals,root,int(p.count),f,frameOk,gateOpen,t0,serial,config,mountedArm);
-    scope.nativeWeapon=res.nativeWeapon;
+    const auto res=applyBody(*p.rig,globals,locals,root,int(p.count),f,frameOk,gateOpen,t0,serial,config,mountedArm,seatMode);
+    scope.nativeWeapon=res.nativeWeapon;scope.leftWeapon=res.leftWeapon;scope.leftAttachment=res.leftAttachment;
+    if(frameOk&&::rdrvr::vr::bodylink::wanted())publishMotionParts(*p.rig,globals,int(p.count),root,f,serial,t0); // AppSW
     ik.saved.skel=p.skel;
+    // the rope after this frame's IK (its wrists = the next check); only the post-physics path (the compose callback runs elsewhere)
+    if(postPhys)ropeStep(actor,p,globals,mountedArm,frameOk?f.upm:1.f,t0);
     detail::addTime(stats.aNsSum,stats.aCount,stats.aUsMax,detail::now()-t0);
 }
 RDRVR_BODY_NOINLINE inline std::uint64_t attachHook(void* actor,const void* message) noexcept {
     const auto original=detail::attachOriginal;
     const auto a=reinterpret_cast<std::uintptr_t>(actor);
+    if(a&&a==steady::mountActor.load(std::memory_order_relaxed)&&a!=hookActor.load(std::memory_order_relaxed)){ // RIDE STEADY: the horse
+        const auto c=RDRVR_BODY_CALLER();const auto base=detail::api.base;
+        if(c==base+attachReturnPostPhysOffset||c==base+attachReturnComposeOffset){try{steady::horseStep(a,detail::now());}catch(...){bump(stats.exceptions);}}
+        return original(actor,message);}
     if(!a||a!=hookActor.load(std::memory_order_relaxed))return original(actor,message);
     const auto caller=RDRVR_BODY_CALLER();const auto base=detail::api.base;
     if(caller==base+attachReturnPostPhysOffset)bump(stats.callsPostPhys);
     else if(caller==base+attachReturnComposeOffset)bump(stats.callsCompose);
     else{bump(stats.callsOtherLR);return original(actor,message);}
-    try{beforeAttachments(a);}catch(...){bump(stats.exceptions);}
+    try{beforeAttachments(a,caller==base+attachReturnPostPhysOffset);}catch(...){bump(stats.exceptions);}
     const auto result=original(actor,message);
     lastAttachSerial=scope.serial;scope=Scope{};
     return result;
@@ -1107,7 +1804,7 @@ RDRVR_BODY_NOINLINE inline std::uint64_t ikHook(void* actor,const void* message)
     if(caller!=base+ikReturnPostPhysOffset&&caller!=base+ikReturnComposeOffset){bump(stats.ikOtherLR);return result;}
     bump(stats.ikCalls);
     const auto serial=lastAttachSerial;lastAttachSerial=0;
-    if(!serial||ik.saved.serial!=serial||(!ik.saved.valid[0]&&!ik.saved.valid[1]))return result;
+    if(!serial||ik.saved.serial!=serial||(!ik.saved.valid[0]&&!ik.saved.valid[1]&&!ik.saved.seat.valid))return result;
     const auto t0=detail::now();
     if(busy.exchange(true,std::memory_order_acquire)){bump(stats.busy);return result;}
     struct Release{~Release(){busy.store(false,std::memory_order_release);}} release;
@@ -1279,6 +1976,9 @@ inline bool install(EngineApi api,Code&& code,Got&& got,Replace&& replace) noexc
     if(!put(broadcastIkGotOffset,broadcastIkOffset,hB)){back(matrixSetUpdateGotOffset,matrixSetUpdateOffset,hC);return fail("HOOK B NOT INSTALLED");}
     if(!put(broadcastAttachGotOffset,broadcastAttachOffset,hA)){back(broadcastIkGotOffset,broadcastIkOffset,hB);
         back(matrixSetUpdateGotOffset,matrixSetUpdateOffset,hC);return fail("HOOK A NOT INSTALLED");}
+    // REIN ROPE: variant-1 words (sm_Instance GLOB_DAT, the sagVerletRein vtable typeinfo + two slots); a mismatch (variant 2 or
+    // any other engine) = UNAVAILABLE: the rope is never read or written, the arms work as without it
+    ::rdrvr::vr::reinrope::verifyEngine(config.rope,[&](std::uintptr_t slot,std::uintptr_t target){bool ok=false;try{ok=got(slot,target);}catch(...){ok=false;}return ok;});
     installed.store(true,std::memory_order_release);
     installState.store(config.dry?"INSTALLED DRY":"INSTALLED");
     publishStatus(GateOk);
@@ -1333,18 +2033,26 @@ inline std::string report() {
         std::snprintf(b,sizeof b,"%s{\"side\":\"%s\",\"weight\":%.2f,\"applied\":%llu,\"targets\":{\"derived\":%llu,\"support\":%llu,\"free\":%llu,\"nativeHold\":%llu,"
             "\"none\":%llu},\"clamped\":%llu,\"clampCmMax\":%.1f,\"lastClampCm\":%.1f,\"stretched\":%llu,\"stretchCmMax\":%.1f,\"clavicle\":%llu,\"clavicleDegMax\":%.1f,"
             "\"targetErrMmMax\":%.2f,\"twistDeg\":%.1f,\"fingers\":%llu,\"poseFailed\":%llu,\"drift\":{\"frames\":%llu,\"over1cm\":%llu,\"cmMax\":%.2f,\"degMax\":%.1f,"
-            "\"lastCm\":%.2f,\"reasserted\":%llu}}",s?",":"",s?"LEFT":"RIGHT",double(a.weight.load()),(unsigned long long)a.applied.load(),
+            "\"lastCm\":%.2f,\"reasserted\":%llu},\"hold\":{\"mirror\":%llu,\"grip\":%llu,\"itemAttach\":%llu},"
+            "\"mounted\":{\"none\":%llu,\"hold\":%llu,\"holdExpired\":%llu,\"blendOut\":%llu,\"fades\":%llu,\"fadeFrames\":%llu}}",s?",":"",s?"LEFT":"RIGHT",
+            double(a.weight.load()),(unsigned long long)a.applied.load(),
             (unsigned long long)a.derived.load(),(unsigned long long)a.support.load(),(unsigned long long)a.free.load(),(unsigned long long)a.nativeHold.load(),
             (unsigned long long)a.noTarget.load(),(unsigned long long)a.clamped.load(),double(a.clampCmMax.load()),double(a.lastClampCm.load()),
             (unsigned long long)a.stretched.load(),double(a.stretchCmMax.load()),(unsigned long long)a.clavicle.load(),double(a.clavicleDegMax.load()),
             double(a.targetErrMmMax.load()),double(a.lastTwistDeg.load()),(unsigned long long)a.fingers.load(),(unsigned long long)a.poseFailed.load(),
             (unsigned long long)a.driftFrames.load(),(unsigned long long)a.driftOver1cm.load(),double(a.driftCmMax.load()),double(a.driftDegMax.load()),
-            double(a.lastDriftCm.load()),(unsigned long long)a.reasserted.load());out+=b;}
-    std::snprintf(b,sizeof b,"],\"weapon\":{\"derivedSideMismatch\":%llu},\"engineIk\":{\"calls\":%llu,\"otherLR\":%llu},"
+            double(a.lastDriftCm.load()),(unsigned long long)a.reasserted.load(),(unsigned long long)a.holdMirror.load(),
+            (unsigned long long)a.holdGrip.load(),(unsigned long long)a.itemAttach.load(),(unsigned long long)a.mountNone.load(),
+            (unsigned long long)a.mountHold.load(),(unsigned long long)a.mountHoldExpired.load(),(unsigned long long)a.mountBlendOut.load(),
+            (unsigned long long)a.mountFades.load(),(unsigned long long)a.mountFadeFrames.load());out+=b;}
+    std::snprintf(b,sizeof b,"],\"weapon\":{\"derivedSideMismatch\":%llu,\"fingerMirror\":%s,\"leftMirror\":%s,\"support\":[%.0f,%.0f,%.1f]},"
+        "\"engineIk\":{\"calls\":%llu,\"otherLR\":%llu},"
         "\"yaw\":{\"applied\":%llu,\"undo\":%llu,\"sticky\":%llu,\"weight\":%.2f,\"lastDeg\":%.1f,\"maxDeg\":%.1f},"
         "\"head\":{\"calls\":%llu,\"applied\":%llu,\"otherLR\":%llu,\"contended\":%llu,\"skipped\":%llu,\"collapsing\":%s},"
         "\"eyeVsHead\":{\"samples\":%llu,\"cm\":%.1f,\"cmMax\":%.1f,\"fwdCm\":%.1f,\"upCm\":%.1f,\"rightCm\":%.1f},",
-        (unsigned long long)stats.weaponDerivedMismatch.load(),(unsigned long long)stats.ikCalls.load(),(unsigned long long)stats.ikOtherLR.load(),
+        (unsigned long long)stats.weaponDerivedMismatch.load(),r&&r->fingerMirror?"true":"false",c.leftMirror?"true":"false",
+        double(c.supportTiltDeg),double(c.supportYawDeg),double(c.supportDropM*100.f),
+        (unsigned long long)stats.ikCalls.load(),(unsigned long long)stats.ikOtherLR.load(),
         (unsigned long long)stats.yawApplied.load(),(unsigned long long)stats.yawUndo.load(),(unsigned long long)stats.yawSticky.load(),double(stats.yawWeight.load()),
         double(stats.yawLastDeg.load()),double(stats.yawMaxDeg.load()),(unsigned long long)stats.headCalls.load(),(unsigned long long)stats.headApplied.load(),
         (unsigned long long)stats.headOtherLR.load(),(unsigned long long)stats.headContended.load(),(unsigned long long)stats.headSkipped.load(),
@@ -1398,6 +2106,22 @@ inline std::string report() {
             double(stats.headVsBodyDeg.load()),double(stats.headVsBodyDegMax.load()),double(c.lockKnee),(unsigned long long)stats.warpSnaps.load(),
             (unsigned long long)stats.warpSnapFrames.load(),(unsigned long long)stats.warpSnapTimeouts.load());out+=b;
     }
+    // RIDING: the mounted arm config + the rein rope (VrReinRope.h)
+    std::snprintf(b,sizeof b,"\"riding\":{\"reinsArm\":%s,\"mountRel\":%s,\"mountHoldMs\":%.0f,\"mountFadeMs\":%.0f,\"ropeFree\":%s,\"rope\":",
+        c.reinsArm?"true":"false",c.mountRel?"true":"false",double(c.mountHoldMs),double(c.mountFadeMs),c.ropeFree?"true":"false");out+=b;out+=::rdrvr::vr::reinrope::report();out+="},";
+    out+="\"seat\":";out+=::rdrvr::vr::seat::report(r?&r->seat:nullptr);out+=","; // SEAT (VrSeat.h)
+    {char sb[768];std::snprintf(sb,sizeof sb,"\"steady\":{\"riderBase\":[%llu,%llu,%llu],\"partsPub\":%llu,\"partsUsed\":%llu,\"partsStale\":%llu,\"partsBusy\":%llu,\"rider\":%llu,\"horse\":%llu,\"noBone\":%llu,\"mismatch\":%llu,\"riderCm\":%.1f,\"horseCm\":%.1f,\"riderBobCm\":%.1f,\"horseBobCm\":%.1f,\"headCm\":%.1f,\"headBobCm\":%.1f,\"mount\":%s},",
+        (unsigned long long)steady::riderHorseBase.load(),(unsigned long long)steady::riderHeldBase.load(),(unsigned long long)steady::riderOwnBase.load(),
+        (unsigned long long)::rdrvr::vr::steadylink::partsPublished.load(),(unsigned long long)::rdrvr::vr::steadylink::partsUsed.load(),
+        (unsigned long long)::rdrvr::vr::steadylink::partsStale.load(),(unsigned long long)::rdrvr::vr::steadylink::partsBusy.load(),(unsigned long long)steady::riderFrames.load(),(unsigned long long)steady::horseFrames.load(),(unsigned long long)steady::horseNoBone.load(),
+        (unsigned long long)steady::horseMismatch.load(),steady::riderShiftCm.load(),steady::horseShiftCm.load(),steady::riderBobCm.load(),steady::horseBobCm.load(),steady::headShiftCm.load(),steady::headBobCm.load(),steady::mountActor.load()?"true":"false");out+=sb;}
+    {namespace bl=::rdrvr::vr::bodylink;char sb[640]; // hook A side of the AppSW player body / rig map / horse chains (VrMotionBodyLink.h)
+     std::snprintf(sb,sizeof sb,"\"mvParts\":{\"body\":%d,\"horse\":%d,\"keys\":%s,\"published\":%llu,\"busy\":%llu,\"noMap\":%llu,\"noParts\":%llu,\"lastParts\":%u,"
+        "\"horseChains\":\"%s\",\"horseSelects\":%llu,\"horseSelectFails\":%llu,\"horseLegSegs\":%u,\"horseNeckSegs\":%u,\"horseFrames\":%llu,\"horseDrops\":%llu},",
+        bl::bodyProp.load(),bl::horseProp.load(),r&&r->mvKeys.humanoid()?"true":"false",(unsigned long long)bl::published.load(),(unsigned long long)bl::busy.load(),
+        (unsigned long long)bl::noMap.load(),(unsigned long long)bl::noParts.load(),bl::lastParts.load(),steady::horseChainState.load(),
+        (unsigned long long)steady::horseSelects.load(),(unsigned long long)steady::horseSelectFails.load(),steady::horseLegSegs.load(),steady::horseNeckSegs.load(),
+        (unsigned long long)steady::horsePartFrames.load(),(unsigned long long)steady::horsePartDrops.load());out+=sb;}
     const auto avg=[](const Counter& s,const Counter& n){const auto k=n.load();return k?double(s.load())/double(k)/1000.0:0.0;};
     std::snprintf(b,sizeof b,"\"timing\":{\"aUsAvg\":%.1f,\"aUsMax\":%.1f,\"bUsAvg\":%.1f,\"bUsMax\":%.1f,\"cUsAvg\":%.1f,\"cUsMax\":%.1f,\"tickUsAvg\":%.1f,"
         "\"tickUsMax\":%.1f},\"exceptions\":%llu}",avg(stats.aNsSum,stats.aCount),double(stats.aUsMax.load()),avg(stats.bNsSum,stats.bCount),

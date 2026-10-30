@@ -135,7 +135,7 @@ private:
   event(5,key,unsigned(kind));
   if(!key||failed_){failure(5);publish();return t;}
   // Native cloth reads and OptimiseVertexBuffersD11 writes can overlap on
-  // different threads (guest41: callers 1f07334 / 1b15e58). Each non-delegated
+  // different threads (callers 1f07334 / 1b15e58). Each non-delegated
   // Lock owns a separate token until its Unlock; duplicate keys are not a
   // permanent accounting failure. In-flight entries deny ALL observations;
   // mapped entries deny their selected pair until EVERY matching map ends.

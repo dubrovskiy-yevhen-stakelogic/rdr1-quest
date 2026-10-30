@@ -72,6 +72,11 @@
 // clipped at the near plane (actors wholly behind the eye are skipped). Mode debug.rdrvr.mvbones (main thread, VrMotionBones.h) travels
 // with the ActorSet. Report: spaceWarp.gpu.actors.{skipBehind,clipped,stillPinned,bones{...}}; dump JSON: per block "bones",
 // the eye's "part" list (blocks with parts first, shape.w = rank), per actor snapshot "bones".
+// Player body (prepareActorPair, vr/VrMotionBodyLink.h): debug.rdrvr.mvbody=<0|1> John's own skeleton parts as the player BODY block (race -3,
+// parts only) [default 0 = off]; debug.rdrvr.vr.riding.horseparts=<0|1> the ridden horse's leg / neck / head parts [default 0 = off]. Both
+// ride the RIG: the snapshot is re-placed on the drawn frame's camera rig (ActorSet::rig). Re-read at 1 Hz by the mvactors tick. Report:
+// spaceWarp.gpu.actors.{body{pairs,stillPairs,skip*},rigFix{pairs,refused,cmAvg,cmMax,degMax},mountParts{pairs,dropped}}, vr.mvactors.mvBody,
+// vr.body.mvParts.
 #include "StereoTargets.h"
 #include "SpaceWarpMath.h"
 #include "SpaceWarpActors.h" // Per-actor motion
@@ -98,6 +103,8 @@ struct SpaceWarpFrame {
     float projectionY{};                                // eye projection m[5]: > 0 = engine NDC y up
     bool valid{};
     spacewarp::ActorSet actors{};                       // Newest main-thread actor matrices at record time
+    std::array<spacewarp::SpaceWarpHand,2> hands{};     // The VR hands / held weapon (engine world grip poses at record time)
+    bool riding{};                                      // The player rides (vr::reins::ridingFresh): the mount moves with the camera rig
 };
 // StereoCaptureSlot -> StereoMailbox::capture: per-eye depth written by commands queued before the
 // capture on the same queue, in `layout`.
@@ -194,6 +201,7 @@ public:
     std::uint64_t lastSubmittedFrame{}; // XR thread only: renderFrameId of the last pair submitted with space-warp info
     std::atomic<std::uint64_t> compensatedResubmits{}; // Re-submits shown with locomotion-compensated poses (skip policy 3)
     std::atomic<int> mvPlayer{1}; // debug.rdrvr.mvplayer (default 1): synthetic actor block for the player's own body
+    std::atomic<int> mvRig{1};    // debug.rdrvr.mvrig (default 1): the ridden horse moves with the rig, VR hands / held weapon = player parts
     std::string report() const;
 private:
     std::atomic<unsigned> menu_{};std::atomic<int> property_{-1};
@@ -382,7 +390,14 @@ private:
     VkQueryPool queries_{};double tsPeriod_{};std::uint64_t tsMask_{};bool queriesTried_{};
     // Per-actor motion: one uniform buffer, slot m / eye e at m*gpuSlotStride + e*gpuEyeStride (vkCmdUpdateBuffer in produce).
     VkBuffer actorBuffer_{};VkDeviceMemory actorMemory_{};
-    std::uint64_t playerBlocks_{}; // Synthetic player actors inserted (per eye)
+    std::uint64_t playerBlocks_{}; // Synthetic player actors inserted (per pair)
+    std::uint64_t mountPairs_{},handPairs_{},rigSameSerial_{}; // Pairs with the ridden horse on the rig / with hand parts / rig blocks without a main tick
+    // Player BODY parts (debug.rdrvr.mvbody) and the RIG re-placement of the snapshot (ActorSet::rig, prepareActorPair): pairs with the
+    // body block, of those without the body's own animation step (same snapshot / >= 2 ticks), skipped [no rig map, no previous body,
+    // layout change, rig re-placement refused]; re-placed snapshots (the eye's move, cm / the largest turn); mount parts re-placed / dropped
+    std::uint64_t bodyPairs_{},bodyStillPairs_{};std::array<std::uint64_t,4> bodySkip_{};
+    std::uint64_t rigFixPairs_{},rigFixRefused_{},mountPartPairs_{},mountPartNoRig_{};double rigFixCmSum_{};float rigFixCmMax_{},rigFixDegMax_{};
+    std::array<spacewarp::ActorSet,2> pairSets_{}; // This pair's actor sets (cur, prev) with the rig actors (prepareActorPair)
     std::uint64_t actorPairs_{},actorsWritten_{},actorSameSerial_{},actorSkipUnmatched_{},actorSkipJump_{},actorSkipStill_{},actorSkipOffscreen_{},
         actorSkipMath_{},actorPairsOff_{};
     unsigned actorsMaxEye_{},actorsLastEye_[2]{};float actorMaxStepM_{};
@@ -398,6 +413,7 @@ private:
     void createActorBuffer();
     // spacewarp::buildActorBlock (SpaceWarpActors.h, host-tested) + the counters; trace (dump) optional.
     unsigned buildActors(const SpaceWarpFrame& cur,const SpaceWarpFrame& prev,unsigned eye,spacewarp::GpuActors& out,spacewarp::ActorTrace* trace=nullptr) noexcept;
+    void prepareActorPair(const SpaceWarpFrame& cur,const SpaceWarpFrame& prev) noexcept; // once per pair, after boneSets_ are loaded
     // AppSW dump (see the header comment). Every member under the mailbox mutex; GPU objects made on the first dump only.
     struct DumpEntry {std::string name;VkFormat format{};Extent extent{};bool depth{};VkDeviceSize offset{},bytes{};bool recorded{};};
     struct Dump {
@@ -517,6 +533,7 @@ inline void SpaceWarpControl::configure(unsigned menuMode,std::uint64_t now) noe
         deltaMode_.store(std::clamp(swdetail::intProperty("debug.rdrvr.spacewarp.delta",1),0,2),std::memory_order_relaxed);
         skip_.store(std::clamp(swdetail::intProperty("debug.rdrvr.spacewarp.skip",1),0,3),std::memory_order_relaxed);
         mvPlayer.store(swdetail::intProperty("debug.rdrvr.mvplayer",1)!=0?1:0,std::memory_order_relaxed);
+        mvRig.store(swdetail::intProperty("debug.rdrvr.mvrig",1)!=0?1:0,std::memory_order_relaxed);
         guardEnabled_.store(swdetail::intProperty("debug.rdrvr.spacewarp.guard",0)!=0?1:0,std::memory_order_relaxed);
         cutCm_.store(std::clamp(swdetail::intProperty("debug.rdrvr.spacewarp.cutcm",50),1,100000),std::memory_order_relaxed);
         cutDeg_.store(std::clamp(swdetail::intProperty("debug.rdrvr.spacewarp.cutdeg",5),1,180),std::memory_order_relaxed);
@@ -719,29 +736,141 @@ inline void SpaceWarp::createActorBuffer() {
     if(vkBindBufferMemory(device_,actorBuffer_,actorMemory_,0)!=VK_SUCCESS){vkDestroyBuffer(device_,actorBuffer_,nullptr);vkFreeMemory(device_,actorMemory_,nullptr);
         actorBuffer_={};actorMemory_={};throw std::runtime_error("spacewarp actor buffer bind");}
 }
-inline unsigned SpaceWarp::buildActors(const SpaceWarpFrame& cur,const SpaceWarpFrame& prev,unsigned e,spacewarp::GpuActors& out,spacewarp::ActorTrace* trace) noexcept {
-    spacewarp::ActorStats st{};
-    // Player body: the engine flags the player, so the actor scan never returns him (not even with
-    // debug.rdrvr.mvactors.player 1) and his body would get the static-world vectors: a body that walks
-    // WITH the camera would be extrapolated as if the camera walked past it. Synthetic actor riding the
-    // app space: Mcur = feet under the eyes, Mprev = WfL_prev * inv(WfL_cur) * Mcur, so the block's
-    // D = WfL_prev * inv(WfL_cur) (head motion only, no locomotion). Standing still it is 'still' (no
-    // block: static-world vectors are right then). Inserted first (rank 0) in copies of both sets.
-    spacewarp::ActorSet curSet=cur.actors,prevSet=prev.actors;const spacewarp::ActorSet* ca=&cur.actors;const spacewarp::ActorSet* pa=&prev.actors;
-    if(spaceWarpControl.mvPlayer.load(std::memory_order_relaxed)&&cur.actors.serial&&prev.actors.serial&&cur.actors.serial!=prev.actors.serial){
-        spacewarp::M4 wc{},wp{},iwc{};for(int i=0;i<16;++i){wc[i]=cur.worldFromLocal[i];wp[i]=prev.worldFromLocal[i];}
-        const double upm=cur.unitsPerMetre>0?cur.unitsPerMetre:1.0;
-        if(wc[15]!=0&&wp[15]!=0&&spacewarp::invert(wc,iwc)){
-            spacewarp::M4 mc=spacewarp::identity();
-            mc[12]=(double(cur.position[0][0])+cur.position[1][0])/2;mc[13]=(double(cur.position[0][1])+cur.position[1][1])/2-1.5*upm;mc[14]=(double(cur.position[0][2])+cur.position[1][2])/2;
-            const spacewarp::M4 mp=spacewarp::mul(wp,spacewarp::mul(iwc,mc));bool ok=true;
-            spacewarp::ActorPose pc{},pp{};pc.guid=pp.guid=0xFFFFFF01u;pc.race=pp.race=-2;
-            for(int c=0;c<4;++c)for(int r=0;r<3;++r){pc.m[c*3+r]=float(mc[c*4+r]);pp.m[c*3+r]=float(mp[c*4+r]);ok=ok&&std::isfinite(pp.m[c*3+r]);}
-            const auto put=[](spacewarp::ActorSet& s,const spacewarp::ActorPose& a){
-                const unsigned n=std::min<unsigned>(s.count,spacewarp::maxActors-1);for(unsigned i=n;i>0;--i)s.actor[i]=s.actor[i-1];s.actor[0]=a;s.count=n+1;};
-            if(ok){put(curSet,pc);put(prevSet,pp);ca=&curSet;pa=&prevSet;++playerBlocks_;}
+// Once per pair (produce, after boneSets_ are loaded, before the eye loop): this pair's actor sets with the RIG actors. All of them
+// ride the app space, A = WfL_prev * inv(WfL_cur): the camera rig's own motion of exactly this pair, no main-thread snapshot timing.
+//  * the PLAYER body: the engine flags the player, so the actor scan never returns him (not even with debug.rdrvr.mvactors.player 1)
+//    and his body would get the static-world vectors: a body that walks WITH the camera would be extrapolated as if the camera walked
+//    past it. Synthetic actor riding the app space: Mcur = feet under the eyes, Mprev = A * Mcur (head motion only, no locomotion).
+//    Standing still it is 'still' (no block: static-world vectors are right then). Inserted first (rank 0) in copies of both sets.
+//  * the MOUNT (root vectors alone make it visibly double): the riding camera follows
+//    the rider on the horse, but the horse's vectors come from its root snapshots, and the main-thread ticks between the snapshots of
+//    a pair vary (actorSerialDelta 0 / 1 / 2): at a gallop a 0- or 2-tick pair moves the horse a whole step against the camera. While
+//    riding, the horse under the eyes (race 1, root <= 1.3 m horizontally, eyes 1.9..3.6 m above it) takes Mprev = A * Mcur; its parts
+//    (debug.rdrvr.mvbones) keep their motion relative to the root (T = Mprev' * inv(Mprev) applied to the previous parts).
+//  * the VR HANDS + the held WEAPON: placed from the controller every frame, so neither an actor root nor the rig carries them. Parts
+//    of the player actor (SpaceWarpActors.h handPart, pose = the grip in world): D = Hprev * inv(Hcur); a part beats every root cylinder.
+// No main tick between the two snapshots (same serial): the previous set gets a different serial, so the rig blocks are still written
+// (every scanned actor is 'still' then: identical matrices). debug.rdrvr.mvrig 0 = mount + hands off (the player body stays).
+// RIG RE-PLACEMENT (ActorSet::rig, only with debug.rdrvr.mvbody / debug.rdrvr.vr.riding.horseparts): a snapshot is read on the main thread
+// in some game frame, the pair draws some frame - at a run / gallop one tick apart is 0.2-0.3 m in world, more than a limb capsule. The
+// snapshot carries VrBody hook A's LOCAL -> world map of its own frame, so R = WfL(pair) * inverse(rig) moves its rig actors (the player
+// body, the ridden horse with parts) onto the camera rig of the drawn frame; what is left is their animation relative to the rig.
+//  * the player BODY (debug.rdrvr.mvbody, against ghosting on John's body when running): John's skeleton parts (legs,
+//    pelvis, torso, arms; the head only in THIRD PERSON) - own synthetic actor (race -3, rank 1, same root as the player): parts only, its
+//    bounding cylinder reaches the feet (the player cylinder stops 1.35 m under the eyes). Previous parts = the previous snapshot's
+//    (one tick: the body's own step); same snapshot / >= 2 ticks: this snapshot's again (the rig motion only, never a doubled step).
+//  * the MOUNT with horse parts (legs, neck, head; VrBody steady::horseChains): root + parts re-placed by R before the mount step above;
+//    no rig map = no parts (else a ghost head: capsules a tick off the drawn neck at a gallop, plus carriers re-picked per frame).
+// Rig parts are centred / widened relative to their root (SpaceWarpActors.h rigPartLayout, SpaceWarpBones.h prepareBoneParts rootRel).
+inline void SpaceWarp::prepareActorPair(const SpaceWarpFrame& cur,const SpaceWarpFrame& prev) noexcept {
+    namespace sw=spacewarp;
+    auto& cs=pairSets_[0];auto& ps=pairSets_[1];cs=cur.actors;ps=prev.actors;
+    // The part cache is per pair (left eye computes, right eye reuses); its (guid, serials) key does not cover the rig parts, which
+    // change with the render frame, not the main tick (two pairs without a main tick have the same serials)
+    if(boneCache_)for(auto& c:boneCache_->entry){c.guid=0;c.bGuid=0;}
+    if(!spaceWarpControl.mvPlayer.load(std::memory_order_relaxed)||!cs.serial||!ps.serial)return;
+    const bool rig=spaceWarpControl.mvRig.load(std::memory_order_relaxed)!=0;
+    const bool sameSnapshot=cs.serial==ps.serial;
+    if(cs.serial==ps.serial){if(!rig)return;ps.serial=cs.serial^(1ull<<63);++rigSameSerial_;}
+    spacewarp::M4 wc{},wp{},iwc{};for(int i=0;i<16;++i){wc[i]=cur.worldFromLocal[i];wp[i]=prev.worldFromLocal[i];}
+    if(!(wc[15]!=0&&wp[15]!=0&&spacewarp::invert(wc,iwc))){if(ps.serial!=prev.actors.serial)ps=prev.actors;return;}
+    const spacewarp::M4 A=spacewarp::mul(wp,iwc);
+    const double upm=cur.unitsPerMetre>0?cur.unitsPerMetre:1.0;
+    const double eye[3]{(double(cur.position[0][0])+cur.position[1][0])/2,(double(cur.position[0][1])+cur.position[1][1])/2,(double(cur.position[0][2])+cur.position[1][2])/2};
+    const auto store=[](const spacewarp::M4& m,float* m12){bool ok=true;
+        for(int c=0;c<4;++c)for(int r=0;r<3;++r){m12[c*3+r]=float(m[c*4+r]);ok=ok&&std::isfinite(m12[c*3+r]);}return ok;};
+    // R of a snapshot (refused: non-finite, or moving the eye > 2 m / turning > 30 deg = a recenter / teleport in between); note = stats
+    const auto replacement=[&](const float* rig12,const sw::M4& W,sw::M4& R,bool note){
+        sw::M4 im{};if(!sw::invert(sw::poseMatrix(rig12),im))return false;
+        R=sw::mul(W,im);for(double x:R)if(!std::isfinite(x))return false;
+        double p[3]{};for(int r=0;r<3;++r)p[r]=R[r]*eye[0]+R[4+r]*eye[1]+R[8+r]*eye[2]+R[12+r];
+        const double cm=std::sqrt((p[0]-eye[0])*(p[0]-eye[0])+(p[1]-eye[1])*(p[1]-eye[1])+(p[2]-eye[2])*(p[2]-eye[2]))/upm*100.0;
+        const double deg=std::acos(std::clamp((R[0]+R[5]+R[10]-1.0)/2.0,-1.0,1.0))*57.29577951308232;
+        if(!(cm<=200.0&&deg<=30.0)){if(note)++rigFixRefused_;return false;}
+        if(note){++rigFixPairs_;rigFixCmSum_+=cm;rigFixCmMax_=std::max(rigFixCmMax_,float(cm));rigFixDegMax_=std::max(rigFixDegMax_,float(deg));}
+        return true;};
+    const auto movePoint=[](const sw::M4& R,float* p){double w[3]{};for(int r=0;r<3;++r)w[r]=R[r]*p[0]+R[4+r]*p[1]+R[8+r]*p[2]+R[12+r];for(int r=0;r<3;++r)p[r]=float(w[r]);};
+    const auto moveParts=[&](const sw::M4& R,sw::ActorBones& b){bool ok=true;
+        for(unsigned k=0;k<b.count&&k<sw::maxActorBones;++k){auto& q=b.part[k];ok=store(sw::mul(R,sw::poseMatrix(q.m)),q.m)&&ok;movePoint(R,q.a);movePoint(R,q.b);
+            for(int i=0;i<3;++i)ok=ok&&std::isfinite(q.a[i])&&std::isfinite(q.b[i]);}
+        return ok;};
+    sw::M4 Rc{},Rp{};
+    const bool rc=rig&&cs.rigValid&&replacement(cs.rig,wc,Rc,true),rp=rig&&!sameSnapshot&&ps.rigValid&&replacement(ps.rig,wp,Rp,false);
+    if(rig&&cur.riding){ // the mount
+        int best=-1;double bestD2=1.3*upm*1.3*upm;
+        for(unsigned i=0;i<cs.count&&i<spacewarp::maxActors;++i){const auto& a=cs.actor[i];if(a.race!=1)continue;
+            const double dx=a.m[9]-eye[0],dz=a.m[11]-eye[2],h=eye[1]-a.m[10],d2=dx*dx+dz*dz;
+            if(h>=1.9*upm&&h<=3.6*upm&&d2<bestD2){bestD2=d2;best=int(i);}}
+        if(best>=0){auto& a=cs.actor[unsigned(best)];
+            // HORSE PARTS (rig layout): the snapshot root + its parts re-placed on this pair's rig first; no rig map = root only
+            auto* cbm=boneSets_&&a.bones>=0&&unsigned(a.bones)<(*boneSets_)[0].count?&(*boneSets_)[0].bones[unsigned(a.bones)]:nullptr;
+            if(cbm&&cbm->guid==a.guid&&cbm->layout==sw::horsePartLayout){
+                float m12[12];std::memcpy(m12,a.m,sizeof m12);
+                if(rc&&store(sw::mul(Rc,sw::poseMatrix(m12)),a.m)&&moveParts(Rc,*cbm))++mountPartPairs_;
+                else{std::memcpy(a.m,m12,sizeof m12);a.bones=-1;++mountPartNoRig_;}}
+            spacewarp::ActorPose* b=nullptr;for(unsigned j=0;j<ps.count&&j<spacewarp::maxActors;++j)if(ps.actor[j].guid==a.guid){b=&ps.actor[j];break;}
+            if(!b&&ps.count<spacewarp::maxActors){b=&ps.actor[ps.count++];*b=a;b->bones=-1;}
+            const spacewarp::M4 mp=spacewarp::mul(A,spacewarp::poseMatrix(a.m));spacewarp::ActorPose np=b?*b:a;
+            if(b&&store(mp,np.m)){
+                auto* pb=boneSets_&&b->bones>=0&&unsigned(b->bones)<(*boneSets_)[1].count?&(*boneSets_)[1].bones[unsigned(b->bones)]:nullptr;
+                spacewarp::M4 inv{};
+                if(pb&&pb->guid==a.guid&&spacewarp::invert(spacewarp::poseMatrix(b->m),inv)){const spacewarp::M4 T=spacewarp::mul(mp,inv);
+                    for(unsigned k=0;k<pb->count&&k<spacewarp::maxActorBones;++k){auto& q=pb->part[k];store(spacewarp::mul(T,spacewarp::poseMatrix(q.m)),q.m);
+                        for(float* e:{q.a,q.b}){double w[3];for(int r=0;r<3;++r)w[r]=T[r]*e[0]+T[4+r]*e[1]+T[8+r]*e[2]+T[12+r];for(int r=0;r<3;++r)e[r]=float(w[r]);}}}
+                else a.bones=-1; // previous parts unknown: root only
+                *b=np;++mountPairs_;}
         }
     }
+    // the player body (+ the hands as its parts)
+    spacewarp::M4 mc=spacewarp::identity();mc[12]=eye[0];mc[13]=eye[1]-1.5*upm;mc[14]=eye[2];
+    spacewarp::ActorPose pc{},pp{};pc.guid=pp.guid=sw::playerGuid;pc.race=pp.race=-2;
+    if(!store(mc,pc.m)||!store(spacewarp::mul(A,mc),pp.m))return;
+    // after the scanned actors' parts (a full set gives up its last entry, never `avoid`: that actor keeps its root)
+    const auto add=[](spacewarp::BoneSet& s,std::uint64_t serial,const spacewarp::ActorBones& b,int avoid=-1){
+        if(!s.count||s.serial!=serial){s.count=0;s.serial=serial;}
+        unsigned k=std::min(s.count,spacewarp::maxBoneActors-1);if(int(k)==avoid&&k>0)--k;
+        s.bones[k]=b;s.count=std::max(s.count,k+1);return std::int32_t(k);};
+    // the player BODY (debug.rdrvr.mvbody: the main thread published John's parts with this snapshot)
+    int bodyCur=-1,bodyPrev=-1;
+    if(rig&&boneSets_){auto& bs=*boneSets_;
+        const auto find=[](const sw::BoneSet& s,std::uint64_t serial){
+            for(unsigned k=0;k<s.count&&k<sw::maxBoneActors;++k)if(s.serial==serial&&s.bones[k].guid==sw::playerBodyGuid&&s.bones[k].layout==sw::playerBodyLayout)return int(k);
+            return -1;};
+        const int ic=find(bs[0],cs.serial);
+        if(ic>=0){
+            const std::uint64_t ticks=sameSnapshot||cs.serial<ps.serial?0:cs.serial-ps.serial; // main ticks between the two snapshots
+            sw::ActorBones prevBody{};sw::M4 Rb{};bool havePrev=false;int ip=-1;
+            if(!rc)++bodySkip_[0];
+            else if(ticks==1){ip=find(bs[1],ps.serial);
+                if(ip>=0&&rp){prevBody=bs[1].bones[unsigned(ip)];Rb=Rp;havePrev=true;}else ++bodySkip_[1];}
+            else{sw::M4 im{}; // the same parts on both frames, each on its own frame's rig: D = A (no doubled / missing step)
+                if(sw::invert(sw::poseMatrix(cs.rig),im)){prevBody=bs[0].bones[unsigned(ic)];Rb=sw::mul(wp,im);havePrev=true;++bodyStillPairs_;}
+                else ++bodySkip_[3];}
+            if(havePrev){auto& cb=bs[0].bones[unsigned(ic)];bool same=cb.count>0&&cb.count==prevBody.count;
+                for(unsigned k=0;same&&k<cb.count&&k<sw::maxActorBones;++k)same=cb.part[k].spec==prevBody.part[k].spec&&cb.part[k].bone==prevBody.part[k].bone;
+                if(!same)++bodySkip_[2];
+                else if(moveParts(Rc,cb)&&moveParts(Rb,prevBody)){
+                    if(ip>=0){bs[1].bones[unsigned(ip)]=prevBody;bodyPrev=ip;}else bodyPrev=add(bs[1],ps.serial,prevBody);
+                    bodyCur=ic;++bodyPairs_;}
+                else{cb.count=0;++bodySkip_[3];}}
+        }
+    }
+    if(rig&&boneSets_){
+        spacewarp::ActorBones hc{},hp{};hc.guid=hp.guid=pc.guid;hc.layout=hp.layout=spacewarp::handPartLayout;
+        for(unsigned h=0;h<2;++h){const auto& c=cur.hands[h];const auto& p=prev.hands[h];
+            if(!c.valid||!p.valid||c.weapon!=p.weapon)continue;
+            hc.part[hc.count++]=spacewarp::handPart(c,h,upm);hp.part[hp.count++]=spacewarp::handPart(p,h,upm);}
+        if(hc.count){auto& bs=*boneSets_;
+            pc.bones=add(bs[0],cs.serial,hc,bodyCur);pp.bones=add(bs[1],ps.serial,hp,bodyPrev);++handPairs_;}
+    }
+    const auto put=[](spacewarp::ActorSet& s,const spacewarp::ActorPose& a){
+        const unsigned n=std::min<unsigned>(s.count,spacewarp::maxActors-1);for(unsigned i=n;i>0;--i)s.actor[i]=s.actor[i-1];s.actor[0]=a;s.count=n+1;};
+    if(bodyCur>=0&&bodyPrev>=0){ // rank 1, right after the player: its parts come after the VR hands, before every other actor
+        sw::ActorPose bc=pc,bp=pp;bc.guid=bp.guid=sw::playerBodyGuid;bc.race=bp.race=-3;bc.bones=bodyCur;bp.bones=bodyPrev;put(cs,bc);put(ps,bp);}
+    put(cs,pc);put(ps,pp);++playerBlocks_;
+}
+inline unsigned SpaceWarp::buildActors(const SpaceWarpFrame& cur,const SpaceWarpFrame& prev,unsigned e,spacewarp::GpuActors& out,spacewarp::ActorTrace* trace) noexcept {
+    spacewarp::ActorStats st{};const spacewarp::ActorSet* ca=&pairSets_[0];const spacewarp::ActorSet* pa=&pairSets_[1];
     const spacewarp::BoneSet* cb=boneSets_&&(*boneSets_)[0].count?&(*boneSets_)[0]:nullptr;const spacewarp::BoneSet* pb=boneSets_&&(*boneSets_)[1].count?&(*boneSets_)[1]:nullptr;
     const unsigned n=spacewarp::buildActorBlock({cur.relClip[e].data(),cur.position[e].data(),ca,cb},{prev.relClip[e].data(),prev.position[e].data(),pa,pb},
         cur.unitsPerMetre,e==0,out,st,trace,spaceWarpControl.actorPadSteps(),boneCache_.get());
@@ -959,8 +1088,12 @@ inline void SpaceWarp::produce(VkCommandBuffer cmd,unsigned m,const SpaceWarpSou
         bool any=false,anyParts=false;
         if(actors)++boneModePairs_[std::min(cur.actors.boneMode,3u)]; // Pairs per debug.rdrvr.mvbones mode
         if(boneSets_){auto& bs=*boneSets_;bs[0].count=bs[1].count=0;bs[0].serial=bs[1].serial=0; // This pair's parts, both snapshots
-            if(actors&&cur.actors.boneCount&&prev.actors.boneCount&&cur.actors.serial!=prev.actors.serial&&
-               !(spacewarp::actorChannel.bones(cur.actors.serial,bs[0])&&spacewarp::actorChannel.bones(prev.actors.serial,bs[1]))){++boneMissing_;bs[0].count=bs[1].count=0;}}
+            const bool both=cur.actors.boneCount&&prev.actors.boneCount&&cur.actors.serial!=prev.actors.serial;
+            if(actors&&both&&
+               !(spacewarp::actorChannel.bones(cur.actors.serial,bs[0])&&spacewarp::actorChannel.bones(prev.actors.serial,bs[1]))){++boneMissing_;bs[0].count=bs[1].count=0;}
+            // rig parts (player body / horse) of the current snapshot also without previous parts / main tick (prepareActorPair)
+            else if(actors&&!both&&cur.actors.rigParts&&!spacewarp::actorChannel.bones(cur.actors.serial,bs[0])){++boneMissing_;bs[0].count=0;}}
+        if(actors)prepareActorPair(cur,prev);
         for(unsigned e=0;e<2;++e){
             auto& block=blocks[e];
             const unsigned n=actors?buildActors(cur,prev,e,block,traces.empty()?nullptr:traces.data()+e*spacewarp::maxActors):0u;block.header[0]=float(n);actorsLastEye_[e]=n;any=any||n;
@@ -1367,7 +1500,12 @@ inline std::string SpaceWarp::report() const {
      <<",\"slotImageSets\":"<<slotImages_<<",\"passes\":"<<consumed_<<",\"acquireFailures\":"<<acquireFailures_<<",\"warpSets\":"<<(altReady_?2:1)<<",\"warpSwaps\":"<<warpSwaps_<<",\"swapchainCreates\":"<<swapchainCreates_
      <<",\"warpDepthTimestamps\":"<<(queries_?"true":"false")<<",\"timingUnavailable\":"<<timingUnavailable_
      <<",\"passCpuNs\":"<<passCpu_.snapshot().json()
-     <<",\"actors\":{\"buffer\":"<<(actorBuffer_?"true":"false")<<",\"pairs\":"<<actorPairs_<<",\"pairsOff\":"<<actorPairsOff_<<",\"written\":"<<actorsWritten_<<",\"playerBlocks\":"<<playerBlocks_
+     <<",\"actors\":{\"buffer\":"<<(actorBuffer_?"true":"false")<<",\"pairs\":"<<actorPairs_<<",\"pairsOff\":"<<actorPairsOff_<<",\"written\":"<<actorsWritten_<<",\"playerBlocks\":"<<playerBlocks_<<",\"mountPairs\":"<<mountPairs_<<",\"handPairs\":"<<handPairs_<<",\"rigSameSerial\":"<<rigSameSerial_
+     <<",\"body\":{\"pairs\":"<<bodyPairs_<<",\"stillPairs\":"<<bodyStillPairs_<<",\"skipNoRig\":"<<bodySkip_[0]<<",\"skipNoPrev\":"<<bodySkip_[1]
+     <<",\"skipLayout\":"<<bodySkip_[2]<<",\"skipMath\":"<<bodySkip_[3]<<'}'
+     <<",\"rigFix\":{\"pairs\":"<<rigFixPairs_<<",\"refused\":"<<rigFixRefused_<<",\"cmAvg\":"<<(rigFixPairs_?rigFixCmSum_/double(rigFixPairs_):0.0)
+     <<",\"cmMax\":"<<rigFixCmMax_<<",\"degMax\":"<<rigFixDegMax_<<'}'
+     <<",\"mountParts\":{\"pairs\":"<<mountPartPairs_<<",\"dropped\":"<<mountPartNoRig_<<'}'
      <<",\"maxPerEye\":"<<actorsMaxEye_<<",\"lastPerEye\":["<<actorsLastEye_[0]<<','<<actorsLastEye_[1]<<"],\"sameSerial\":"<<actorSameSerial_
      <<",\"skipUnmatched\":"<<actorSkipUnmatched_<<",\"skipJump\":"<<actorSkipJump_<<",\"skipStill\":"<<actorSkipStill_
      <<",\"skipOffscreen\":"<<actorSkipOffscreen_<<",\"skipMath\":"<<actorSkipMath_<<",\"maxStepM\":"<<actorMaxStepM_

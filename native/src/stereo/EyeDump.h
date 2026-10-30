@@ -1,7 +1,7 @@
 #pragma once
 // Diagnostic: dump right/left eye targets to files on request (trigger file in the app's rdrvr dir).
 // Copies are recorded at the end of the right-eye color replay into a host-visible buffer and written
-// to disk a few frames later. Loader exports are used for the private buffer (same as UniformIntegration).
+// to disk a few frames later (on an own thread). Loader exports are used for the private buffer (same as UniformIntegration).
 // The same trigger (debug.rdrvr.eyedump <nonce>) also requests the AppSW dump (runtime/SpaceWarp.h: eye-dump-warp-*.raw +
 // eye-dump-warp.json: motion vectors, AppSW depth, actor blocks); "warpRequest" in eye-dump.json = its number. The next
 // produced pair is the pre-roll (its depth = -prevDepth), the pair after it is dumped (so not the frame of these eye targets).
@@ -12,8 +12,10 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 #ifdef __ANDROID__
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/system_properties.h>
@@ -21,6 +23,12 @@
 namespace rdrvr::engine::stereo {
 // an automatic request (e.g. GameXr on the K-th stereo frame of a cutscene, debug.rdrvr.eyedump.cutscene K) - same dump as the property.
 inline std::atomic<bool> eyeDumpAutoRequest{false};
+// SAVE LOG (diagnostics/SavedLog.h) waits on these from its own thread: dumps whose files are written / dumps that could not be recorded.
+inline std::atomic<std::uint64_t> eyeDumpsFlushed{},eyeDumpsRefused{};
+// The files are written on a detached thread. On the render thread ~106 MB would stall the pairs past StereoMailbox::maxAgeNs (150 ms):
+// without ADAPTIVE (staleEnabled false) the XR frame then falls through to the 2D theater, and the AppSW guard sees the re-submits (>= 5 s off).
+// While it runs the buffer must stay as it is: poll() arms nothing (a request waits) and ensureBuffer is only reached through poll().
+inline std::atomic<bool> eyeDumpWriting{false};
 struct EyeDumpEntry {const char* name;VkImage image;std::uintptr_t texture;VkFormat format;VkExtent3D extent;bool depth;VkDeviceSize offset;VkDeviceSize bytes;};
 class EyeDump {
 public:
@@ -31,6 +39,7 @@ public:
     // Call once per frame (color replay start). Returns true when a dump should be recorded this frame.
     bool poll(){
         if(pendingFrames){if(--pendingFrames==0)flush();return false;}
+        if(eyeDumpWriting.load(std::memory_order_acquire))return false;
         if(armed)return true;
         if(eyeDumpAutoRequest.exchange(false,std::memory_order_relaxed)){armed=true;return true;}
         if(++pollCounter%10)return false;
@@ -67,7 +76,7 @@ public:
     bool record(VkCommandBuffer c,VkDevice d,VkPhysicalDevice p,std::vector<EyeDumpEntry> list,const std::string& metaJson,Tracked tracked,Barrier barrier,Copy copy){
         armed=false;entries.clear();VkDeviceSize total=0;
         for(auto& e:list){e.bytes=VkDeviceSize(e.extent.width)*e.extent.height*texelBytes(e.format,e.depth);e.offset=total;total+=(e.bytes+255)&~VkDeviceSize(255);}
-        if(!ensureBuffer(d,p,total)){++failures;return false;}
+        if(!ensureBuffer(d,p,total)){++failures;eyeDumpsRefused.fetch_add(1,std::memory_order_relaxed);return false;}
         for(const auto& e:list){
             const VkImageAspectFlags aspect=e.depth?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT;
             VkImageLayout old=tracked(e.texture);if(old==VK_IMAGE_LAYOUT_UNDEFINED||old==VK_IMAGE_LAYOUT_PREINITIALIZED)old=VK_IMAGE_LAYOUT_GENERAL;
@@ -86,18 +95,31 @@ public:
         meta=metaJson+",\"warpRequest\":"+std::to_string(warp);pendingFrames=4;return true;
     }
     void flush(){
-        if(!mapped){++failures;return;}
-        std::string base=std::string(dir)+"/eye-dump";
-        std::string json="{\"entries\":[";bool first=true;
-        for(const auto& e:entries){
-            std::string path=base+"-"+e.name+".raw";
-            if(FILE* f=std::fopen(path.c_str(),"wb")){std::fwrite(static_cast<const char*>(mapped)+e.offset,1,std::size_t(e.bytes),f);std::fclose(f);}
-            char line[256];std::snprintf(line,sizeof line,"%s{\"name\":\"%s\",\"format\":%u,\"width\":%u,\"height\":%u,\"depth\":%u,\"bytes\":%llu}",first?"":",",e.name,unsigned(e.format),e.extent.width,e.extent.height,e.depth?1u:0u,(unsigned long long)e.bytes);
-            json+=line;first=false;
-        }
-        json+="],"+meta+"}";
-        if(FILE* f=std::fopen((base+".json").c_str(),"wb")){std::fwrite(json.data(),1,json.size(),f);std::fclose(f);}
-        ++dumps;
+        if(!mapped){++failures;eyeDumpsRefused.fetch_add(1,std::memory_order_relaxed);return;}
+        ++dumps;eyeDumpWriting.store(true,std::memory_order_release);
+        try{std::thread([data=static_cast<const char*>(mapped),list=entries,metaJson=meta]{
+#ifdef __ANDROID__
+            setpriority(PRIO_PROCESS,0,10); // the trace writer's priority: never competes with the game threads
+#endif
+            writeFiles(data,list,metaJson);
+        }).detach();return;}catch(...){}
+        writeFiles(static_cast<const char*>(mapped),entries,meta);
+    }
+    // Any thread. The JSON last: eye-dump.json means the raws are there.
+    static void writeFiles(const char* data,const std::vector<EyeDumpEntry>& list,const std::string& metaJson) noexcept {
+        try{
+            std::string base=std::string(dir)+"/eye-dump";
+            std::string json="{\"entries\":[";bool first=true;
+            for(const auto& e:list){
+                std::string path=base+"-"+e.name+".raw";
+                if(FILE* f=std::fopen(path.c_str(),"wb")){std::fwrite(data+e.offset,1,std::size_t(e.bytes),f);std::fclose(f);}
+                char line[256];std::snprintf(line,sizeof line,"%s{\"name\":\"%s\",\"format\":%u,\"width\":%u,\"height\":%u,\"depth\":%u,\"bytes\":%llu}",first?"":",",e.name,unsigned(e.format),e.extent.width,e.extent.height,e.depth?1u:0u,(unsigned long long)e.bytes);
+                json+=line;first=false;
+            }
+            json+="],"+metaJson+"}";
+            if(FILE* f=std::fopen((base+".json").c_str(),"wb")){std::fwrite(json.data(),1,json.size(),f);std::fclose(f);}
+        }catch(...){}
+        eyeDumpWriting.store(false,std::memory_order_release);eyeDumpsFlushed.fetch_add(1,std::memory_order_release);
     }
 };
 }

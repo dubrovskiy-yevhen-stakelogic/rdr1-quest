@@ -1,9 +1,11 @@
 #include "StereoTestMode.h"
 #include "diagnostics/FrameTimings.h"
 #include "diagnostics/ThreadCpuScope.h"
+#include "diagnostics/PerfRecorder.h" // PERF RECORD: eye stage wall times
 #include "EngineStereoPass.h"
 #include "vr/HandsHook.h"
 #include "vr/TaaHook.h"
+#include "vr/ScopeHook.h"
 #include <cerrno>
 #include <cstring>
 #include <sstream>
@@ -21,7 +23,8 @@ void drawVrHands(PassResources& images,VkDevice device,const PassSourceAbi& memo
     namespace hands=::rdrvr::vr::hands;
     const auto hook=hands::eyeHook.load(std::memory_order_acquire);
     const auto taa=::rdrvr::vr::taa::eyeHook.load(std::memory_order_acquire);
-    if((!hook&&!taa)||eye>1)return;
+    const auto scope=::rdrvr::vr::scope::eyeHook.load(std::memory_order_acquire); // SNIPER SCOPE lens (vr/ScopeHook.h)
+    if((!hook&&!taa&&!scope)||eye>1)return;
     try{
         const auto target=[](const ImageRecord& r,VkImageLayout layout){hands::EyeTarget t{};t.image=r.image;t.format=r.format;
             t.extent={r.extent.width,r.extent.height};t.layout=layout;t.usage=r.usage;t.samples=r.samples;t.layers=r.layers;t.mips=r.mips;
@@ -36,6 +39,7 @@ void drawVrHands(PassResources& images,VkDevice device,const PassSourceAbi& memo
         if(depthTarget&&readTargetImage(images,device,memory,depthTarget,depth)&&depth.image.image&&depth.image.device==device)
             call.depth=target(depth.image,depth.layout);
         if(taa)taa(call);   // Before the hands; leaves every image in its received layout
+        if(scope)scope(call); // After TAA (never in its history), before the hands (the support hand draws over the lens)
         if(hook)hook(call);
     }catch(...){}
 }
@@ -192,6 +196,7 @@ StereoPassResult EngineStereoPass::drawScene(VkQueue queue,EyeViewports& views,c
                 diagnostics::WallScope timing(phase==SceneStage::Depth?(eye?t.rightDepth:t.leftDepth):phase==SceneStage::Lighting?(eye?t.rightLight:t.leftLight):(eye?t.rightColor:t.leftColor));
                 auto& c=diagnostics::threadCpuTimings;
                 diagnostics::ThreadCpuScope cpuTiming(phase==SceneStage::Depth?(eye?c.rightDepth:c.leftDepth):phase==SceneStage::Lighting?(eye?c.rightLight:c.leftLight):(eye?c.rightColor:c.leftColor));
+                diagnostics::perfrec::StageScope perfStage(eye,phase==SceneStage::Depth?0u:phase==SceneStage::Lighting?1u:2u); // PERF RECORD
                 const auto label=[&](const char* depth,const char* light,const char* color){return phase==SceneStage::Depth?depth:phase==SceneStage::Lighting?light:color;};
                 if(EngineStereoPass::gpuStage)EngineStereoPass::gpuStage(eye,phase,true);
                 struct GpuEnd{unsigned eye;SceneStage phase;~GpuEnd(){if(EngineStereoPass::gpuStage)EngineStereoPass::gpuStage(eye,phase,false);}} gpuEnd{eye,phase};

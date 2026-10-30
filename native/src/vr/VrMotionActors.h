@@ -17,10 +17,15 @@
 // VrMotionBones.h adds the skeleton joints of <= 8 near actors in the SAME per-tick vector read
 // (crSkeleton header + bone runs), parts attached to the published set (ActorSet::bones); debug.rdrvr.mvbones 0/1/2/3 re-read here at
 // 1 Hz; Env + entityVtable / instSkeletonFn (MELEE's words, checked again in TraceEntry); report vr.mvactors.bones.
+// Body motion vectors (VrMotionBodyLink.h, props re-read here at 1 Hz, both default 0): every published set carries VrBody hook A's rig map of the
+// frame (ActorSet::rig) and, with debug.rdrvr.mvbody 1, John's parts (guid playerBodyGuid); with debug.rdrvr.vr.riding.horseparts 1 the
+// mount's chain parts. Report vr.mvactors.mvBody.
 #include "VrMainThread.h"
 #include "VrLassoLink.h"
 #include "runtime/SpaceWarpActors.h"
 #include "VrMotionBones.h"
+#include "VrRideSteadyLink.h" // RIDE STEADY: the horse under the eye
+#include "VrMotionBodyLink.h" // John's parts + the rig map of the frame (VrBody hook A)
 #include "runtime/KgslClock.h" // runtime::measurementPack (debug.rdrvr.perfmetrics) gates the counters
 #include "diagnostics/GuardedReadVector.h"
 #include <algorithm>
@@ -178,23 +183,53 @@ inline void rescan(const float cam[3],std::uint64_t now) noexcept {
     if(track)for(unsigned t=0;t<nn&&lastScan.count<maxScan;++t){const unsigned k=nearList[t].k;lastScan.guid[lastScan.count]=B.guid[k];lastScan.pos[lastScan.count++]=B.pos[k];}
     const auto us=(nowNs()-t0)/1000u;stats.scanUs.fetch_add(us,std::memory_order_relaxed);detail::maxOf(stats.scanUsMax,us);
 }
+// Body motion vectors (VrMotionBodyLink.h): hook A's record of this frame (published after the previous tick, <= 100 ms old) -> the set's RIG map and,
+// with debug.rdrvr.mvbody 1, the player body's BoneSet entry. Rig entries (player body, horse parts) never give way to NPC parts: a full
+// set gives up its last NPC entry (that actor keeps its root).
+inline std::uint64_t lastRigTickNs{}; // main thread only: the previous tick (a record published before it is not this frame's)
+inline int rigSlot(sw::ActorSet& set,sw::BoneSet& bones) noexcept {
+    if(bones.count<sw::maxBoneActors)return int(bones.count++);
+    for(int k=int(sw::maxBoneActors)-1;k>=0;--k){if(sw::rigPartLayout(bones.bones[unsigned(k)].layout))continue;
+        for(unsigned j=0;j<set.count&&j<sw::maxActors;++j)if(set.actor[j].bones==k)set.actor[j].bones=-1;
+        ::rdrvr::vr::bodylink::dropNpc.fetch_add(1,std::memory_order_relaxed);return k;}
+    return -1;
+}
+inline void attachBody(sw::ActorSet& set,sw::BoneSet& bones,std::uint64_t now,std::uint64_t since) noexcept {
+    namespace bl=::rdrvr::vr::bodylink;
+    if(!bl::wanted())return;
+    static bl::Record rec{}; // main thread only (~1.4 KB off the stack)
+    if(!bl::read(rec)||!rec.ns||rec.ns<=since||rec.ns>now||now-rec.ns>100'000'000ull){bl::stale.fetch_add(1,std::memory_order_relaxed);return;}
+    bool finite=true;for(float x:rec.map)finite=finite&&std::isfinite(x)&&std::fabs(x)<1e7f;
+    if(!finite)return;
+    std::memcpy(set.rig,rec.map,sizeof set.rig);set.rigValid=true;bl::mapsUsed.fetch_add(1,std::memory_order_relaxed);
+    if(!bl::bodyProp.load(std::memory_order_relaxed)||rec.parts.count<10||rec.parts.guid!=sw::playerBodyGuid||rec.parts.layout!=sw::playerBodyLayout)return;
+    const int k=rigSlot(set,bones);if(k<0)return;
+    bones.bones[unsigned(k)]=rec.parts;bones.serial=set.serial;set.boneCount=bones.count;++set.rigParts;bl::bodiesUsed.fetch_add(1,std::memory_order_relaxed);
+}
 inline void tick(const mainthread::Frame& f) noexcept {
     stats.ticks.fetch_add(1,std::memory_order_relaxed);
     if(!lastPropNs||f.now>=lastPropNs+1'000'000'000ull){lastPropNs=f.now;
         enabledProp.store(detail::intProperty("debug.rdrvr.mvactors",1),std::memory_order_relaxed);
         playerProp.store(detail::intProperty("debug.rdrvr.mvactors.player",0),std::memory_order_relaxed);
         movingProp.store(detail::intProperty("debug.rdrvr.mvactors.moving",0),std::memory_order_relaxed);
-        mvbones::modeProp.store(std::clamp(detail::intProperty("debug.rdrvr.mvbones",0),0,3),std::memory_order_relaxed);}
+        mvbones::modeProp.store(std::clamp(detail::intProperty("debug.rdrvr.mvbones",0),0,3),std::memory_order_relaxed);
+        namespace bl=::rdrvr::vr::bodylink; // Body motion vectors (VrMotionBodyLink.h): both OFF by default
+        bl::bodyProp.store(detail::intProperty("debug.rdrvr.mvbody",0)!=0?1:0,std::memory_order_relaxed);
+        bl::horseProp.store(detail::intProperty("debug.rdrvr.vr.riding.horseparts",0)!=0?1:0,std::memory_order_relaxed);}
     float cam[3]{};
     if(!env||!enabledProp.load(std::memory_order_relaxed)||!sw::actorChannel.camera(cam,f.now)){
-        stats.idle.fetch_add(1,std::memory_order_relaxed);
+        stats.idle.fetch_add(1,std::memory_order_relaxed);::rdrvr::vr::steadylink::mountActor.store(0,std::memory_order_relaxed);
         if(cacheCount||serial){cacheCount=0;sw::actorChannel.clear();serial=0;history={};lastScan.ns=0;lastScan.count=0;} // Also clears the change history / scan positions
         mvbones::reset();
         return;}
     if(!cacheCount||f.now<lastScanNs||f.now-lastScanNs>=rescanNs)rescan(cam,f.now);
     const auto t0=nowNs();auto& B=scratch;
     std::uintptr_t slots{};
-    if(!cacheCount||!env.read(nullptr,env.actorSlots,&slots,sizeof slots)||!slots){sw::ActorSet empty{};empty.serial=++serial;sw::actorChannel.publish(empty);return;}
+    if(!cacheCount||!env.read(nullptr,env.actorSlots,&slots,sizeof slots)||!slots){::rdrvr::vr::steadylink::mountActor.store(0,std::memory_order_relaxed);sw::ActorSet empty{};empty.serial=++serial;
+        if(::rdrvr::vr::bodylink::wanted()){ // the rig map / player body also with no actor in range (alone on the trail)
+            boneScratch.count=0;boneScratch.serial=empty.serial;attachBody(empty,boneScratch,f.now,lastRigTickNs);lastRigTickNs=f.now;
+            sw::actorChannel.publish(empty,&boneScratch);return;}
+        sw::actorChannel.publish(empty);return;}
     unsigned n=0;
     for(unsigned i=0;i<cacheCount;++i){B.tickSegs[2*i]={slots+std::uintptr_t(cache[i].slot)*16,B.entry[i].data(),16};
         B.tickSegs[2*i+1]={cache[i].matrix,B.m[i].data(),off::matrixSize};n+=2;}
@@ -222,6 +257,31 @@ inline void tick(const mainthread::Frame& f) noexcept {
         if(history)noteHistory(a,set.serial);
     }
     mvbones::finish(set,boneScratch,B.tickSegs.data()+boneSeg,setIndex.data(),f.now); // Parts of the planned actors
+    { // RIDE STEADY: the horse under the eye (race 1, root within 1.3 m horizontally and 1.0..3.8 m below the eye)
+        std::uintptr_t horse=0;float bd=1.69f;
+        for(unsigned i=0;i<cacheCount;++i){const int si=setIndex[i];if(si<0)continue;const auto& a=set.actor[unsigned(si)];if(a.race!=1)continue;
+            const float dx=a.m[9]-cam[0],dz=a.m[11]-cam[2],dy=cam[1]-a.m[10],d2=dx*dx+dz*dz;
+            if(std::isfinite(d2)&&d2<bd&&dy>1.f&&dy<3.8f){bd=d2;horse=cache[i].actor;}}
+        ::rdrvr::vr::steadylink::mountActor.store(horse,std::memory_order_relaxed);
+        attachBody(set,boneScratch,f.now,lastRigTickNs); // rig map + player body (before the horse: the body never gives way)
+        // HORSE PARTS (VrRideSteadyLink.h, debug.rdrvr.vr.riding.horseparts 1): the mount's leg / neck / head capsules from hook A of THIS frame
+        // (world, carrier = the engine bone) -> the mount's ActorBones. SpaceWarp::prepareActorPair re-places them on the drawn rig (no rig
+        // map in this set = dropped there) and keeps their motion relative to the root.
+        namespace sl=::rdrvr::vr::steadylink;static sl::HorseParts hp{}; // main thread only (~1.2 KB off the stack)
+        static sw::ActorBones hb{};
+        if(::rdrvr::vr::bodylink::horseProp.load(std::memory_order_relaxed)&&horse){
+            if(sl::readParts(hp)&&hp.actor==horse&&hp.count&&hp.ns>lastRigTickNs&&f.now>=hp.ns&&f.now-hp.ns<100'000'000ull){
+                for(unsigned i=0;i<cacheCount;++i){if(cache[i].actor!=horse)continue;const int si=setIndex[i];if(si<0)break;auto& pose=set.actor[unsigned(si)];
+                    if(pose.bones>=0)break; // already has parts (never for a horse today)
+                    hb.guid=pose.guid;hb.layout=sw::horsePartLayout;hb.count=0;
+                    for(unsigned k=0;k<hp.count&&k<sw::maxActorBones;++k){const auto& s=hp.part[k];if(s.bone<0)continue;auto& p=hb.part[hb.count++];
+                        std::memcpy(p.a,s.a,sizeof p.a);std::memcpy(p.b,s.b,sizeof p.b);std::memcpy(p.m,s.m,sizeof p.m);p.radius=s.radius;
+                        p.cls=std::uint8_t(sw::ClassHead);p.spec=std::uint8_t(k);p.bone=std::uint16_t(s.bone);}
+                    const int k=hb.count?rigSlot(set,boneScratch):-1;if(k<0)break;
+                    pose.bones=k;boneScratch.bones[unsigned(k)]=hb;boneScratch.serial=set.serial;set.boneCount=boneScratch.count;++set.rigParts;
+                    sl::partsUsed.fetch_add(1,std::memory_order_relaxed);break;}
+            }else sl::partsStale.fetch_add(1,std::memory_order_relaxed);}
+        lastRigTickNs=f.now;}
     sw::actorChannel.publish(set,&boneScratch);stats.published.fetch_add(1,std::memory_order_relaxed);
     stats.lastCount.store(set.count,std::memory_order_relaxed);
     {auto c=stats.maxCount.load(std::memory_order_relaxed);while(set.count>c&&!stats.maxCount.compare_exchange_weak(c,set.count,std::memory_order_relaxed)){}}
@@ -251,7 +311,12 @@ inline std::string report() {
         (unsigned long long)stats.moving.load(),(unsigned long long)stats.held.load(),(unsigned long long)stats.alternating.load(),
         movingProp.load(),stats.scanInRange.load(),stats.scanMoving.load(),(unsigned long long)stats.movingKept.load(),(unsigned long long)stats.movingDropped.load());
     std::string out(b);if(!out.empty()&&out.back()=='}')out.pop_back();
-    out+=",\"bones\":"+mvbones::report()+"}";
+    out+=",\"bones\":"+mvbones::report();
+    {namespace bl=::rdrvr::vr::bodylink;namespace sl=::rdrvr::vr::steadylink;char m[400]; // what the ticks attached (VrMotionBodyLink.h)
+     std::snprintf(m,sizeof m,",\"mvBody\":{\"body\":%d,\"horseParts\":%d,\"mapsUsed\":%llu,\"bodiesUsed\":%llu,\"stale\":%llu,\"dropNpc\":%llu,\"horseUsed\":%llu,\"horseStale\":%llu}",
+        bl::bodyProp.load(),bl::horseProp.load(),(unsigned long long)bl::mapsUsed.load(),(unsigned long long)bl::bodiesUsed.load(),(unsigned long long)bl::stale.load(),
+        (unsigned long long)bl::dropNpc.load(),(unsigned long long)sl::partsUsed.load(),(unsigned long long)sl::partsStale.load());out+=m;}
+    out+="}";
     return out;
 }
 } // namespace rdrvr::vr::mvactors

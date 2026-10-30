@@ -20,7 +20,7 @@ namespace rdrvr::engine {
 namespace {
 template<class T>T read(const void* p,std::size_t n=0)noexcept{T v{};std::memcpy(&v,static_cast<const unsigned char*>(p)+n,sizeof v);return v;}
 struct Binding {std::uint32_t slot{};bool partial{};VkShaderStageFlags stages{};};
-// cpu02: slotMask/partialMask = bindings[0,count) as bits (slots are unique and sorted, so binding i is the i-th set bit).
+// slotMask/partialMask = bindings[0,count) as bits (slots are unique and sorted, so binding i is the i-th set bit).
 struct Layout {std::uint64_t generation{};VkDescriptorSetLayout handle{};unsigned count{};std::uint16_t slotMask{},partialMask{};std::array<Binding,16> bindings{};};
 struct Key {
     std::uint64_t generation{},bufferGeneration{};VkBuffer buffer{};std::array<std::uint32_t,16> ranges{};
@@ -34,7 +34,7 @@ struct KeyHash {std::size_t operator()(const Key& k)const noexcept{auto h=std::u
         h^=h>>30;h*=0xbf58476d1ce4e5b9ull;h^=h>>27;h*=0x94d049bb133111ebull;return std::size_t(h^(h>>31));}};
 // raw is the layout every reader uses. layout owns it in the normal mode; in fast mode (debug.rdrvr.dud.fast)
 // layout stays empty and the thread's FastThread pins keep it alive (no refcount atomics per draw).
-// cpu02: count = raw->count, copied so bind does not read the Layout heap object (dud.lean bit 1).
+// count = raw->count, copied so bind does not read the Layout heap object (dud.lean bit 1).
 struct Pending {VkDescriptorSet set{};std::shared_ptr<const Layout> layout;const Layout* raw{};std::array<std::uint32_t,16> offsets{},ranges{};std::uint32_t matrixRange{},matrixOffset{};std::uint8_t count{};};
 // Allocation-free open-addressing tables (linear probing, power-of-two
 // capacity, growth only by doubling). A clear is a generation bump: entries that
@@ -45,7 +45,7 @@ inline std::size_t setHash(VkDescriptorSet s)noexcept{auto h=std::uint64_t(reint
 struct SetTable {
     struct Entry {VkDescriptorSet set{};std::uint32_t gen{};};
     std::vector<Entry> slots;std::uint32_t gen{1},count{};
-    // cpu02 (dud.lean bit 4): one bit per (hash>>12)&4095 of every set inserted since the last clear, so a clear bit
+    // dud.lean bit 4: one bit per (hash>>12)&4095 of every set inserted since the last clear, so a clear bit
     // proves "not owned" without touching the slot array (no false negatives; kept up to date even while unused).
     std::array<std::uint64_t,64> filter{};
     static unsigned filterBit(std::size_t h)noexcept{return unsigned(h>>12)&4095u;}
@@ -149,7 +149,7 @@ struct FastThread {
     static constexpr std::size_t maxLayoutSlots=std::size_t(1)<<16;
     // Open addressing (linear probing, power-of-two, load <= 1/2). handle 0 = empty slot (never a
     // converted layout); layout null = cached "not converted" answer, exactly like the 64-entry cache.
-    // cpu02 (dud.lean bit 1): the layout's immutable per-draw fields ride in the slot (32 B), saving the dependent Layout heap read.
+    // dud.lean bit 1: the layout's immutable per-draw fields ride in the slot (32 B), saving the dependent Layout heap read.
     struct LayoutSlot {VkDescriptorSetLayout handle{};const Layout* layout{};std::uint64_t generation{};std::uint16_t slotMask{},partialMask{};};
     std::uint64_t layoutInstance{},layoutEpoch{};std::vector<LayoutSlot> layouts;std::size_t layoutCount{};
     std::vector<std::shared_ptr<const Layout>> pins,retiredLayouts;
@@ -187,7 +187,7 @@ struct DynamicUniformDescriptors::Tls {
     struct LastContext {std::uint64_t instance{},generation{};void* context{};const Command* command{};} last;
     // debug.rdrvr.dud.fast state of this thread. fastOn implies fast!=nullptr. Counts are kept here
     // (single writer, plain adds) while fastOn and published to the owner's atomics by Impl::tick().
-    // cpu02: lean = debug.rdrvr.dud.lean bits in effect (0 unless fastOn), verify = debug.rdrvr.dud.verify (only with lean).
+    // lean = debug.rdrvr.dud.lean bits in effect (0 unless fastOn), verify = debug.rdrvr.dud.verify (only with lean).
     FastThread* fast{};bool fastOn{};std::uint8_t lean{};bool verify{};std::uint32_t fastCountdown{};std::uint64_t fastNextNs{};
     std::uint64_t countInstance{},calls{},hits{},binds{},offsets{},scopes{},layoutHits{};
 };
@@ -211,7 +211,7 @@ struct DynamicUniformDescriptors::Impl {
     // is the average cache carried across a reset; forgets counts every cache drop.
     std::atomic<std::uint64_t> bufferRoute{},bufferTracked{},bufferRetired{},forgets{},forgetsBound{},retainedSets{},poolsDestroyed{},ownedPeak{},memoHits{};
     static constexpr std::size_t maxOwned=4096,maxPools=16;
-    // cpu02: the hit path (5 calls per draw) is inlined; the lock + map lookup stays out of line.
+    // The hit path (5 calls per draw) is inlined; the lock + map lookup stays out of line.
     [[gnu::always_inline]] BufferLife92 bufferLife92(Command& c,VkBuffer buffer){
         const auto epoch=bufferEpoch92.load(std::memory_order_acquire);
         if(c.bufferEpoch92==epoch&&c.lastBuffer92==buffer)[[likely]]return {c.bufferGeneration92,c.lastBufferSize92};
@@ -254,7 +254,7 @@ struct DynamicUniformDescriptors::Impl {
     // shared_ptr atomics). This table keeps every layout the thread met in the epoch and returns a raw pointer.
     std::atomic<std::uint64_t> fastScopes{},fastLayoutHits{},fastLayoutMisses{},fastLayoutFlushes{},fastCommandMisses{};
     std::atomic<bool> fastOn{};
-    // cpu02: debug.rdrvr.dud.lean bits (unset = all; any bit is off while dud.fast is off). verify* count only with debug.rdrvr.dud.verify=1:
+    // debug.rdrvr.dud.lean bits (unset = all; any bit is off while dud.fast is off). verify* count only with debug.rdrvr.dud.verify=1:
     // checks run, Key/offsets of the lean path != the Layout path, Pending.count != raw->count, filter said "not owned" for an owned set.
     static constexpr unsigned leanLayout=1,leanOwned=4,leanAll=leanLayout|leanOwned;
     std::atomic<unsigned> leanOn{};std::atomic<bool> verifyOn{};
@@ -303,7 +303,7 @@ struct DynamicUniformDescriptors::Impl {
             // Default ON (unset); "0" (any value but "1") turns it off. Saves about 0.8 ms of
             // render-thread time per frame on Quest 3.
             char v[PROP_VALUE_MAX]{};on=__system_property_get("debug.rdrvr.dud.fast",v)<=0||(v[0]=='1'&&!v[1]);
-            // cpu02: debug.rdrvr.dud.lean unset = all bits (1 layout slot cache, 4 owned-set filter), else its value; dud.verify=1 checks them.
+            // debug.rdrvr.dud.lean unset = all bits (1 layout slot cache, 4 owned-set filter), else its value; dud.verify=1 checks them.
             char l[PROP_VALUE_MAX]{};lean=__system_property_get("debug.rdrvr.dud.lean",l)<=0?leanAll:unsigned(std::strtoul(l,nullptr,0))&leanAll;
             char w[PROP_VALUE_MAX]{};verify=__system_property_get("debug.rdrvr.dud.verify",w)>0&&w[0]=='1'&&!w[1];
 #endif
@@ -570,8 +570,8 @@ std::uintptr_t DynamicUniformDescriptors::nativeSet(NativeOriginal original,void
         if(!impl_->bufferCurrent92(*s.command,s.buffer,s.bufferGeneration92))return failure();
         const auto first=read<std::uintptr_t>(constants),last=read<std::uintptr_t>(constants,8);
         if(!first||last<first||(last-first)%8||(last-first)/8>256)return failure();
-        // cpu02 (dud.lean bit 1; t.lean is 0 outside fast mode): generation and bindings come from the table slot (bindings[i] =
-        // i-th set bit of slotMask) instead of the Layout heap object; lean=false is the old path. Same Key/Pending by construction.
+        // dud.lean bit 1 (t.lean is 0 outside fast mode): generation and bindings come from the table slot (bindings[i] =
+        // i-th set bit of slotMask) instead of the Layout heap object; lean=false reads the Layout heap object. Same Key/Pending by construction.
         const bool p1=(t.lean&Impl::leanLayout)&&view.layout==raw;
         auto build=[&](bool lean,Key& key,Pending& pending)__attribute__((always_inline))->bool{
             key.generation=lean?view.generation:raw->generation;key.bufferGeneration=s.bufferGeneration92;key.buffer=s.buffer;
@@ -589,7 +589,7 @@ std::uintptr_t DynamicUniformDescriptors::nativeSet(NativeOriginal original,void
             }
             pending.count=std::uint8_t(i);return true;};
         Key key;Pending pending;const bool built=build(p1,key,pending);
-        // cpu02: debug.rdrvr.dud.verify=1 also builds the Key the old way (Layout heap object) and counts any difference.
+        // debug.rdrvr.dud.verify=1 also builds the Key from the Layout heap object and counts any difference.
         if(p1&&t.verify){Key k;Pending p;const bool ok=build(false,k,p);impl_->verifyChecks.fetch_add(1,std::memory_order_relaxed);
             if(ok!=built||(ok&&!(k==key&&p.offsets==pending.offsets&&p.ranges==pending.ranges&&p.matrixRange==pending.matrixRange&&p.matrixOffset==pending.matrixOffset&&p.count==pending.count)))
                 impl_->verifyKeyMismatches.fetch_add(1,std::memory_order_relaxed);}
@@ -632,11 +632,11 @@ void DynamicUniformDescriptors::bind(PFN_vkCmdBindDescriptorSets original,VkComm
        point!=VK_PIPELINE_BIND_POINT_GRAPHICS||n||!descriptors||!count||count>sets||first>sets-count){fail();return;}
     if(!impl_->bufferCurrent92(*s.command,s.buffer,s.bufferGeneration92)){fail();return;}
     std::array<const Pending*,sets> matched{};
-    // cpu02: only [0,total) is ever passed on, so no zero fill.
+    // Only [0,total) is ever passed on, so no zero fill.
     std::array<std::uint32_t,slots*sets> dynamic;unsigned total{},consumed{};
     ++s.command->captureSerial;
     s.boundMatrix=nullptr;const Pending* matrix=nullptr;
-    // cpu02: dud.lean bit 1 takes the binding count from Pending, bit 4 asks the owned-set filter before the probe (same answers).
+    // dud.lean bit 1 takes the binding count from Pending, bit 4 asks the owned-set filter before the probe (same answers).
     const unsigned lean=t.lean;const bool filtered=lean&Impl::leanOwned,verify=t.verify;
     for(unsigned j=0;j<count;++j){const Pending* found=nullptr;
         if(consumed<s.count&&s.pending(consumed).set==descriptors[j])found=&s.pending(consumed++);
@@ -667,7 +667,7 @@ void DynamicUniformDescriptors::bind(PFN_vkCmdBindDescriptorSets original,VkComm
         s.command->needsDescriptorBind=false;s.boundMatrix=matrix;
         impl_->count(t,&Tls::binds,impl_->binds);impl_->count(t,&Tls::offsets,impl_->offsets,total);errno=saved;return;
     }
-    // cpu02: the capture bind (CaptureBatch is ~10 KB) runs in its own frame, so the plain bind above keeps a small one.
+    // The capture bind (CaptureBatch is ~10 KB) runs in its own frame, so the plain bind above keeps a small one.
     [&]()__attribute__((noinline)){
         CaptureBatch batch;bool prepared=false;
         if(observer){
@@ -785,7 +785,7 @@ std::string DynamicUniformDescriptors::report()const{
      // counts (setCalls/setHits/binds/dynamicOffsets too) are published every 256 scopes of that thread.
      <<",\"fast\":"<<impl_->fastOn.load(std::memory_order_relaxed)<<",\"fastScopes\":"<<impl_->fastScopes<<",\"fastLayoutHits\":"<<impl_->fastLayoutHits
      <<",\"fastLayoutMisses\":"<<impl_->fastLayoutMisses<<",\"fastLayoutFlushes\":"<<impl_->fastLayoutFlushes<<",\"fastCommandMisses\":"<<impl_->fastCommandMisses
-     // cpu02: debug.rdrvr.dud.lean bits in effect (last drawing thread) and the dud.verify counts (every *Mismatches must stay 0).
+     // debug.rdrvr.dud.lean bits in effect (last drawing thread) and the dud.verify counts (every *Mismatches must stay 0).
      <<",\"lean\":"<<impl_->leanOn.load(std::memory_order_relaxed)<<",\"verify\":"<<impl_->verifyOn.load(std::memory_order_relaxed)<<",\"verifyChecks\":"<<impl_->verifyChecks
      <<",\"verifyKeyMismatches\":"<<impl_->verifyKeyMismatches<<",\"verifyCountMismatches\":"<<impl_->verifyCountMismatches<<",\"verifyFilterMismatches\":"<<impl_->verifyFilterMismatches<<'}';return o.str();
 }

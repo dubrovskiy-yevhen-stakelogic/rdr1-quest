@@ -1,8 +1,9 @@
 #pragma once
-// heat01 OVERHEAT WARNING (user: "small text like our FPS readout, but RED - HEADSET OVERHEATING, please pause and let it
-// cool down - so players see it is the headset overheating, not the mod lagging. A MENU option, default ON: whoever wants to play on
-// a hot headset just turns it off").
-// XrHarness draws it on the persistent stats quad (PerfPanel::red), independent of PROFILER: readout OFF -> the two red lines alone,
+// CLOCK NOTICE: small text like the FPS readout, so players see it is the headset throttling, not the mod
+// lagging. A MENU option, default ON.
+// Throttling is normal on the headset and a red warning reads as damage, so: calm text in the normal ink,
+// no OVERHEAT / HOT / COOL DOWN, menu row CLOCK NOTICE. Code names (HeatWarning, cfg key heatWarning, report framePacing.heatWarning) stay.
+// XrHarness draws it on the persistent stats quad, independent of PROFILER: readout OFF -> the two lines alone,
 // FPS -> under the FPS line (the crop grows right/down from the FPS readout's corner), DETAIL -> on top of the panel. Never over
 // the open menu.
 //
@@ -13,11 +14,11 @@
 //   XR       the runtime's XR_EXT_performance_settings THERMAL notification, CPU or GPU domain, at WARNING (25) or IMPAIRED (75)
 //   TEMP     kgsl GPU temperature >= 85.0 C, once latched down to 82.0 C (guard for a runtime that reports none of the above)
 // Deliberately NOT a trigger: kgsl thermal_pwrlevel / devfreq max_freq / CPU ceilings. The battery POWER POLICY moves them (Quest 3
-// unplugged: GPU ceiling 545/492 MHz, tpl 3-4) at only 51-70 C with status 0 and headroom 0.54-0.67 (162k flight rows of
-// /14) - not heat, never trips. Measured without throttling: AC 690 MHz pinned 15 min, GPU plateau 73 C, tpl 0, status 0
-// headroom <= 0.73 (the hottest flight row: 75.5 C); no XR perf event in any report so far. (They are still reported, for context.)
+// unplugged: GPU ceiling 545/492 MHz, tpl 3-4) at only 51-70 C with status 0 and headroom 0.54-0.67 (162k flight rows)
+// - not heat, never trips. Measured without throttling: AC 690 MHz pinned 15 min, GPU plateau 73 C, tpl 0, status 0
+// headroom <= 0.73 (the hottest flight row: 75.5 C); no XR perf event in any recorded report. (They are still reported, for context.)
 // Hysteresis: latched after 3 consecutive HOT samples (~3 s), released after 15 consecutive clear samples (~15 s).
-// Switch: graphics.cfg heatWarning (GRAPHICS row HEAT WARNING, default 1); debug.rdrvr.heatwarn (read at most once per second):
+// Switch: graphics.cfg heatWarning (GRAPHICS row CLOCK NOTICE, default 1); debug.rdrvr.heatwarn (read at most once per second):
 // unset/-1 = the menu, 0 off, 1 on, 2 force-show (test). The detector runs and counts while the warning is off.
 // Report: framePacing.heatWarning (FramePacing.h report()).
 #include <algorithm>
@@ -32,21 +33,21 @@
 #endif
 
 namespace rdrvr::runtime {
-inline std::atomic<int> heatWarningSetting{1}; // heat01: graphics.cfg heatWarning (0/1), published by GraphicsSettings on load / set / defaults
+inline std::atomic<int> heatWarningSetting{1}; // graphics.cfg heatWarning (0/1), published by GraphicsSettings on load / set / defaults
 class HeatWarning {
 public:
     static constexpr int statusOn=2,headroomOn100=100,headroomOff100=95,xrLevelOn=25,tempOn10=850,tempOff10=820;
     static constexpr unsigned showAfter=3,hideAfter=15; // consecutive 1 Hz samples
     enum Reason : unsigned {Status=1,Headroom=2,Xr=4,Temp=8,Forced=16};
-    // Panel text (PerfPanel::red = the rest of the line in red; panel glyphs only, <= 52 per line) and its crop in panel px
+    // Panel text (panel glyphs only, <= 52 per line, no colour code = the same ink as the FPS readout) and its crop in panel px
     // (glyph advance 12, line pitch 25, glyph 14 px tall, 12 px margins - the FPS crop is 12+12*12 x 38).
-    static constexpr const char* panelText="\x01" "HEADSET OVERHEATING\n" "\x01" "PLEASE PAUSE AND LET IT COOL DOWN";
-    static constexpr unsigned panelLines=2,cropWidth=12+12*33; // longest line: 33 glyphs
+    static constexpr const char* panelText="NOTE: META LOWERED THE CLOCKS\n" "FPS DROPS ARE POSSIBLE - THIS IS NORMAL";
+    static constexpr unsigned panelLines=2,cropWidth=12+12*39; // longest line: 39 glyphs
     static constexpr unsigned cropHeight(unsigned lines) noexcept {return 12+(lines-1)*25+14+12;}
     int property() const noexcept {return property_.load(std::memory_order_relaxed);}
     bool latched() const noexcept {return latched_.load(std::memory_order_relaxed);}
     bool enabled() const noexcept {const int p=property();return p>=0?p!=0:heatWarningSetting.load(std::memory_order_relaxed)!=0;}
-    // Any thread, every frame: the red lines are on screen (a menu OFF hides them at once, a latch shows them within 1 s).
+    // Any thread, every frame: the notice lines are on screen (a menu OFF hides them at once, a latch shows them within 1 s).
     bool shown() const noexcept {return property()==2||(latched()&&enabled());}
     // XR thread (XrHarness): true once per show/hide change, so the stats quad redraws now instead of at its next 2 Hz slot.
     bool takeRedraw() noexcept {const bool s=shown();if(s==drawn_)return false;drawn_=s;return true;}

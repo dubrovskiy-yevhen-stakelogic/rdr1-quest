@@ -1,34 +1,56 @@
 #pragma once
-// WELCOME (user): a one-time-per-launch message on the menu panel at the player's first steps in the stereo world (never during a
-// cutscene / menu): early-stage warning, charger + GPU boost script advice, where the controls are, the Discord link. The first press of
+// WELCOME: a one-time-per-launch message on the menu panel at the player's first steps in the stereo world (never during a
+// cutscene / menu): mod version, early-stage warning, charger advice, the GPU boost state, where the controls are, the Discord link. The first press of
 // any button / trigger / grip closes it; that press never reaches the game (the input stays masked until everything is released).
 // XR thread only. debug.rdrvr.vr.welcome 0 = never show.
+// compose() re-reads GpuBoost::on() on every panel redraw (2 Hz)
+// while the panel is open. It opens after 2 s on foot in the stereo world, long after the helper's first 2 s poll, so the first draw is settled.
+// The how-to line follows the state: helper running = the GRAPHICS row is what is off; no helper = the PC script or QGO.
 #include "VrControls.h"
 #include "runtime/ControllerInput.h"
+#include "runtime/GpuBoost.h"
+#include "runtime/ModVersion.h"
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
 
 namespace rdrvr::vr::welcome {
-inline constexpr const char* text=
-    "\n"
-    "  WELCOME TO RDR RICH VR MOD\n"
-    "\n"
-    "  THE MOD IS IN AN EARLY STAGE:\n"
-    "  EXPECT BUGS AND PERFORMANCE ISSUES.\n"
-    "\n"
-    "  FOR THE BEST EXPERIENCE:\n"
-    "  - PLAY WITH THE CHARGER CONNECTED\n"
-    "  - RUN THE GPU BOOST SCRIPT\n"
-    "\n"
-    "  CONTROLS: HOLD THE LEFT MENU BUTTON > CONTROLS\n"
-    "\n"
-    "  DISCORD:\n"
-    "  \x02https://discord.gg/5pUVuZVQj\n"
-    "\n"
-    "  PRESS ANY BUTTON TO CLOSE";
+// Panel text (\x05 = PerfPanel::orange; <= 52 glyphs per line). With the orange block 23 lines: PerfPanel tightens the pitch to 19 px, the
+// trailing newline keeps a margin under the last line (PerfPanel fits a long text exactly to the panel's bottom edge).
+// XR thread: `out` must hold the whole text (1 KB is plenty).
+inline void compose(char* out,std::size_t size) noexcept {
+    auto& boost=::rdrvr::runtime::gpuBoost;const bool on=boost.on();boost.noteWelcome(on);
+    char block[256];
+    if(on)std::snprintf(block,sizeof block,"  - GPU BOOST: ON\n");
+    else std::snprintf(block,sizeof block,
+        "\n"
+        "  \x05" "GPU BOOST IS OFF - PLEASE ENABLE IT\n"
+        "  \x05" "FOR A BETTER EXPERIENCE:\n"
+        "  \x05" "%s\n"
+        "\n"
+        "  \x05" "PLAYING WITHOUT BOOST? TURN APPSW OFF:\n"
+        "  \x05" "MENU > GRAPHICS > SPACEWARP\n",boost.helper()?"MENU > GRAPHICS > GPU BOOST":"RUN THE GPU BOOST SCRIPT OR SET GPU 7 IN QGO");
+    std::snprintf(out,size,
+        "\n"
+        "  WELCOME TO RDR RICH VR MOD %s\n"
+        "\n"
+        "  THE MOD IS IN AN EARLY STAGE:\n"
+        "  EXPECT BUGS AND PERFORMANCE ISSUES.\n"
+        "\n"
+        "  FOR THE BEST EXPERIENCE:\n"
+        "  - PLAY WITH THE CHARGER CONNECTED\n"
+        "%s"
+        "\n"
+        "  CONTROLS: HOLD THE LEFT MENU BUTTON > CONTROLS\n"
+        "\n"
+        "  DISCORD:\n"
+        "  \x02https://discord.gg/5pUVuZVQj\n"
+        "\n"
+        "  PRESS ANY BUTTON TO CLOSE\n",::rdrvr::runtime::modVersion,block);
+}
 enum class State : std::uint8_t {Waiting,Shown,Closing,Done};
 inline std::atomic<unsigned> stateAtom{0};
 inline std::atomic<std::uint64_t> shownNs{},closedNs{};

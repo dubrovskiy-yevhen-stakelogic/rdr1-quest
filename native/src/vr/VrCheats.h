@@ -15,6 +15,8 @@
 //   TIME          <hh:00>  sagTimeOfDayScript::SetTimeOfDay(tod) 0x2abaa10 (day 0 = next occurrence: time only goes forward)
 //   FREEZE CLOCK  OFF|ON   sagTimeOfDayManager::SetAccelerationFactor(0,force) 0x2398b9c; the saved factor is restored on OFF
 //   WEATHER       <state>  WeatherManager::ChangeWeather(state,0.0,false) 0x2aaa018 (instant); NOW = GetWeather() 0x2aaa1d4
+//   CLEAR WANTED  A        script globals + faction/child-script calls: what the law scripts do when a chase ends + what pay_bounty does (see LAW below)
+//   NO WANTED     OFF|ON   gLawDogs flag 0x100 (the scripts' own "law" console switch: CREATE_CRIME_EVENT refuses, HUD meter off), any raise cleared at once
 //
 // Threads: rows' callbacks run on the XR thread (menu): they only flip atomics or post VrMainThread commands. Every engine
 // call runs on the engine main thread inside the sagShellDerived::UpdateInputs wrapper (VrMainThread module 2), after
@@ -22,6 +24,8 @@
 // did not verify shows UNAVAILABLE and never calls the engine. Kill switch: debug.rdrvr.vr.cheats 0 (no rows, no engine use).
 #include "VrMenuPages.h"
 #include "VrMainThread.h"
+#include "VrDeadEye.h" // DEAD EYE: state for the mapper / XR tint, HALF drain
+#include "VrDuelStart.h" // DUEL ON LOOK: the game's own duel script on the person looked at
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -32,6 +36,9 @@
 #include <cstring>
 #include <string>
 #include <type_traits>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 namespace rdrvr::vr::cheats {
 namespace mt=::rdrvr::vr::mainthread;
@@ -42,16 +49,16 @@ inline constexpr std::uintptr_t invulnerableOffset=0x1cab2a4,setHitPointsOffset=
     weaponEnumNameOffset=0x254ea64,scriptTimeOfDayOffset=0x2abaa10,accelerationOffset=0x2398b9c,changeWeatherOffset=0x2aaa018,
     getWeatherOffset=0x2aaa1d4,timeWarpOffset=0x23997a0,cancelWarpOffset=0x23997f4,sprintStaminaOffset=0x2420498,
     horseFreshnessOffset=0x245070c;
-// WEAPONS (user: "GIVE WEAPON lists only 7"; "a HOLSTERS menu: which revolver / rifle... Is in each holster"):
+// WEAPONS and the HOLSTERS menu (which revolver / rifle... is in each holster):
 // byte [enum+0x180] is WeaponEnumBase::IsLocked (0x254b090), NOT a redirect: FindWeaponEnumOrCategory gives a random UNLOCKED weapon
-// of the category for a locked enum. The old list skipped the 25 locked enums (story progress). Now every enum is listed; a give of a
+// of the category for a locked enum. Every enum is listed, including the 25 locked ones (story progress); a give of a
 // locked one first calls WeaponEnumBase::SetLocked(false) (0x254b098: also re-adds it to its category, like the game's own unlock).
 // HOLSTERS: HasEnumeratedWeapon(actor,enum) 0x267a498 (owned), HasEnumeratedWeaponReady(actor,enum) 0x2679c88 (= the one in its
 // holster: invInventoryComponent::HasNamedItemEquipped), ReadyEnumeratedWeapon(actor,enum) 0x26799b4 (EquipItem(name) = put it into
 // its holster slot + SetNextUseSlotFromWeaponEnum) - the script natives the game uses for the same thing.
 inline constexpr std::uintptr_t setLockedOffset=0x254b098,hasWeaponOffset=0x267a498,readyWeaponOffset=0x26799b4,hasReadyOffset=0x2679c88;
-// SAVE FIX: the old ALL WEAPONS gave RIFLE_ANTITANK (mission weapon) and BOW_SHORTBOW; a save holding them never leaves the
-// loading screen (user's autosave "New Friends, Old Problems": world sim runs, no scene ever renders). Such weapons are no longer
+// SAVE GUARD: a save holding RIFLE_ANTITANK (mission weapon) or BOW_SHORTBOW, which older ALL WEAPONS versions gave, never leaves the
+// loading screen (world sim runs, no scene ever renders). Such weapons are not
 // listed, and whenever the player owns one it is removed with DeleteEnumeratedWeapon(actor,enum) 0x267a9c8 (invManager::DeleteItem).
 inline constexpr std::uintptr_t deleteWeaponOffset=0x267a9c8;
 // invInventoryComponent::DeleteItem 0x2661e68 refuses the item at inv+0x458 (the item being equipped; GiveEnumeratedWeapon also waits
@@ -72,6 +79,14 @@ inline constexpr std::size_t playerActive=0x5f1,playerGuid=0x5f4,playerInfiniteD
     todAcceleration=0x8,todValue=0x5c,todWarpScale=0xc,todWarpDuration=0x28,todWarpActive=0x30,enumNodeObject=0,enumNodeKey=8,
     enumNodeParent=0x10,enumNodeLeft=0x18,enumNodeRight=0x20,enumRedirected=0x180,inventoryOwner=0x10;
 inline constexpr std::uint32_t invulnerableBit=0x4;
+// DEAD EYE meter (VrDeadEye.h): sagPlayerStates+0x1c = level (ldr w, GetDeadEyeTimeRemaining 0x269d6dc), player+0x3c0 = points
+// (SetDeadEyePoints 0x2696c24 str s0)
+inline constexpr std::size_t statesDeadEyeLevel=0x1c,playerDeadEyePoints=0x3c0;
+// DEAD EYE MODE SLOW-MO (VrDeadEye.h): player+0x3bd = multi-lock enable (u8 bool, sagPlayerHandle::SetDeadEyeMultiLockEnable
+// 0x26a9700 strb; UpdateWeaponSpecialMove 0x269a808 ldrb: 0 and no duel -> engine Dead Eye level 1), player+0x3be bit2 = duel
+// (sagPlayerHandle::GetDeadEyeDueling 0x26a976c ubfx #2: a duel is level 2 whatever 0x3bd says - never touched in a duel).
+inline constexpr std::size_t playerDeadEyeMultiLock=0x3bd,playerDeadEyeFlags=0x3be;
+inline constexpr std::uint8_t deadEyeDuelBit=0x4;
 // WEATHER. Rain/thunder are not driven by the forced weather TYPE but by the EFFECTIVE weather:
 //   WeatherManager::ProcessWeather 0x2aaa768 copies the base weights (+0x5c, what ChangeWeather writes) to +0xb8 and then
 //   rdrWeatherSphereManager::OverrideWeather 0x2ac011c (sagEnvironment+0x170) lets every active weather sphere replace them
@@ -95,6 +110,90 @@ inline constexpr std::size_t weatherEffective=0x54,weatherBase=0x58,weatherBaseW
 inline constexpr std::array<std::size_t,4> vfxCloudSlots{0x1c4,0x2ec,0x414,0x53c};                  // cloud-lightning sequences
 inline constexpr unsigned maxSpheres=42;                                                             // atFixedArray<rdrWeatherSphere,42>
 inline constexpr int weatherRainy=3,weatherStormy=4;
+
+// LAW (CLEAR WANTED / NO WANTED cheats). The law system is script only: there is no engine
+// function for it, the state is the script global block (rage::scrProgram::sm_Globals 0x4e6ebd60, GOT 0x2de22b0; sm_GlobalSize 0x4e6ebd58,
+// GOT 0x2de22a0; layout signature at 0x4e6ebd74 read by GetGlobalsHash 0x1be5298 = word 0 of every SCR header). scrThread::Run: GLOBAL_U16 =
+// base + index*4 (0x1be0b04), its load/store are 32 bit (0x1be1764), IADD_U8 adds BYTES (0x1be1420), array element = array + 8 + i*stride*8
+// with the count at array+0 (0x1be1390). Names of the save blocks: script 0002, rdr2SaveGameManager::RegisterData (native 0x1bf05d8):
+// 0x9bf2 "gLawDogs" (0x138 bytes), 0x9c7c "gPlayerBounties" (0x1170 bytes). Both are SAVED, see lawMarkerBit.
+//   0x19f6 wanted flag (HUD script 0189 shows the WantedMeter on it; scripts 0186/0190 SET_WANTED func 0x174d1/0x124c5)
+//   0x19f7 read with it by 121 scripts (never written by a readable script: reported only), 0x19f8 cleared with it
+//   0x5447 HUD law state, -1 = hide the meter; 0x5426 HUD meter (0..1, report only)
+//   0x9c40 law faction of the region, +0x8 current territory
+//   0x9c7c bounty[3]; +0x20 pending bounty[3] (func 0x20b96 moves it to bounty); +0x44 crimes[3][36][4] (snapshot source only, never written here)
+//   0xa0d8 snapshot taken on clear: +0 bounty, +4 array[36] = crimes[territory][i][3] where crime definition 0xa124[i] (stride 0xb) is set
+//   gLawDogs +0x58 flags: 0x100 law off (tested by CREATE_CRIME_EVENT's gate, func 0xf389 in main.sc and every town script, and by the HUD; main.sc's
+//   console command "law" toggles exactly this bit, func 0xfbcd; bounty missions set it too), 0x20000000 HUD notice "law_bounty_cleared" (HUD script 0xd0da..d163)
+//   gLawDogs +0x60 / +0x68 guids of the law child scripts, ended by SET_WANTED(false)
+// SET_WANTED(false) (0190 func 0x124c5, called by the mission launcher when a mission starts), mirrored by detail::lawClear: 0x19f6 = 0,
+// 0x19f8 = 0, snapshot, SetStatusTwoWay(lawFaction,2,2) + (8,2,2) + (10,2,2), TerminateAllNamedChildScripts + AddToTerminationList for
+// both guids, 0x5447 = -1; it does nothing when the flag is already 0. Clearing the bounty is the mod's addition.
+// The raise and the chase live in .wsc resources of content_android.rpf (AES, then zstd; code pages through the table in the program header). Numbers are
+// the rpf toc entries; every fact below was read from them:
+//   2508, module "LAW" (func 0x2eb2c, runs on the script scheduler): with crime objects of "CurrentCrimes" in state 3 (reported) in this territory it calls
+//   SET_WANTED(true) and starts the chase script (+0x60). The only gate is func 0x226d2, which is false while 0x100 is set: so NO WANTED stops raises at the source,
+//   and clearing the flag alone is undone on the LAW module's next tick: the reported crime is still there.
+//   0189..0208 (chase scripts) end with SET_WANTED(false), flag 0x400 and 0x5426 = 1.0. LAW answers 0x400 (func 0x342f7) with: every crime to state 1 + expired
+//   (func 0x31055 then destroys it), ends the witness script (+0x68), takes 0x400 back. This is what the mod sends.
+//   0193 (witness script) sets 0x19f7 on start and only its own exit code zeroes it: ended from outside it stays 1 for good (scripts read it as "being reported",
+//   crimes are not destroyed while it is set), so the mod zeroes it. Its exit code also restores the player from the road report cutscene, as does any scripted
+//   scene: nothing is ended while 0x1834a (scripted scene running) is set.
+//   0196 (pay_bounty, pardon letter): bounty[t] = 0, stat 0x114c[t] and total stat 0xde = 0 (table 0xd346, float), 0x5447 = -1, flag 0x800000 off,
+//   crimes[t][i][3] = 0 (rap sheet), snapshot, notice 0x20000000. The mod does all of it for the 3 territories.
+// Any layout doubt = row UNAVAILABLE or lastError, never a write. All code runs on the engine main thread (scripts run on that thread too, in
+// sagScriptContext::UpdateAllScripts, not nested in the UpdateInputs wrapper).
+inline constexpr std::uintptr_t scriptGlobalsGotOffset=0x2de22b0,scriptGlobalsOffset=0x4e6ebd60,scriptGlobalSizeGotOffset=0x2de22a0,scriptGlobalSizeOffset=0x4e6ebd58,
+    scriptGlobalsHashOffset=0x4e6ebd74,globalsHashFnOffset=0x1be5298,vmGlobalRefOffset=0x1be0b04,vmGlobalStoreOffset=0x1be1764,vmArrayElementOffset=0x1be1390,
+    vmIaddU8Offset=0x1be1420;
+inline constexpr std::uintptr_t factionMgrGotOffset=0x2deb220,factionMgrOffset=0x4e70c4f8,isFactionValidOffset=0x1e51834,setStatusTwoWayOffset=0x1e51284,
+    nativeSetStatusOffset=0x2324c7c,scriptGuidCountGotOffset=0x2e01298,scriptGuidCountOffset=0x4e6ecfe0,scriptGuidSlotsGotOffset=0x2e012a0,scriptGuidSlotsOffset=0x4e6ecfc8,
+    terminateChildrenOffset=0x1bec19c,addToTerminationOffset=0x1c04f48,nativeTerminateOffset=0x1bee408,nativeScriptValidOffset=0x1bee2ac;
+inline constexpr std::int32_t lawGlobalWords=0x225b1;
+inline constexpr std::uint32_t lawGlobalsSignature=0xf9ae02c6u;
+inline constexpr std::uint32_t lawWantedWord=0x19f6,lawWanted2Word=0x19f7,lawMeterFlagWord=0x19f8,lawHudMeterWord=0x5426,lawHudStateWord=0x5447,lawDogsWord=0x9bf2,
+    lawFactionWord=0x9c40,bountiesWord=0x9c7c,lawSnapshotWord=0xa0d8,crimeDefsWord=0xa124,lawStatsWord=0xd346,lawSceneWord=0x1834a;
+inline constexpr std::size_t lawDogsFlags=0x58,lawDogsChildA=0x60,lawDogsChildB=0x68,lawTerritory=0x8,bountiesPending=0x20,bountiesCrimes=0x44,lawSnapshotList=0x4,bountiesStats=0x114c;
+inline constexpr std::uint32_t lawOffBit=0x100u,lawNoticeBit=0x20000000u,lawChaseEndBit=0x400u,lawReportedBit=0x800000u;
+// gLawDogs is in the save game: a save made while NO WANTED holds 0x100 would keep the law off for good after the cheat is gone. So the mod's 0x100
+// always comes with this marker (no readable script uses bit 31 of the flags and they only ever test masks): marker set + cheat off = the mod takes both back.
+inline constexpr std::uint32_t lawMarkerBit=0x80000000u;
+inline constexpr int lawPlayerFaction=2,lawCalmFeeling=2,lawScriptLayer=2,lawOtherFactionA=8,lawOtherFactionB=10,lawTerritories=3,lawCrimeTypes=36,lawBountyTotalStat=0xde;
+inline constexpr unsigned lawHudHoldFrames=45,lawPressHoldFrames=180;
+inline constexpr std::array<unsigned char,20> isFactionValidFingerprint{
+#include "gamecode/VrCheats_1e51834_20_8d.inc"
+};
+inline constexpr std::array<unsigned char,144> setStatusTwoWayFingerprint{
+#include "gamecode/VrCheats_1e51284_144_8d.inc"
+};
+inline constexpr std::array<unsigned char,244> terminateChildrenFingerprint{
+#include "gamecode/VrCheats_1bec19c_244_8d.inc"
+};
+inline constexpr std::array<unsigned char,428> addToTerminationFingerprint{
+#include "gamecode/VrCheats_1c04f48_428_8d.inc"
+};
+inline constexpr std::array<unsigned char,36> vmGlobalRefFingerprint{
+#include "gamecode/VrCheats_1be0b04_36_8d.inc"
+};
+inline constexpr std::array<unsigned char,44> vmGlobalStoreFingerprint{
+#include "gamecode/VrCheats_1be1764_44_8d.inc"
+};
+inline constexpr std::array<unsigned char,16> vmArrayElementFingerprint{
+#include "gamecode/VrCheats_1be1390_16_8d.inc"
+};
+inline constexpr std::array<unsigned char,44> vmIaddU8Fingerprint{
+#include "gamecode/VrCheats_1be1420_44_8d.inc"
+};
+inline constexpr std::array<unsigned char,140> nativeSetStatusFingerprint{
+#include "gamecode/VrCheats_2324c7c_140_8d.inc"
+};
+inline constexpr std::array<unsigned char,128> nativeTerminateFingerprint{
+#include "gamecode/VrCheats_1bee408_128_8d.inc"
+};
+inline constexpr std::array<unsigned char,80> nativeScriptValidFingerprint{
+#include "gamecode/VrCheats_1bee2ac_80_8d.inc"
+};
+inline constexpr std::array<unsigned char,12> globalsHashFingerprint{40,88,38,208,0,117,77,185,192,3,95,214};
 
 inline constexpr std::array<unsigned char,92> invulnerableFingerprint{
 #include "gamecode/VrCheats_1cab2a4_92_8d.inc"
@@ -232,12 +331,17 @@ using TimeWarpFn=void(*)(void* manager,float scale,float rampIn,float rampOut,fl
 using CancelWarpFn=void(*)(void* manager,bool smooth);
 using SprintStaminaFn=void(*)(std::uint32_t guid,bool on);
 using HorseFreshnessFn=void(*)(bool on);
+using IsFactionValidFn=bool(*)(const void* manager,int faction);
+using SetStatusTwoWayFn=void(*)(void* manager,int a,int b,int feeling,int layer);
+using TerminateChildrenFn=void(*)(const char* name,void* context);
+using AddToTerminationFn=void(*)(void* context);
 struct Functions {
     InvulnerableFn invulnerable{};SetHitPointsFn setHitPoints{};ScriptInfiniteDeadEyeFn infiniteDeadEye{};DeadEyePointsFn deadEyePoints{};
     AmmoFlagFn ammoFlag{};AmmoAmountFn ammoAmount{};GiveWeaponFn giveWeapon{};EnumNameFn enumName{};ScriptTimeOfDayFn timeOfDay{};
     AccelerationFn acceleration{};ChangeWeatherFn changeWeather{};GetWeatherFn getWeather{};TimeWarpFn timeWarp{};CancelWarpFn cancelWarp{};
     SprintStaminaFn sprintStamina{};HorseFreshnessFn horseFreshness{};
     SetLockedFn setLocked{};HasWeaponFn hasWeapon{};ReadyWeaponFn readyWeapon{};HasReadyFn hasReady{};DeleteWeaponFn deleteWeapon{};
+    IsFactionValidFn isFactionValid{};SetStatusTwoWayFn setStatus{};TerminateChildrenFn terminateChildren{};AddToTerminationFn addToTermination{};
 };
 // Addresses are absolute (engineBase applied). A zero global / null function = that part did not verify.
 struct EngineApi {
@@ -250,23 +354,26 @@ struct EngineApi {
     std::uintptr_t vfxWeather{};       // g_vfxWeather object (CVfxWeather::Update / IsLightningEnabled / Render prints)
     std::uintptr_t environment{};      // sagEnvironment::sm_instance global (EnableWeatherSphere / OverrideWeather prints)
     std::uintptr_t noRainParam{};      // PARAM_noRain object (report only)
+    // LAW (each zero unless its GOT word and the prints of the code that encodes the layout verified):
+    std::uintptr_t scriptGlobals{},scriptGlobalSize{},scriptGlobalsHash{},factionMgr{},scriptGuidCount{},scriptGuidSlots{};
+    bool lawGate{true};                // false: debug.rdrvr.vr.wantedgate 0 = NO WANTED only clears each frame, never writes the law-off flag
     WriteFn write{&processWrite};
     Functions fn{};
 };
 
 // ---- rows ----
-enum Row : unsigned {RowGod,RowHeal,RowDeadEye,RowAmmo,RowRefill,RowGive,RowAll,RowWeapons,RowTime,RowFreeze,RowWeather,RowSlow,RowStamina,RowCount};
+enum Row : unsigned {RowGod,RowHeal,RowDeadEye,RowAmmo,RowRefill,RowGive,RowAll,RowWeapons,RowTime,RowFreeze,RowWeather,RowSlow,RowStamina,RowDuel,RowClearWanted,RowNoWanted,RowCount};
 inline constexpr std::array<const char*,RowCount> rowLabels{"GOD MODE","HEAL","INF DEAD EYE","INF AMMO","REFILL AMMO","GIVE WEAPON",
-    "ALL WEAPONS","WEAPONS BY TYPE","TIME","FREEZE CLOCK","WEATHER","SLOW MOTION","INF STAMINA"};
+    "ALL WEAPONS","WEAPONS BY TYPE","TIME","FREEZE CLOCK","WEATHER","SLOW MOTION","INF STAMINA","DUEL ON LOOK","CLEAR WANTED","NO WANTED"};
 inline constexpr std::array<const char*,RowCount> rowKeys{"god","heal","deadEye","infAmmo","refillAmmo","giveWeapon","allWeapons","weaponsByType","time",
-    "freezeClock","weather","slowMotion","infStamina"};
+    "freezeClock","weather","slowMotion","infStamina","duelOnLook","clearWanted","noWanted"};
 // weapon groups (first word of the enum name, e.g. WEAPON_REVOLVER_CATTLEMAN) = the holster each one goes to.
 enum Group : std::uint8_t {GroupSidearm,GroupRepeater,GroupRifle,GroupShotgun,GroupThrown,GroupMelee,GroupOther,GroupCount};
 inline constexpr std::array<const char*,GroupCount> groupNames{"REVOLVERS + PISTOLS","REPEATERS","RIFLES","SHOTGUNS","THROWN","MELEE","OTHER"};
 inline constexpr std::array<const char*,GroupCount> holsterLabels{"REVOLVER","REPEATER","RIFLE","SHOTGUN","THROWN","MELEE","OTHER"};
 inline constexpr unsigned holsterRows=6; // the groups with a holster (OTHER: bow / lasso / ... stay in the GIVE lists only)
-enum Toggle : unsigned {ToggleGod,ToggleDeadEye,ToggleAmmo,ToggleFreeze,ToggleStamina,ToggleCount};
-enum Op : std::uint16_t {OpHeal=1,OpRefill=2,OpGive=3,OpAll=4,OpTime=5,OpWeather=6,OpSlow=7,OpReady=8};
+enum Toggle : unsigned {ToggleGod,ToggleDeadEye,ToggleAmmo,ToggleFreeze,ToggleStamina,ToggleNoWanted,ToggleCount};
+enum Op : std::uint16_t {OpHeal=1,OpRefill=2,OpGive=3,OpAll=4,OpTime=5,OpWeather=6,OpSlow=7,OpReady=8,OpClearWanted=10,OpDuel=duellink::opPress};
 inline constexpr std::array<const char*,23> weatherNames{"CLEAR","FAIR","CLOUDY","RAINY","STORMY","SNOWY","IN CLEAR","IN FAIR",
     "IN CLOUDY","IN RAINY","IN STORMY","IN SNOWY","CAVE","THIEVES","FOREST","LOC A","LOC B","LOC C","IN THIEVES","IN FOREST",
     "IN LOC A","IN LOC B","IN LOC C"};
@@ -313,6 +420,12 @@ inline std::array<std::int32_t,maxBad> badIds{};inline std::atomic<unsigned> bad
 inline std::atomic<std::uint64_t> commands{},executed{},refused{},engineCalls{},reasserts{},listBuilds{},listNodes{},listSkipped{},readFailures{},exceptions{};
 inline std::atomic<std::uint64_t> wakeups{};                              // XR thread: maintain soon
 inline std::atomic<const char*> lastResult{"NONE"};
+// LAW (main thread writes, menu/report read). wantedLevel: -1 unknown, else the wanted flag; wantedBounty: bounty + pending of all territories.
+inline std::atomic<int> wantedLevel{-1},wantedFlag2{-1},wantedBounty{-1},wantedPending{-1},wantedHudState{-1},wantedGlobalWords{-1},wantedScene{-1};
+inline std::atomic<std::uint32_t> wantedFlags{0},wantedSignature{0};
+inline std::atomic<float> wantedHudMeter{-1.f};
+inline std::atomic<std::uint64_t> wantedClearPresses{},wantedCleared{},wantedBlockedRaises{},wantedReraised{},wantedChildEnds{},wantedFactionCalls{},wantedGateSets{},wantedGateReleases{};
+inline std::atomic<const char*> wantedError{""};
 
 namespace detail {
 inline EngineApi api{};
@@ -433,14 +546,14 @@ inline void buildWeaponList(std::uintptr_t actor=0) noexcept {
         if(!ok)break;
     }
     listNodes.store(visited,std::memory_order_relaxed);listSkipped.store(skipped,std::memory_order_relaxed);badCount.store(bad,std::memory_order_relaxed);
-    // SAVE FIX: remove a non-player weapon the old ALL WEAPONS gave (it blocks the next save load)
+    // SAVE GUARD: remove a non-player weapon an older ALL WEAPONS gave (it blocks the next save load)
     if(actor&&api.fn.hasWeapon&&api.fn.deleteWeapon)for(unsigned i=0;i<bad;++i)
         if(api.fn.hasWeapon(reinterpret_cast<const void*>(actor),badIds[i])){scrubFound.fetch_add(1,std::memory_order_relaxed);
             api.fn.deleteWeapon(reinterpret_cast<void*>(actor),badIds[i]);engineCalls.fetch_add(1);
             if(!api.fn.hasWeapon(reinterpret_cast<const void*>(actor),badIds[i]))scrubbed.fetch_add(1,std::memory_order_relaxed);}
     if(n){weaponPublished.store(n|(back<<16),std::memory_order_release);weaponCount.store(n,std::memory_order_release);listPublishes.fetch_add(1,std::memory_order_relaxed);}
 }
-// SAVE FIX: the item being equipped, when it is a non-player weapon (name checked like the list), is dropped from inv+0x458.
+// SAVE GUARD: the item being equipped, when it is a non-player weapon (name checked like the list), is dropped from inv+0x458.
 inline void clearBadPending(std::uintptr_t inventory) noexcept {
     if(!inventory)return;
     std::uintptr_t item{},type{},namePtr{};char raw[48]{};
@@ -647,6 +760,173 @@ inline void publishWorld(bool inGame) noexcept {
         const int w=api.fn.getWeather(reinterpret_cast<const void*>(manager));nowWeather.store(w>=0&&w<int(weatherNames.size())?w:-1);engineCalls.fetch_add(1);}
     publishWeather();
 }
+// ---- LAW: CLEAR WANTED / NO WANTED (facts: LAW block at the top) ----
+struct LawState {unsigned pressHold{},hudHold{};std::uint64_t ticks{};bool noWantedSeen{};};
+inline LawState lawState{};
+inline bool lawApi() noexcept {
+    const auto& f=api.fn;
+    return api.scriptGlobals&&api.scriptGlobalSize&&api.scriptGlobalsHash&&api.factionMgr&&api.scriptGuidCount&&api.scriptGuidSlots&&
+        f.isFactionValid&&f.setStatus&&f.terminateChildren&&f.addToTermination;
+}
+// The global block only after main script 0002 made it, with exactly the layout the indices above were read from.
+inline std::uintptr_t lawGlobals() noexcept {
+    std::uintptr_t globals{};std::int32_t words{};std::uint32_t signature{};
+    if(!rd(api.scriptGlobals,0,globals)||!rd(api.scriptGlobalSize,0,words)||!rd(api.scriptGlobalsHash,0,signature)){wantedError.store("GLOBALS UNREADABLE",std::memory_order_relaxed);return 0;}
+    wantedGlobalWords.store(words,std::memory_order_relaxed);wantedSignature.store(signature,std::memory_order_relaxed);
+    if(!globals||globals%4){wantedError.store("NO GLOBALS YET",std::memory_order_relaxed);return 0;}
+    if(words!=lawGlobalWords||signature!=lawGlobalsSignature){wantedError.store("GLOBALS MISMATCH",std::memory_order_relaxed);return 0;}
+    wantedError.store("",std::memory_order_relaxed);
+    return globals;
+}
+inline std::uintptr_t lawWord(std::uintptr_t globals,std::uint32_t word) noexcept {return globals+std::uintptr_t(word)*4;}
+// scrThread::Run array element: bounds as the VM (count at +0), element at +8.
+inline bool lawElement(std::uintptr_t array,unsigned stride,int i,std::uintptr_t& out) noexcept {
+    std::int32_t n{};if(i<0||!rd(array,0,n)||i>=n)return false;
+    out=array+8+std::uintptr_t(unsigned(i))*stride*8;return true;
+}
+// Sum of bounty + pending; zero = true also zeroes them.
+inline std::int64_t lawBounties(std::uintptr_t globals,bool zero,std::int64_t* pending=nullptr) noexcept {
+    const auto bounties=lawWord(globals,bountiesWord);std::int64_t total=0,later=0;
+    for(int t=0;t<lawTerritories;++t){
+        std::uintptr_t e{};std::int32_t v{};
+        if(lawElement(bounties,1,t,e)&&rd(e,0,v)&&v){total+=v;if(zero)wr(e,0,std::int32_t{0});}
+        if(lawElement(bounties+bountiesPending,1,t,e)&&rd(e,0,v)&&v){later+=v;if(zero)wr(e,0,std::int32_t{0});}
+    }
+    if(pending)*pending=later;
+    return total+later;
+}
+// pay_bounty func 0xcdb, all territories: the rap sheet (bounty hunters and marshals are picked by these counts).
+inline void lawZeroRapSheet(std::uintptr_t globals) noexcept {
+    const auto crimes=lawWord(globals,bountiesWord)+bountiesCrimes;
+    for(int t=0;t<lawTerritories;++t){
+        std::uintptr_t perType{};if(!lawElement(crimes,0xb5,t,perType))continue;
+        for(int i=0;i<lawCrimeTypes;++i){std::uintptr_t type{},count{};if(lawElement(perType,5,i,type)&&lawElement(type,1,3,count))wr(count,0,std::int32_t{0});}
+    }
+}
+// pay_bounty func 0x1ec3: the stats that mirror the bounty (stats page). Stat 0 is the money: an unset table word (0) is never written.
+inline void lawZeroBountyStats(std::uintptr_t globals) noexcept {
+    const auto stats=lawWord(globals,lawStatsWord),ids=lawWord(globals,bountiesWord)+bountiesStats;
+    const auto zero=[&](std::int32_t id)noexcept{std::uintptr_t e{};if(id>0&&lawElement(stats,1,id,e))wr(e,0,0.f);};
+    for(int t=0;t<lawTerritories;++t){std::uintptr_t e{};std::int32_t id{};if(lawElement(ids,1,t,e)&&rd(e,0,id))zero(id);}
+    zero(lawBountyTotalStat);
+}
+// Func 0x12554: the snapshot SET_WANTED(false) takes (bounty, then the crime counts of the current territory).
+inline void lawSnapshot(std::uintptr_t globals) noexcept {
+    std::int32_t territory{-1};if(!rd(lawWord(globals,lawFactionWord),lawTerritory,territory))return;
+    const auto snapshot=lawWord(globals,lawSnapshotWord),bounties=lawWord(globals,bountiesWord);
+    std::uintptr_t e{};std::int32_t bounty{};
+    if(territory>=0&&territory<lawTerritories&&lawElement(bounties,1,territory,e))rd(e,0,bounty);
+    wr(snapshot,0,bounty);
+    std::uintptr_t perType{};if(!lawElement(bounties+bountiesCrimes,0xb5,territory,perType))return;
+    const auto list=snapshot+lawSnapshotList;std::int32_t n{};if(!rd(list,0,n))return;
+    n=std::clamp(n,0,lawCrimeTypes);
+    for(int i=0;i<n;++i){
+        std::uintptr_t def{},type{},count{},to{};std::int32_t set{},value{};
+        if(lawElement(lawWord(globals,crimeDefsWord),0xb,i,def)&&rd(def,0,set)&&set&&lawElement(perType,5,i,type)&&lawElement(type,1,3,count)&&rd(count,0,value)&&
+           lawElement(list,1,i,to))wr(to,0,value);
+    }
+}
+inline void lawCalmFactions(std::uintptr_t globals) noexcept {
+    auto* manager=reinterpret_cast<void*>(api.factionMgr);
+    std::int32_t faction{-1};rd(lawWord(globals,lawFactionWord),0,faction);
+    if(api.fn.isFactionValid(manager,faction)){api.fn.setStatus(manager,faction,lawPlayerFaction,lawCalmFeeling,lawScriptLayer);wantedFactionCalls.fetch_add(1,std::memory_order_relaxed);}
+    // The native behind the script's two extra calls checks validity first (0x2324c7c), so does the mod.
+    if(api.fn.isFactionValid(manager,lawPlayerFaction))for(int other:{lawOtherFactionA,lawOtherFactionB})if(api.fn.isFactionValid(manager,other)){
+        api.fn.setStatus(manager,other,lawPlayerFaction,lawCalmFeeling,lawScriptLayer);wantedFactionCalls.fetch_add(1,std::memory_order_relaxed);}
+    engineCalls.fetch_add(1,std::memory_order_relaxed);
+}
+// Natives 0x1bee2ac + 0x1bee408: guid -> sagScriptContext through the aGuidGeneral registry (slot = index*16, generation at +8).
+inline bool lawEndChild(std::uint32_t guid) noexcept {
+    std::uintptr_t table{},slots{},context{};std::uint16_t count{},generation{};
+    const std::uintptr_t index=guid&0xffffu;
+    if(!rd(api.scriptGuidCount,0,table)||!table||!rd(table,0,count)||index>=count||!rd(api.scriptGuidSlots,0,slots)||!slots||slots%8||
+       !rd(slots,index*16+8,generation)||generation!=(guid>>16)||!rd(slots,index*16,context)||!context)return false;
+    api.fn.terminateChildren(nullptr,reinterpret_cast<void*>(context));api.fn.addToTermination(reinterpret_cast<void*>(context));
+    engineCalls.fetch_add(1,std::memory_order_relaxed);wantedChildEnds.fetch_add(1,std::memory_order_relaxed);
+    return true;
+}
+inline bool lawBusy(std::uintptr_t globals) noexcept {std::int32_t scene{};return rd(lawWord(globals,lawSceneWord),0,scene)&&scene!=0;}
+// The end of a chase + pay_bounty (LAW block at the top). The crimes go through flag 0x400 even when nothing else is set: a crime the mod cannot see would raise
+// the flag again. Returns true when there was anything to clear. The caller checks lawBusy first.
+inline bool lawClear(std::uintptr_t globals,bool& wasWanted,std::int64_t& hadBounty) noexcept {
+    const auto flag=lawWord(globals,lawWantedWord),witnessFlag=lawWord(globals,lawWanted2Word),dogs=lawWord(globals,lawDogsWord);
+    std::int32_t wanted{},witness{};std::uint32_t flags{};
+    wasWanted=false;hadBounty=0;
+    if(!rd(flag,0,wanted)||!rd(witnessFlag,0,witness)||!rd(dogs,lawDogsFlags,flags)){wantedError.store("WANTED FLAG UNREADABLE",std::memory_order_relaxed);return false;}
+    hadBounty=lawBounties(globals,true);
+    lawZeroBountyStats(globals);lawZeroRapSheet(globals);
+    if(wanted){
+        wasWanted=true;
+        wr(flag,0,std::int32_t{0});wr(lawWord(globals,lawMeterFlagWord),0,std::int32_t{0});wr(lawWord(globals,lawHudMeterWord),0,1.f);
+        lawCalmFactions(globals);
+    }
+    lawSnapshot(globals);
+    bool ended=false;
+    for(std::size_t field:{lawDogsChildA,lawDogsChildB}){std::uint32_t guid{};if(rd(dogs,field,guid)&&guid&&lawEndChild(guid))ended=true;}
+    if(witness)wr(witnessFlag,0,std::int32_t{0});
+    if(hadBounty>0)flags|=lawNoticeBit;
+    wr(dogs,lawDogsFlags,(flags|lawChaseEndBit)&~lawReportedBit);
+    if(!wasWanted&&!witness&&!ended&&!hadBounty)return false;
+    wr(lawWord(globals,lawHudStateWord),0,std::int32_t{-1});
+    wantedCleared.fetch_add(1,std::memory_order_relaxed);
+    lawState.hudHold=lawHudHoldFrames; // the HUD script only hides its meter / shows the notice while 0x100 is clear
+    return true;
+}
+inline void lawPublish(std::uintptr_t globals) noexcept {
+    std::int32_t v{};float meter{};std::int64_t pending{};
+    if(rd(lawWord(globals,lawWantedWord),0,v))wantedLevel.store(v,std::memory_order_relaxed);
+    if(rd(lawWord(globals,lawWanted2Word),0,v))wantedFlag2.store(v,std::memory_order_relaxed);
+    if(rd(lawWord(globals,lawHudStateWord),0,v))wantedHudState.store(v,std::memory_order_relaxed);
+    if(rd(lawWord(globals,lawSceneWord),0,v))wantedScene.store(v,std::memory_order_relaxed);
+    if(rd(lawWord(globals,lawHudMeterWord),0,meter)&&std::isfinite(meter))wantedHudMeter.store(meter,std::memory_order_relaxed);
+    const auto total=lawBounties(globals,false,&pending);
+    wantedBounty.store(int(std::clamp<std::int64_t>(total,-1,1000000000)),std::memory_order_relaxed);wantedPending.store(int(std::clamp<std::int64_t>(pending,-1,1000000000)),std::memory_order_relaxed);
+}
+// Every main tick, two reads while it matters; idle = nothing but the report refresh every maintainEveryFrames.
+inline void maintainLaw() noexcept {
+    if(!lawApi())return;
+    auto& st=lawState;++st.ticks;
+    const bool wantOn=want[ToggleNoWanted].load(std::memory_order_acquire);
+    const bool refresh=st.ticks%maintainEveryFrames==0;
+    if(!wantOn&&!st.noWantedSeen&&!st.pressHold&&!st.hudHold&&!refresh)return;
+    std::uint32_t state{};
+    if(!rd(api.gameData,0,state)||state!=3){wantedLevel.store(-1,std::memory_order_relaxed);wantedBounty.store(-1,std::memory_order_relaxed);active[ToggleNoWanted].store(false);return;}
+    const auto globals=lawGlobals();if(!globals){wantedLevel.store(-1,std::memory_order_relaxed);active[ToggleNoWanted].store(false);return;}
+    const auto dogs=lawWord(globals,lawDogsWord);
+    std::int32_t wanted{},witness{};std::uint32_t flags{};
+    if(!rd(lawWord(globals,lawWantedWord),0,wanted)||!rd(lawWord(globals,lawWanted2Word),0,witness)||!rd(dogs,lawDogsFlags,flags)){wantedError.store("LAW READ FAILED",std::memory_order_relaxed);return;}
+    // The bounty is read every refresh only: a raise of the flag is caught at once, a bounty alone may wait a quarter second.
+    const bool bounty=refresh&&(wantOn||st.pressHold)&&lawBounties(globals,false)!=0;
+    // Switching on also ends what is already under way: a crime reported before the switch would raise the flag the moment 0x100 is lifted.
+    const bool rising=wantOn&&!st.noWantedSeen,falling=!wantOn&&st.noWantedSeen;
+    if((rising||((wantOn||st.pressHold)&&(wanted||witness||bounty)))&&!lawBusy(globals)){
+        bool wasWanted{};std::int64_t hadBounty{};
+        if(lawClear(globals,wasWanted,hadBounty)){
+            if(wantOn&&!rising)wantedBlockedRaises.fetch_add(1,std::memory_order_relaxed);
+            if(st.pressHold)wantedReraised.fetch_add(1,std::memory_order_relaxed);
+        }
+        if(!rd(dogs,lawDogsFlags,flags))return;
+        if(wantOn)st.noWantedSeen=true;
+    }
+    if(falling)st.noWantedSeen=false;
+    if(st.pressHold)--st.pressHold;
+    const bool hud=st.hudHold>0;if(hud)--st.hudHold;
+    const bool gate=wantOn&&api.lawGate;
+    // Only 0x100 the mod set itself (marker) is ever taken back; without the cheat a marker from an old save heals here.
+    std::uint32_t next=flags;
+    if((flags&lawMarkerBit)&&(!gate||hud))next&=~lawOffBit;
+    if(!gate&&(flags&lawMarkerBit))next&=~lawMarkerBit;
+    if(gate&&!hud&&!(flags&lawOffBit))next|=lawOffBit|lawMarkerBit;
+    if(falling)next|=lawChaseEndBit; // A crime from the moments 0x100 was lifted is not left to raise the flag now
+    if(next!=flags&&wr(dogs,lawDogsFlags,next)){
+        if(next&lawOffBit)wantedGateSets.fetch_add(1,std::memory_order_relaxed);
+        else wantedGateReleases.fetch_add(1,std::memory_order_relaxed);
+        flags=next;
+    }
+    wantedFlags.store(flags,std::memory_order_relaxed);
+    active[ToggleNoWanted].store(wantOn&&(!api.lawGate||hud||(flags&lawOffBit)));
+    if(refresh)lawPublish(globals);
+}
 inline void giveNext(const Player& p) noexcept { // ALL WEAPONS / a group: a few per frame
     const auto w=weaponView();
     for(unsigned k=0;k<allPerFrame&&owned.allNext<w.n;++owned.allNext){
@@ -656,6 +936,99 @@ inline void giveNext(const Player& p) noexcept { // ALL WEAPONS / a group: a few
         static char msg[40];std::snprintf(msg,sizeof msg,"%u %s GIVEN",owned.allGiven,owned.allGroup<GroupCount?groupNames[owned.allGroup]:"WEAPONS");
         ::rdrvr::vr::panelSanitize(msg);result(RowAll,msg,true);}
 }
+// DEAD EYE (VrDeadEye.h): every main tick. Not running: a 2-read probe on the last validated player (a full sample every
+// maintainEveryFrames); running: a full sample every tick (Dead Eye lasts seconds), publishes the state for the mapper / XR tint and
+// applies the HALF drain through the engine's own SetDeadEyePoints (only on the player this tick just validated).
+inline std::uintptr_t deadEyeProbePlayer{};inline ::rdrvr::vr::deadeye::Drain deadEyeDrain{};inline std::uint64_t deadEyeTicks{};
+inline void maintainDeadEyeMeter() noexcept {
+    namespace de=::rdrvr::vr::deadeye;
+    ++deadEyeTicks;
+    if(!de::active.load(std::memory_order_relaxed)&&deadEyeTicks%maintainEveryFrames){
+        std::uintptr_t states{};std::uint32_t eye{};
+        if(!deadEyeProbePlayer||!rd(deadEyeProbePlayer,playerStates,states)||!states||!rd(states,statesDeadEye,eye)||!eye)return;
+    }
+    Player p{};
+    if(sample(p)){deadEyeProbePlayer=0;deadEyeDrain={};de::observeNone();return;}
+    deadEyeProbePlayer=p.player;
+    std::uintptr_t states{};std::uint32_t eye{};std::int32_t lvl{-1};float pts{-1.f},max{-1.f};std::uint8_t inf{};
+    if(!rd(p.player,playerStates,states)||!states||!rd(states,statesDeadEye,eye)){de::bump(de::sampleFailures);de::observeNone();deadEyeDrain={};return;}
+    if(!rd(states,statesDeadEyeLevel,lvl))lvl=-1;
+    if(!rd(p.player,playerDeadEyePoints,pts))pts=-1.f;
+    if(!rd(p.player,playerDeadEyeMax,max))max=-1.f;
+    const bool on=eye!=0&&p.hp>0;
+    de::observe(on,int(lvl),pts,max);
+    const bool infinite=rd(p.player,playerInfiniteDeadEye,inf)&&inf;
+    if(on&&infinite)de::bump(de::drainInfinite);
+    const float target=pts>=0.f?de::drainTarget(deadEyeDrain,on,pts,infinite,de::halfTime.load(std::memory_order_relaxed)):-1.f;
+    if(target>=0.f&&std::isfinite(target)&&api.fn.deadEyePoints){
+        api.fn.deadEyePoints(reinterpret_cast<void*>(p.player),target,false);engineCalls.fetch_add(1,std::memory_order_relaxed);de::bump(de::drainCalls);
+        float after{};
+        if(rd(p.player,playerDeadEyePoints,after)&&std::isfinite(after)){
+            if(after<pts)de::drainedExtra.store(de::drainedExtra.load(std::memory_order_relaxed)+(pts-after),std::memory_order_relaxed);
+            deadEyeDrain.prev=after;de::points.store(after,std::memory_order_relaxed);}
+    }
+}
+// DEAD EYE MODE SLOW-MO (VrDeadEye.h): every main tick, after maintainDeadEyeMeter. Nothing wanted and nothing held = no read.
+// A cheap 3-byte probe on the last fully validated player answers the steady case (byte already as wanted); every WRITE happens only
+// right after a full sample() of that same player (never on a stale pointer). The value the hold replaced (the story's 1) is written
+// back when the hold ends (gun out of the hands and Dead Eye over, GAME, a duel), only if the byte still holds the mod's 0; a new
+// sagPlayer is never written for the old one (its constructor / ResetData store their own 1).
+// Gated by the verified SetDeadEyePoints print (the same sagPlayer Dead Eye layout the meter reads); without it SLOW-MO stays inert.
+// Known limit: the script command SET_DEADEYE_MULTILOCK_ENABLE (sagActorScript 0x1cb34ac) can store 0 while the byte
+// is held at 0 - invisible here, so the restore gives the saved 1 back. Only GAME / a duel ever read it afterwards (a duel is level 2
+// anyway) and the next script call / ResetData sets it again; nothing saves it.
+struct SlowMoHold {std::uintptr_t player{};std::uint8_t saved{1};bool on{};};
+inline SlowMoHold slowMoHold{};inline std::uintptr_t slowMoPlayer{};
+inline void maintainSlowMo() noexcept {
+    namespace de=::rdrvr::vr::deadeye;
+    const bool running=de::active.load(std::memory_order_relaxed);
+    // the mode comes from the store itself, not from the holster pad filter's publish (debug.rdrvr.vr.holsters 0 installs no
+    // such filter -> the atomic keeps its SLOW-MO default and GAME would get writes). Before vr.cfg is loaded, or with the row's
+    // feature killed (the row reads PROP), nothing is written = the game's own level.
+    namespace vs=::rdrvr::vr;
+    const bool chosen=vs::vrSettings.loaded()&&!vs::keyKilled(vs::Key::DeadEyeMode)&&vs::vrSettings.requested().deadEyeSlowMo();
+    de::slowMo.store(chosen,std::memory_order_relaxed);
+    const bool mode=chosen&&api.fn.deadEyePoints;
+    const bool candidate=mode&&(running||de::gunInHand.load(std::memory_order_relaxed));
+    if(running&&slowMoHold.on)de::bump(de::slowMoRunningTicks);
+    if(!candidate&&!slowMoHold.on){slowMoPlayer=0;return;}
+    if(slowMoPlayer){ // steady case: the byte already says what we want -> nothing to write
+        std::uintptr_t table{};std::uint8_t on{},ml{},flags{};
+        if(rd(slowMoPlayer,0,table)&&table==api.playerTable&&rd(slowMoPlayer,playerActive,on)&&on==1&&
+           rd(slowMoPlayer,playerDeadEyeMultiLock,ml)&&rd(slowMoPlayer,playerDeadEyeFlags,flags)&&ml<=1){
+            const bool hold=de::slowMoWanted(mode,de::gunInHand.load(std::memory_order_relaxed),running,(flags&deadEyeDuelBit)!=0);
+            de::multiLock.store(ml,std::memory_order_relaxed);
+            if(hold&&ml==0)return;           // held (or the story's own level 1: nothing to hold, nothing to give back)
+            if(!hold&&!slowMoHold.on)return; // a duel with nothing held
+        }
+    }
+    Player p{};
+    // no valid player (loading / death screen): no write; the hold record stays, so the SAME player validating again gets its byte back
+    if(sample(p)){slowMoPlayer=0;de::multiLock.store(-1,std::memory_order_relaxed);return;}
+    if(slowMoHold.on&&slowMoHold.player!=p.player){slowMoHold={};de::bump(de::slowMoDropped);} // another sagPlayer: its own byte
+    slowMoPlayer=p.player;
+    std::uint8_t ml{},flags{};
+    if(!rd(p.player,playerDeadEyeMultiLock,ml)||!rd(p.player,playerDeadEyeFlags,flags)){de::bump(de::sampleFailures);return;}
+    if(ml>1){ // not the bool the engine stores: layout mismatch -> never write
+        de::bump(de::slowMoBadValue);slowMoHold={};slowMoPlayer=0;de::slowMoHeld.store(false,std::memory_order_relaxed);
+        de::multiLock.store(int(ml),std::memory_order_relaxed);return;}
+    const bool dueling=(flags&deadEyeDuelBit)!=0;
+    if(dueling&&candidate)de::bump(de::slowMoDuel);
+    const bool hold=de::slowMoWanted(mode,de::gunInHand.load(std::memory_order_relaxed),running,dueling);
+    // never switch the level under a level-2 execute (eye state 3 = shooting the marks; level 1 has no state 3 handler): wait it out
+    std::uintptr_t states{};std::uint32_t eye{};
+    const bool executing=rd(p.player,playerStates,states)&&states&&rd(states,statesDeadEye,eye)&&eye==3;
+    if(hold&&ml!=0&&executing)de::bump(de::slowMoExecuteWaits);
+    else if(hold&&ml!=0){
+        if(wr(p.player,playerDeadEyeMultiLock,std::uint8_t{0})){
+            de::bump(slowMoHold.on?de::slowMoReasserts:de::slowMoHolds);
+            slowMoHold.saved=ml;slowMoHold.player=p.player;slowMoHold.on=true;ml=0;}
+    }else if(!hold&&slowMoHold.on){
+        if(ml==0&&wr(p.player,playerDeadEyeMultiLock,slowMoHold.saved))ml=slowMoHold.saved;
+        de::bump(de::slowMoRestores);slowMoHold={};
+    }
+    de::slowMoHeld.store(slowMoHold.on,std::memory_order_relaxed);de::multiLock.store(int(ml),std::memory_order_relaxed);
+}
 } // namespace detail
 
 // ---- main thread (VrMainThread module 2) ----
@@ -664,6 +1037,12 @@ inline void tick(const mt::Frame& frame) noexcept {
     if(!engineReady.load(std::memory_order_acquire))return;
     try{
         ++owned.frame;
+        maintainDeadEyeMeter(); // every tick (before the maintain throttle)
+        maintainSlowMo();       // DEAD EYE MODE SLOW-MO: every tick (the hold must be in place before the R3 press)
+        // DUEL ON LOOK: every 8th tick while the row is ON or its script runs (no reads otherwise)
+        if(!(frame.index&7u)&&duel::available.load(std::memory_order_relaxed)&&(duellink::enabled.load(std::memory_order_relaxed)||duel::scriptRunning.load(std::memory_order_relaxed))){
+            Player dp{};const bool dok=!sample(dp);duel::tick(frame.now,frame.index,dp.gameState==3,dok?dp.actor:0,dp.guid);}
+        maintainLaw();          // NO WANTED: a raise is answered in the tick it is seen
         const bool wake=wakeups.exchange(0,std::memory_order_acq_rel)!=0;
         const bool storm=nowWeather.load(std::memory_order_relaxed)==weatherStormy||weatherOwned.state==weatherStormy;
         if(!wake&&!owned.allActive&&owned.frame%maintainEveryFrames&&frame.index<owned.nextList){if(storm)sampleLightning();return;} // No missed strikes
@@ -673,12 +1052,12 @@ inline void tick(const mt::Frame& frame) noexcept {
         maintainGod(p,ok);maintainDeadEye(p,ok);maintainAmmo(p,ok);maintainFreeze(inGame);maintainStamina(p,ok);
         // every ~2 s in game (0.25 s while the menu is open): locks, owned and holstered weapons change with the story
         if(inGame&&frame.index>=owned.nextList){owned.nextList=frame.index+(::rdrvr::vr::menuOpen.load(std::memory_order_relaxed)?15:120);
-            if(ok&&p.hp>0)clearBadPending(p.inventory); // SAVE FIX (before the delete inside the list build)
+            if(ok&&p.hp>0)clearBadPending(p.inventory); // SAVE GUARD (before the delete inside the list build)
             buildWeaponList(ok&&p.hp>0?p.actor:0);}
         if(owned.allActive){if(ok&&p.hp>0)giveNext(p);else{owned.allActive=false;result(RowAll,reason?reason:"NOT ALIVE",false);}}
     }catch(...){exceptions.fetch_add(1,std::memory_order_relaxed);}
 }
-inline void execute(const mt::Command& c,const mt::Frame&) noexcept {
+inline void execute(const mt::Command& c,const mt::Frame& frame) noexcept {
     using namespace detail;
     if(!engineReady.load(std::memory_order_acquire))return;
     Player p{};const char* reason=sample(p);const bool inGame=p.gameState==3;
@@ -766,6 +1145,33 @@ inline void execute(const mt::Command& c,const mt::Frame&) noexcept {
         if(warp&&!ours)return refuse(RowSlow,"GAME WARP ACTIVE");
         api.fn.timeWarp(reinterpret_cast<void*>(manager),slowScales[level],warpRamp,warpRamp,warpDuration);engineCalls.fetch_add(1);wakeups.fetch_add(1);
         return result(RowSlow,"SLOW MOTION ON",true);}
+    case OpDuel:{ // DUEL ON LOOK (VrDuelStart.h)
+        if(reason)return refuse(RowDuel,duel::refuseEarly(frame.now,reason));
+        // the player's sidearm by the names of the weapon list (no list yet: nothing is given to him)
+        const auto duelList=weaponView();bool armed=!duelList.n||!api.fn.hasWeapon;
+        for(unsigned i=0;i<duelList.n&&!armed;++i)armed=duelList[i].group==GroupSidearm&&api.fn.hasWeapon(reinterpret_cast<const void*>(p.actor),duelList[i].id);
+        const char* why=duel::press(frame.now,p.player,p.actor,p.guid,p.hp,deadEyeRunning(p),armed,api.fn.giveWeapon,api.fn.hasWeapon);
+        if(why)return refuse(RowDuel,why);
+        return result(RowDuel,"DUEL STARTING",true);}
+    case OpClearWanted:{
+        wantedClearPresses.fetch_add(1,std::memory_order_relaxed);
+        if(!lawApi())return refuse(RowClearWanted,"UNAVAILABLE");
+        if(!inGame)return refuse(RowClearWanted,reason?reason:"NOT IN GAME");
+        const auto globals=lawGlobals();
+        if(!globals)return refuse(RowClearWanted,wantedError.load(std::memory_order_relaxed));
+        if(lawBusy(globals))return refuse(RowClearWanted,"IN CUTSCENE - AGAIN AFTER IT");
+        bool wasWanted{};std::int64_t hadBounty{};
+        const bool any=lawClear(globals,wasWanted,hadBounty);
+        lawState.pressHold=lawPressHoldFrames; // a raise racing the press is answered too (report reraised)
+        lawPublish(globals);
+        if(!any)return result(RowClearWanted,"NOTHING TO CLEAR",true);
+        static char msg[48];
+        if(wasWanted&&hadBounty)std::snprintf(msg,sizeof msg,"WANTED CLEARED  BOUNTY %lld GONE",(long long)hadBounty);
+        else if(wasWanted)std::snprintf(msg,sizeof msg,"WANTED CLEARED");
+        else if(hadBounty)std::snprintf(msg,sizeof msg,"BOUNTY %lld CLEARED",(long long)hadBounty);
+        else std::snprintf(msg,sizeof msg,"WITNESS STOPPED");
+        ::rdrvr::vr::panelSanitize(msg);
+        return result(RowClearWanted,msg,true);}
     default:return;
     }
 }
@@ -781,8 +1187,8 @@ inline void post(std::uint16_t op,int arg,int arg1=0) noexcept {
 }
 inline Row rowOf(void* context) noexcept {return Row(reinterpret_cast<std::uintptr_t>(context));}
 inline Toggle toggleOf(Row r) noexcept {
-    return r==RowGod?ToggleGod:r==RowDeadEye?ToggleDeadEye:r==RowAmmo?ToggleAmmo:r==RowFreeze?ToggleFreeze:ToggleStamina;}
-inline bool isToggle(Row r) noexcept {return r==RowGod||r==RowDeadEye||r==RowAmmo||r==RowFreeze||r==RowStamina;}
+    return r==RowGod?ToggleGod:r==RowDeadEye?ToggleDeadEye:r==RowAmmo?ToggleAmmo:r==RowFreeze?ToggleFreeze:r==RowNoWanted?ToggleNoWanted:ToggleStamina;}
+inline bool isToggle(Row r) noexcept {return r==RowGod||r==RowDeadEye||r==RowAmmo||r==RowFreeze||r==RowStamina||r==RowNoWanted;}
 inline void suffix(char* out,std::size_t size,Row r) noexcept {
     const char* n=rowNote[r].load(std::memory_order_acquire);
     if(n&&*n){const auto used=std::strlen(out);if(used+3<size)std::snprintf(out+used,size-used," - %s",n);}
@@ -795,6 +1201,14 @@ inline void valueText(void* context,char* out,std::size_t size) noexcept {
     switch(r){
     case RowHeal:case RowRefill:case RowAll:std::snprintf(out,size,"PRESS A");break;
     case RowWeapons:std::snprintf(out,size,"A: OPEN >");break;
+    case RowDuel:duel::rowText(out,size);break;
+    case RowClearWanted:{const int level=wantedLevel.load(std::memory_order_relaxed),bounty=wantedBounty.load(std::memory_order_relaxed);
+        if(level<0)std::snprintf(out,size,"PRESS A");
+        else if(level>0)std::snprintf(out,size,"WANTED  BOUNTY %d  PRESS A",std::max(bounty,0));
+        else if(bounty>0)std::snprintf(out,size,"BOUNTY %d  PRESS A",bounty);
+        else if(wantedFlag2.load(std::memory_order_relaxed)>0)std::snprintf(out,size,"WITNESS  PRESS A");
+        else std::snprintf(out,size,"NOT WANTED  PRESS A");
+        break;}
     case RowGive:{
         const auto w=weaponView();
         if(!w.n){std::snprintf(out,size,"NO LIST YET");break;}
@@ -811,7 +1225,7 @@ inline void valueText(void* context,char* out,std::size_t size) noexcept {
         std::snprintf(out,size,"SET %s  NOW %s",slowNames[slowPick.load(std::memory_order_relaxed)%slowNames.size()],s<0?"?":s==3?"GAME":slowNames[unsigned(s)]);break;}
     default:{
         const Toggle t=toggleOf(r);const bool w=want[t].load(std::memory_order_acquire),a=active[t].load(std::memory_order_acquire);
-        std::snprintf(out,size,"%s",w?(a?"ON":"ON - PENDING"):(a&&r!=RowStamina?"OFF - GAME ON":"OFF"));
+        std::snprintf(out,size,"%s",w?(a?"ON":"ON - PENDING"):(a&&r!=RowStamina&&r!=RowNoWanted?"OFF - GAME ON":"OFF"));
         // One load - the main thread may clear the note between a check and the snprintf argument.
         const char* n=rowNote[r].load(std::memory_order_acquire);
         if(w&&a)suffix(out,size,r);else if(w&&!a&&n&&*n)std::snprintf(out,size,"ON - %s",n);
@@ -828,6 +1242,7 @@ inline void onAdjust(void* context,int direction) noexcept {
     case RowTime:step(timePick,24);break;
     case RowWeather:step(weatherPick,weatherChoices);break;
     case RowSlow:step(slowPick,unsigned(slowNames.size()));break;
+    case RowDuel:duel::toggle(direction>0);break;
     default:if(isToggle(r)){want[toggleOf(r)].store(direction>0,std::memory_order_release);wakeups.fetch_add(1);}break;
     }
 }
@@ -845,13 +1260,15 @@ inline void onActivate(void* context) noexcept {
     case RowTime:post(OpTime,int(timePick.load(std::memory_order_relaxed)%24));break;
     case RowWeather:post(OpWeather,int(weatherPick.load(std::memory_order_relaxed)%weatherChoices));break;
     case RowSlow:post(OpSlow,int(slowPick.load(std::memory_order_relaxed)%slowNames.size()));break;
+    case RowDuel:duel::toggle(!duellink::enabled.load(std::memory_order_acquire));break;
+    case RowClearWanted:post(OpClearWanted,0);break;
     default:if(isToggle(r)){auto& w=want[toggleOf(r)];w.store(!w.load(std::memory_order_acquire),std::memory_order_release);wakeups.fetch_add(1);
         ::rdrvr::vr::cheatNote.store(nullptr,std::memory_order_release);}break;
     }
 }
 } // namespace rows
 
-// ---- SAVE FIX 2: invInventoryComponent::AddItem watcher (JUMP_SLOT 0x2e48600 -> 0x26615b8) ----
+// ---- SAVE GUARD 2: invInventoryComponent::AddItem watcher (JUMP_SLOT 0x2e48600 -> 0x26615b8) ----
 // simpleperf of the endless loading screen: the main thread spins in a script native (0x267b644, AddItem by type hash) that the save
 // restore keeps calling. Every AddItem is counted per item type (report vr.cheats.addItem). A NON-PLAYER weapon (name like the list's
 // skip set: antitank / cannon / turret / gatling / bow) that is added again and again (>= blockAfter calls = a retry loop, never a single
@@ -916,7 +1333,7 @@ inline void giveText(std::string& out,unsigned selected) {
             std::snprintf(label,sizeof label,"ALL %s",groupNames[r-1]);std::snprintf(value,sizeof value,"%u/%u OWNED",have,n);}
         else{const auto& e=w[r-1-GroupCount];std::snprintf(label,sizeof label,"%s",e.name);
             std::snprintf(value,sizeof value,"%s",e.ready?"IN HOLSTER":e.owned?"OWNED":e.locked?"LOCKED":"");}
-        ::rdrvr::vr::panelSanitize(label);::rdrvr::vr::appendRow(out,r==selected,label,value);});
+        ::rdrvr::vr::panelSanitize(label);::rdrvr::vr::appendRow(out,r==selected,label,value,::rdrvr::vr::pageInks[::rdrvr::vr::PageGiveWeapons]);});
     footer(out,"A / TRIGGER: GIVE  B: BACK");
 }
 // HOLSTERS: one row per holster; triggers / A step through the owned weapons of that kind and put the chosen one into the holster.
@@ -938,7 +1355,7 @@ inline void holsterText(std::string& out,unsigned selected) {
         const WeaponEntry* now=nullptr;{int k=0;for(unsigned i=0;i<w.n;++i)if(w[i].group==r&&w[i].owned){if(k==current)now=&w[i];++k;}}
         if(!count)std::snprintf(value,sizeof value,"NONE OWNED");
         else std::snprintf(value,sizeof value,"< %s > %d/%d",now?now->name:"-",current+1,count);
-        ::rdrvr::vr::panelSanitize(value);::rdrvr::vr::appendRow(out,r==selected,holsterLabels[r],value);
+        ::rdrvr::vr::panelSanitize(value);::rdrvr::vr::appendRow(out,r==selected,holsterLabels[r],value,::rdrvr::vr::pageInks[::rdrvr::vr::PageHolsters]);
     }
     out+="\n";
     for(const char* l:{"  REVOLVER: RIGHT HIP   REPEATER: RIGHT SHOULDER","  RIFLE: BEHIND THE HEAD   SHOTGUN: LEFT SHOULDER",
@@ -971,6 +1388,8 @@ inline bool configure(const EngineApi& api) noexcept {
     rowAvailable[RowTime].store(tod&&f.timeOfDay);rowAvailable[RowFreeze].store(tod&&f.acceleration);
     rowAvailable[RowWeather].store(player&&f.changeWeather&&api.weatherInstance);
     rowAvailable[RowSlow].store(tod&&f.timeWarp&&f.cancelWarp);rowAvailable[RowStamina].store(player&&(f.sprintStamina||f.horseFreshness));
+    rowAvailable[RowDuel].store(player&&f.giveWeapon&&f.hasWeapon&&duel::available.load(std::memory_order_acquire));
+    rowAvailable[RowClearWanted].store(player&&detail::lawApi());rowAvailable[RowNoWanted].store(player&&detail::lawApi());
     unsigned registered=0;
     for(unsigned r=0;r<RowCount;++r)registered+=::rdrvr::vr::registerCheatRow({rowLabels[r],&rows::valueText,&rows::onAdjust,&rows::onActivate,
         reinterpret_cast<void*>(std::uintptr_t(r))})?1u:0u;
@@ -1022,6 +1441,22 @@ inline bool install(EngineApi api,std::uintptr_t base,Code&& code,Got&& got) noe
     api.environment=got(environmentGotOffset,environmentOffset)&&code(enableWeatherSphereOffset,enableWeatherSphereFingerprint)&&
         code(overrideWeatherOffset,overrideWeatherFingerprint)?base+environmentOffset:0;
     api.noRainParam=got(noRainGotOffset,noRainOffset)?base+noRainOffset:0;
+    duel::install(api.read,base,api.actorManagerGlobal,api.actorSlotsGlobal,got); // DUEL ON LOOK: its own prints, UNAVAILABLE if any differs
+    // LAW: the global block's addressing, then each engine call with the script native that shows its arguments.
+    if(code(vmGlobalRefOffset,vmGlobalRefFingerprint)&&code(vmGlobalStoreOffset,vmGlobalStoreFingerprint)&&code(vmArrayElementOffset,vmArrayElementFingerprint)&&
+       code(vmIaddU8Offset,vmIaddU8Fingerprint)&&code(globalsHashFnOffset,globalsHashFingerprint)&&got(scriptGlobalsGotOffset,scriptGlobalsOffset)&&
+       got(scriptGlobalSizeGotOffset,scriptGlobalSizeOffset)){
+        api.scriptGlobals=base+scriptGlobalsOffset;api.scriptGlobalSize=base+scriptGlobalSizeOffset;api.scriptGlobalsHash=base+scriptGlobalsHashOffset;}
+    if(got(factionMgrGotOffset,factionMgrOffset)&&code(nativeSetStatusOffset,nativeSetStatusFingerprint)){
+        api.factionMgr=base+factionMgrOffset;
+        fn(isFactionValidOffset,isFactionValidFingerprint,f.isFactionValid);fn(setStatusTwoWayOffset,setStatusTwoWayFingerprint,f.setStatus);}
+    if(got(scriptGuidCountGotOffset,scriptGuidCountOffset)&&got(scriptGuidSlotsGotOffset,scriptGuidSlotsOffset)&&
+       code(nativeTerminateOffset,nativeTerminateFingerprint)&&code(nativeScriptValidOffset,nativeScriptValidFingerprint)){
+        api.scriptGuidCount=base+scriptGuidCountOffset;api.scriptGuidSlots=base+scriptGuidSlotsOffset;
+        fn(terminateChildrenOffset,terminateChildrenFingerprint,f.terminateChildren);fn(addToTerminationOffset,addToTerminationFingerprint,f.addToTermination);}
+#ifdef __ANDROID__
+    {char v[PROP_VALUE_MAX]{};api.lawGate=!(__system_property_get("debug.rdrvr.vr.wantedgate",v)>0&&v[0]=='0');}
+#endif
     return configure(api);
 }
 
@@ -1061,6 +1496,18 @@ inline std::string report() {
             (unsigned long long)lightningSamples.load());
         out.insert(out.size()-1,wb);
     }
+    { // "wanted" = CLEAR WANTED / NO WANTED (LAW block at the top)
+        char lb[768];
+        std::snprintf(lb,sizeof lb,",\"wanted\":{\"api\":%s,\"clearPresses\":%llu,\"cleared\":%llu,\"noWanted\":%s,\"blockedRaises\":%llu,\"reraised\":%llu,"
+            "\"level\":%d,\"bounty\":%d,\"pending\":%d,\"flag2\":%d,\"scene\":%d,\"hudState\":%d,\"hudMeter\":%.3f,\"lawFlags\":\"0x%08x\",\"gate\":%s,\"gateSets\":%llu,"
+            "\"gateReleases\":%llu,\"childEnds\":%llu,\"factionCalls\":%llu,\"globalWords\":%d,\"signature\":\"0x%08x\",\"lastError\":\"%s\"}",
+            detail::lawApi()?"true":"false",(unsigned long long)wantedClearPresses.load(),(unsigned long long)wantedCleared.load(),want[ToggleNoWanted].load()?"true":"false",
+            (unsigned long long)wantedBlockedRaises.load(),(unsigned long long)wantedReraised.load(),wantedLevel.load(),wantedBounty.load(),wantedPending.load(),wantedFlag2.load(),wantedScene.load(),
+            wantedHudState.load(),double(wantedHudMeter.load()),wantedFlags.load(),detail::api.lawGate?"true":"false",(unsigned long long)wantedGateSets.load(),
+            (unsigned long long)wantedGateReleases.load(),(unsigned long long)wantedChildEnds.load(),(unsigned long long)wantedFactionCalls.load(),wantedGlobalWords.load(),
+            wantedSignature.load(),wantedError.load());
+        out.insert(out.size()-1,lb);
+    }
     const auto w=weaponView();const auto& fa=detail::api.fn;
     std::string names=",\"weaponApi\":{\"setLocked\":";names+=fa.setLocked?"true":"false";names+=",\"hasWeapon\":";names+=fa.hasWeapon?"true":"false";
     names+=",\"readyWeapon\":";names+=fa.readyWeapon?"true":"false";names+=",\"hasReady\":";names+=fa.hasReady?"true":"false";
@@ -1070,6 +1517,7 @@ inline std::string report() {
         ",\"nextUseCleared\":"+std::to_string(nextUseCleared.load())+
         ",\"pending\":\""+pendingName.load()+"\"}";
     names+=addItemReport();
+    names+=",\"duelStart\":"+duel::report();
     names+=",\"weaponNames\":[";
     for(unsigned i=0;i<w.n;++i){const auto& e=w[i];if(i)names+=',';names+="[";names+=std::to_string(e.id);names+=",\"";names+=e.name;names+="\",";
         names+=std::to_string(e.group);names+=e.locked?",1":",0";names+=e.owned?",1":",0";names+=e.ready?",1]":",0]";}

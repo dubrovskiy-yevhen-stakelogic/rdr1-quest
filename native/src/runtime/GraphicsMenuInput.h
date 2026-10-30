@@ -14,26 +14,29 @@ class GraphicsMenuInput {
     std::uint64_t pressNs_{},pauseUntil_{},lastNs_{},nextNav_{};
     int nav_{};unsigned selected_{};std::array<bool,2> triggerHeld_{true,true}; // Per trigger (armed only after it was released)
     int ignoreGrip_{-1}; // Hand whose grip the close guard ignores (it holds a VR weapon), -1 none
+    bool pulseAfterGuard_{};std::uint64_t pulseDeadline_{}; // SATCHEL: report 'pulsed' once the close guard saw neutral (not after the deadline)
 public:
     // The hand that holds a VR weapon keeps its grip squeezed through the menu; closing must not wait for it to open
     // (the holsters own that grip; its trigger still has to be released).
     void ignoreGrip(int hand) noexcept {ignoreGrip_=hand==0||hand==1?hand:-1;}
-    // 23 rows (the panel's 25-line maximum with the title/FPS line and one footer line). SUN SHADOWS absorbs
-    // SHADOW UPDATE, GRASS absorbs GRASS DISTANCE. Shadows/ShadowUpdate/GrassDistance stay as aliases for old callers.
+    // 26 rows, 27 panel lines with the title/FPS line and one footer line (PerfPanel 446 px; GraphicsMenu pads the hidden rows). SUN SHADOWS absorbs
+    // SHADOW UPDATE, GRASS absorbs GRASS DISTANCE. Shadows/ShadowUpdate/GrassDistance stay as aliases.
     // No CLOSE row: B closes the menu, as does holding the menu button.
-    // heat01: + HEAT WARNING after PROFILER (24 rows, 26 panel lines: PerfPanel grew to 430 px).
-    // boost01: + GPU BOOST after HEAT WARNING (25 rows, 27 panel lines: PerfPanel 446 px).
-    // w02: + WATER after GRASS (26 rows; the panel stays 27 lines: GraphicsMenu pads one hidden row less).
     enum Row : unsigned {Resolution,SunShadows,ShadowMap,CascadeCull,LampShadows,Grass,Water,EdgeMargin,Occlusion,SmallObjects,Foveation,FoveationApi,
 TextureFilter,MipBias,Sharpen,AntiAliasing,PostFx,FrameRate,SpaceWarp,XrQueue,Profiler,HeatWarning,GpuBoost,StereoTest,Teleport,Defaults,Count,
 Shadows=SunShadows,ShadowUpdate=SunShadows,GrassDistance=Grass};
     // page = -1 (X) / +1 (Y) while open; the owner (GraphicsMenu) switches pages and calls select().
     // back = B inside a submenu (update(..., bBack=true)): the owner returns to the ROOT page instead of closing.
-    struct Event {bool consume{},opened{},closed{},changed{};int adjust{};bool activate{};int page{};bool back{};int triggerStep{};}; // +1 right trigger, -1 left
+    // pulsed = SATCHEL: the buttons are released, the owner presses Select; tapped = a tap of the left menu button sends Start
+    struct Event {bool consume{},opened{},closed{},changed{};int adjust{};bool activate{};int page{};bool back{};int triggerStep{};bool pulsed{},tapped{};}; // +1 right trigger, -1 left
     bool open()const noexcept{return open_;}
     unsigned selected()const noexcept{return selected_;}
     void select(unsigned row) noexcept {selected_=row;} // A page switch restores that page's row (stick repeat state kept)
-    void invalidate() noexcept {open_=armed_=menuHeld_=suppressRelease_=releaseGuard_=false;previousButtons_=0;pressNs_=pauseUntil_=lastNs_=nextNav_=0;nav_=0;}
+    void invalidate() noexcept {open_=armed_=menuHeld_=suppressRelease_=releaseGuard_=false;previousButtons_=0;pressNs_=pauseUntil_=lastNs_=nextNav_=0;pulseAfterGuard_=false;nav_=0;}
+    // SATCHEL: close like B (physical neutral first, nothing leaks into the game), then report pulsed (pulse = false: just close).
+    void closeThenPulse(bool pulse,std::uint64_t deadlineNs) noexcept {open_=false;releaseGuard_=true;pulseAfterGuard_=pulse;pulseDeadline_=deadlineNs;nav_=0;nextNav_=0;}
+    // Open again without the hold (the game refused the row's press, the row shows why); never over the close guard or a held menu button. Held buttons give no edge, held triggers stay latched.
+    bool reopen() noexcept {if(open_||!armed_||releaseGuard_||menuHeld_)return false;open_=true;nav_=0;nextNav_=0;triggerHeld_={true,true};return true;}
     // rows = row count of the current page (GRAPHICS = Count); up/down wrap at it.
     // bBack = the current page is a submenu, so B means BACK (out.back) and the menu stays open.
     Event update(ControllerSample& sample,unsigned rows=Count,bool bBack=false) noexcept {
@@ -48,7 +51,8 @@ Shadows=SunShadows,ShadowUpdate=SunShadows,GrassDistance=Grass};
             for(float v:sample.sticks)neutral=neutral&&std::abs(v)<=.15f;
             for(float v:sample.triggers)neutral=neutral&&v<=.15f;
             for(unsigned h=0;h<2;++h)if(int(h)!=ignoreGrip_)neutral=neutral&&sample.grips[h]<=.15f;
-            if(neutral){releaseGuard_=menuHeld_=suppressRelease_=false;pressNs_=pauseUntil_=0;}
+            if(neutral){releaseGuard_=menuHeld_=suppressRelease_=false;pressNs_=pauseUntil_=0;
+                if(pulseAfterGuard_){if(now<=pulseDeadline_)out.pulsed=true;pulseAfterGuard_=false;}}
             out.consume=true;return out;
         }
         if(!armed_){if(!menu&&!(buttons&(PadA|PadB)))armed_=true;return out;}
@@ -64,7 +68,7 @@ Shadows=SunShadows,ShadowUpdate=SunShadows,GrassDistance=Grass};
         }
         if(menuHeld_&&!menu){
             menuHeld_=false;
-            if(!suppressRelease_&&!open_)pauseUntil_=now+120'000'000;
+            if(!suppressRelease_&&!open_){pauseUntil_=now+120'000'000;out.tapped=true;}
             suppressRelease_=false;
             // Do not activate a row using the button that opened the menu.
             if(open_){out.consume=true;return out;}
@@ -78,7 +82,7 @@ Shadows=SunShadows,ShadowUpdate=SunShadows,GrassDistance=Grass};
         // Either stick navigates (the stronger one): a hand holding a weapon can leave its stick alone.
         const bool right=std::abs(sample.sticks[2])+std::abs(sample.sticks[3])>std::abs(sample.sticks[0])+std::abs(sample.sticks[1]);
         const float x=sample.sticks[right?2:0],y=sample.sticks[right?3:1];
-        // (user: values changed by accident while scrolling down): sideways only on a clear push (|x| >= .8 and > 2 |y|)
+        // Values must not change by accident while scrolling down: sideways only on a clear push (|x| >= .8 and > 2 |y|)
         // GraphicsMenu drops it on the settings pages anyway (A / trigger cycle the value there).
         const int direction=std::abs(y)>=.55f&&std::abs(y)>=std::abs(x)?(y>0?1:2):std::abs(x)>=.8f&&std::abs(x)>2.f*std::abs(y)?(x>0?3:4):0;
         if(!direction){nav_=0;nextNav_=0;}

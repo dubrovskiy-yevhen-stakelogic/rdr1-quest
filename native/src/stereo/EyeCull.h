@@ -51,6 +51,7 @@
 #include "S02Levers.h"
 #include "SmallObjectCull.h"
 #include "EyeCullTape.h" // EYE CULL B: per-draw pad (TLS scope, tape header, left/right drop counters)
+#include "vr/VrCutscene.h" // cullExempt: no eye cull in stereo cutscenes (excluded.cutscene)
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -129,8 +130,8 @@ inline constexpr unsigned distBuckets=5;inline constexpr float distEdges[distBuc
 inline unsigned distBucket(float metres) noexcept {unsigned b=0;while(b<distBuckets-1&&!(metres<distEdges[b]))++b;return b;}
 
 // ---- runtime (render thread) ----
-enum Exclusion : unsigned {Creature,Instance,Near,NoPlan,ExclusionCount};
-inline constexpr const char* exclusionNames[ExclusionCount]{"creature","instance","near","noPlan"};
+enum Exclusion : unsigned {Creature,Instance,Near,NoPlan,Cutscene,ExclusionCount};
+inline constexpr const char* exclusionNames[ExclusionCount]{"creature","instance","near","noPlan","cutscene"};
 inline constexpr unsigned stageCount=3;               // stockDepth, stockColor, stereoPass
 // [render] > 0 while the RetailSceneBoundary consumer (the stereo pass) runs.
 inline unsigned stereoPassDepth{};
@@ -207,6 +208,8 @@ template<class Provider> Decision test(const SmallObjectCull::Token& t,const voi
     const auto* views=provider();
     if(!views||!views->ready()){stats.excluded[x][NoPlan].fetch_add(1,std::memory_order_relaxed);return none;}
     const auto& plan=views->plan();
+    // Stereo cutscene / scripted shot: animated props carry their ROOT matrix sphere, not where they are drawn -> never culled there
+    if(::rdrvr::vr::cutscene::cullExempt(plan.actorGuid)){stats.excluded[x][Cutscene].fetch_add(1,std::memory_order_relaxed);return none;}
     const std::uint64_t planKey=(plan.sceneId*0x9E3779B97F4A7C15ull)^plan.tracking.frameId,scene=s02::sceneSerial.load(std::memory_order_relaxed);
     if(!f.open||scene!=f.scene||planKey!=f.planKey)beginFrame(plan,planKey,scene);
     if(!f.planes.valid){++f.excluded[x][NoPlan];return none;}

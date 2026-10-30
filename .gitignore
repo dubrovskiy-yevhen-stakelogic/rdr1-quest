@@ -33,7 +33,7 @@
 *.pem
 *.key
 
-# User inputs, archives and diagnostics
+# Local inputs, archives and diagnostics
 *.zip
 *.7z
 *.rar

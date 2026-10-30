@@ -47,6 +47,8 @@
 #include "NativeOcclusionVertexCapture.h"
 #include "NativeFramePacing.h"
 #include "runtime/GraphicsSettings.h"
+#include "diagnostics/PerfRecorder.h" // PERF RECORD: main-thread frame times, profile folder
+#include "runtime/EngineFrameCount.h" // REGRID: engine main updates for FramePacer::pace
 #include "GraphicsDrawPolicy.h"
 #include "ShadowGrassQuality.h"
 #include "PostFxSkip.h"         // STEREO TEST 16 SKIP POSTFX
@@ -59,6 +61,7 @@ static_assert(rdrvr::runtime::GraphicsSettings::s02MaskBits==rdrvr::engine::s02:
 #include "EyeCull.h"             // EYE CULL A: per-eye count of MAIN objects, skip outside both eyes, bodyDraw
 #include "CategoryAblation.h"    // GEOMETRY COST PROFILER (debug.rdrvr.ablate): draw categories suppressed in turn, report graphics.ablation
 #include "CreatureLod.h"         // CREATURE LOD (debug.rdrvr.lod.creature): NPC / horse authored LODs by distance, report graphics.creatureLod
+#include "ClothUpdateGate.h"     // CLOTH GATE / RING (debug.rdrvr.cloth.update / .radius / .ring): duplicated horse tail levers, report graphics.clothGate / clothRing
 #include "StaticLod.h"           // STATIC LOD (debug.rdrvr.lod.static): distant statics draw their authored lo drawable, report graphics.staticLod
 #include "TerrainLod.h"          // TERRAIN LOD (debug.rdrvr.lod.terrain, default off): terrain quadtree split distance, report graphics.terrainLod
 #include "LowFreqRate.h"         // LOW-FREQUENCY PASSES (debug.rdrvr.lowfreq): per-pipeline coarse fragment rate (MAX with the foveation map), report graphics.lowFreq
@@ -79,6 +82,8 @@ static_assert(rdrvr::runtime::GraphicsSettings::s02MaskBits==rdrvr::engine::s02:
 #include "vr/VrCover.h"          // AUTO COVER: install (COVER input filter + SetAttachRequest GOT hooks), report vr.cover
 #include "vr/VrBody.h"           // BODY: install, report vr.body
 #include "vr/VrCutscene.h"       // CUTSCENES: report vr.cutscene
+#include "vr/VrCutsceneSteady.h" // CUTSCENE PROPS / LIGHTS / SUN: report vr.cutscene.steady
+#include "vr/VrIdleCam.h"        // IDLE CAMERA: input timers + channel guard (no 2D when standing still), report vr.idleCam
 #include "vr/VrArc.h"            // ARC: reports vr.arc / vr.probes
 #include "vr/VrTeleportLoco.h"   // TELEPORT locomotion: install (prints / GOT words), report vr.tploco
 #include "vr/VrLasso.h"          // LASSO: graded install (prints / GOT words / H1-H3), report vr.lasso
@@ -87,6 +92,7 @@ static_assert(rdrvr::runtime::GraphicsSettings::s02MaskBits==rdrvr::engine::s02:
 #include "vr/VrInputRec.h"       // INPUT RECORD / REPLAY: files dir (rdrvr/), reports vr.inputRec / vr.inputReplay
 #include "vr/HandsPass.h"        // HANDS: report vr.hands
 #include "vr/TaaPass.h"          // TAA: report vr.taa
+#include "vr/ScopePass.h"        // SNIPER SCOPE: report vr.scope
 #include "vr/VrHud.h"            // HUD: optional coverage alpha on the HUD draw flushes, report vr.hud
 #include "vr/VrCheats.h"         // CHEATS: CHEATS page rows + main-thread engine calls, report vr.cheats
 #endif
@@ -366,6 +372,7 @@ void gameConfigureHudScreenViewport(std::uintptr_t) noexcept;std::string gameHud
 std::string gameEyeWaterReport();
 void gameConfigureSubtitles(std::uintptr_t,void (*)(void*,bool)) noexcept;std::string gameSubtitlesReport();
 void gameConfigureWaterQuery(std::uintptr_t) noexcept;
+void gameConfigureGunUp(std::uintptr_t) noexcept;
 void gameConfigureCutsceneActors(std::uintptr_t,std::uintptr_t,std::uintptr_t,const char* (*)(std::uintptr_t,int),std::uintptr_t,std::uintptr_t) noexcept;std::string gameCutsceneActorNames();
 #endif
 namespace {
@@ -890,6 +897,8 @@ void observeReticleUi(void*,void* object,bool complete){gameObserveReticleUi(obj
 void paintReticleUi(void* object){reticleUiBoundary.paint(object);}
 ProjectileLaunchBoundary projectileLaunchBoundary;std::atomic<bool> projectileLaunchInterposed{};
 void observeProjectileLaunch(void*,const ProjectileLaunchCall& call,const WeaponFireScope& scope,bool complete){gameObserveProjectileLaunch(call,scope,complete,now());}
+bool adjustProjectileLaunch(const ProjectileLaunchCall& call,const WeaponFireScope& scope,WeaponNativeMatrix& world,AimNativeVector& velocity,AimNativeVector& muzzle){
+    return gameAdjustProjectileLaunch(call,scope,world,velocity,muzzle,now());} // THROWABLE: the substituted launch of a VR throw
 __attribute__((noinline)) void launchProjectile(void* projectile,const WeaponNativeMatrix* world,int weaponType,const AimNativeVector* velocity,
         std::uint32_t actorGuid,const AimNativeVector* muzzle,bool nativeFlag,bool finalFlag,float scalar,const AimNativeVector* delta){
     const auto caller=reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
@@ -938,7 +947,7 @@ bool holsterContext(void*,std::uintptr_t player,std::uintptr_t actor,std::uint32
     LocalWeapon p{};p.player=player;p.actor=actor;p.actorGuid=guid;WeaponContext c{};
     if(!WeaponContextReader(holsterOwnerApi).inspectPlayer(p,c))return false;
     out.alive=c.alive;out.controlDisabled=c.controlDisabled;out.deadEye=c.deadEye;out.riding=c.riding;out.ridingVehicle=c.ridingVehicle;
-    out.vehicleTransition=c.vehicleTransition;out.duel=c.duel;out.mountedWeapon=c.mountedWeapon;out.mountingHorse=c.mountingHorse;
+    out.vehicleTransition=c.vehicleTransition;out.duel=c.duel;out.duelRaw=c.duelRaw;out.mountedWeapon=c.mountedWeapon;out.mountingHorse=c.mountingHorse;
     out.blindFiring=c.blindFiring;out.cover=c.cover;out.linkedAnimation=c.linkedAnimation;out.usingGringo=c.usingGringo;return true;
 }
 // sagShellDerived::UpdateInputs (GOT 0x2e499c0). The original runs first and unchanged; only the call from
@@ -952,9 +961,11 @@ __attribute__((noinline)) void nativeUpdateInputs(void* self) noexcept {
     const auto caller=reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
     nativeUpdateInputsOriginal(self);
     const bool qualified=caller==engineBase+teleport::updateInputsReturnOffset;
+    if(qualified)vr::idlecam::frame(vr::nowNs()); // IDLE CAMERA: InputTracker::Update just ran in the original, the script step comes later
     teleport::gameFrame(qualified);
     vr::mainthread::run(qualified,vr::nowNs()); // Holsters (and cheats) on the engine main thread
     gameclock::gameFrame(qualified); // Game clock (sagTimeOfDayManager): debug.rdrvr.clock / clock.freeze
+    if(qualified){::rdrvr::runtime::engineMainFrames.fetch_add(1,std::memory_order_relaxed);diagnostics::perfrec::mainFrame();} // REGRID + PERF RECORD
 }
 PipelinePassHashMemo::Original nativePassHash{};
 using DynamicLayoutFn=bool(*)(void*,const void*,const void*);
@@ -1037,6 +1048,12 @@ __attribute__((noinline)) void ablationModelDraw54(const void* model,const void*
     originalAblationModel54(model,group,bucket,flags);
 }
 #endif
+// SMALL OBJECTS skips nothing in a stereo cutscene / scripted shot (vr/VrCutscene.h cullExempt; the skip path only).
+static bool smallSkipUndone() noexcept {
+    const auto* views=gameEyeViewports();
+    if(!views||!views->ready()||!::rdrvr::vr::cutscene::cullExempt(views->plan().actorGuid))return false;
+    ::rdrvr::vr::cutscene::cullKept.fetch_add(1,std::memory_order_relaxed);return true;
+}
 __attribute__((noinline)) void bodyDraw(void* container,const void* info,int commands,int instance,float fade,unsigned flags,unsigned extra){
     const auto caller=reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
     const bool pinned=caller==engineBase+bodyOpaqueReturnOffset||caller==engineBase+bodyAlphaReturnOffset||
@@ -1051,7 +1068,7 @@ __attribute__((noinline)) void bodyDraw(void* container,const void* info,int com
     // stages before any other draw hook sees them; end() runs for every begin().
     const auto smallToken=smallObjectCull.begin(container,info,pinned);
     struct SmallEnd{const SmallObjectCull::Token& token;~SmallEnd(){smallObjectCull.end(token);}} smallEnd{smallToken};
-    if(smallToken.skip)return;
+    if(smallToken.skip&&!smallSkipUndone())return;
     const auto eyeCull=eyecull::decide(smallToken,info,instance,gameEyeViewports); // EYE CULL A (EyeCull.h): count per eye; lever bit 0x400 skips outside both
     if(eyeCull.skip)return;
     const eyecull::tape::Scope eyeCullPad(eyeCull.pad,eyeCull.scoped); // EYE CULL B: per-eye pad of this object's draws (EyeCullTape.h)
@@ -1218,7 +1235,7 @@ void closeHudClearAlphaDrop() noexcept {
 }
 __attribute__((noinline)) void hudPixBegin(unsigned color,const char* name){
     originalPixBegin(color,name);
-    // (perf session 3S profile): the return-address compare first - the thread_local read is a dynamic TLS resolve per draw
+    // The return-address compare first: the thread_local read is a dynamic TLS resolve per draw
     if(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0))==engineBase+clearAlphaBeginReturnOffset&&!hudClearAlphaDrop&&
        postfx::ready.load(std::memory_order_relaxed)&&::rdrvr::vr::hud::takeClearAlpha()){
         hudClearAlphaDrop=true;hudClearAlphaBefore=postfx::threadDropped;++postfx::threadScopes;postfx::liveScopes.fetch_add(1,std::memory_order_relaxed);}
@@ -1252,8 +1269,8 @@ bool radarFixScale(float& sx,float& sy) noexcept {
     static unsigned calls=0;static bool lever=true;
     if((calls++&255u)==0){char v[PROP_VALUE_MAX]{};lever=!(__system_property_get("debug.rdrvr.vr.hud.radarfix",v)>0&&v[0]=='0');}
     std::int32_t d[2]{},g[2]{};
-    // (user: the map was sometimes squashed, then fine): no hud::active() gate - frames outside the VR HUD interval (transitions
-    // the post-cutscene delay) drew the radar unscaled. The device / virtual size ratio alone decides (equal sizes = no scaling).
+    // No hud::active() gate: frames outside the VR HUD interval (transitions, the post-cutscene delay) would draw the radar unscaled and
+    // squashed. The device / virtual size ratio alone decides (equal sizes = no scaling).
     if(!lever||!readMemory(nullptr,engineBase+deviceWidthOffset,d,sizeof d)||!readMemory(nullptr,engineBase+deviceGlobalWidthOffset,g,sizeof g)||
        g[0]<64||g[1]<64||d[0]<64||d[1]<64){radarFixSkipped.fetch_add(1,std::memory_order_relaxed);return false;}
     radarFixDims[0].store(d[0],std::memory_order_relaxed);radarFixDims[1].store(d[1],std::memory_order_relaxed);
@@ -1261,7 +1278,7 @@ bool radarFixScale(float& sx,float& sy) noexcept {
     sx=float(d[0])/float(g[0]);sy=float(d[1])/float(g[1]);
     return sx>.25f&&sx<8.f&&sy>.25f&&sy<8.f&&(std::fabs(sx-1.f)>1e-3f||std::fabs(sy-1.f)>1e-3f);
 }
-// TILES INDOORS (user: inside buildings the minimap went grey): the game's script hides the radar map tiles indoors
+// TILES INDOORS: the game's script hides the radar map tiles indoors
 // (hudScript::SetRadarTilesVisible(false) -> CRadar::bTilesVisible, copied to bTilesVisibleDraw 0x2f76277 in CRadar::PerformDMZ);
 // DrawRadar reads bTilesVisibleDraw after this SetWindow (@0x2a1ab58). Set to 1 here = the town map stays visible indoors (the
 // special interior maps, radar mode 1 / 3, take their own branch). debug.rdrvr.vr.hud.tiles 0 = the stock behaviour.
@@ -1368,11 +1385,33 @@ __attribute__((noinline)) int ptfxCullEffect(void* rule,void* inst){
 inline constexpr std::uintptr_t touchGetViewportReturnOffset=0x2b2bcb0;
 inline constexpr std::array<unsigned char,4> touchGetViewportCall{205,77,5,148};
 std::atomic<std::uint64_t> touchEyeViewports{};std::atomic<bool> touchHooked{};
+// LETTERBOX (cutscene subtitles in VR): rage::LetterboxManager::Render (0x2a6e928; only caller letterboxProxy::Draw, a HUD
+// proxy) draws the cinematic bars with rage::DrawBlackBox (0x2a6e7a8, JUMP_SLOT 0x2e5faf8; its only three calls @0x2a6eb00 /
+// 0x2a6eb58 / 0x2a6eb74) sized from the device = the locked 1680x1760 VR HUD target (aspect < 16:9 -> 407 px bars over the top
+// of the Flash area): the black rectangles on the HUD panel in stereo cutscenes. Inside a VR HUD interval (hud::active) those
+// draws are dropped; the manager's fade state still runs. debug.rdrvr.vr.hud.letterbox 1 = keep the bars.
+inline constexpr std::uintptr_t blackBoxOffset=0x2a6e7a8,blackBoxGotOffset=0x2e5faf8;
+inline constexpr std::array<std::uintptr_t,3> blackBoxReturnOffsets{0x2a6eb04,0x2a6eb5c,0x2a6eb78};
+inline constexpr std::array<unsigned char,16> blackBoxFingerprint{
+#include "gamecode/TraceEntry_2a6e7a8_16_8d.inc"
+};
+inline constexpr std::array<std::array<unsigned char,4>,3> blackBoxCalls{{{140,255,8,148},{118,255,8,148},{111,255,8,148}}};
+using BlackBoxFn=void(*)(float,float,float,float);
+BlackBoxFn originalBlackBox{};std::atomic<std::uint64_t> blackBoxDropped{},blackBoxPassed{};std::atomic<bool> blackBoxHooked{};
+__attribute__((noinline)) void hudDrawBlackBox(float x0,float y0,float x1,float y1){
+    const auto ret=reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
+    static unsigned calls=0;static bool keep=false;
+    if((calls++&255u)==0){char v[PROP_VALUE_MAX]{};keep=__system_property_get("debug.rdrvr.vr.hud.letterbox",v)>0&&v[0]=='1';}
+    if(!keep&&::rdrvr::vr::hud::active()&&(ret==engineBase+blackBoxReturnOffsets[0]||ret==engineBase+blackBoxReturnOffsets[1]||ret==engineBase+blackBoxReturnOffsets[2])){
+        blackBoxDropped.fetch_add(1,std::memory_order_relaxed);return;}
+    blackBoxPassed.fetch_add(1,std::memory_order_relaxed);originalBlackBox(x0,y0,x1,y1);
+}
 std::string radarFixReport(){
     return "{\"hooked\":"+std::string(radarFixHooked.load()?"true":"false")+",\"windows\":"+std::to_string(radarFixWindows.load())+",\"scissors\":"+
         std::to_string(radarFixScissors.load())+",\"skipped\":"+std::to_string(radarFixSkipped.load())+",\"device\":["+std::to_string(radarFixDims[0].load())+","+
         std::to_string(radarFixDims[1].load())+"],\"global\":["+std::to_string(radarFixDims[2].load())+","+std::to_string(radarFixDims[3].load())+"],\"mapHooked\":"+
-        std::string(radarMapHooked.load()?"true":"false")+",\"mapRgbOnly\":"+std::to_string(radarMapRgbOnly.load())+",\"quadHooked\":"+std::string(radarQuadHooked.load()?"true":"false")+",\"interiorRgbOnly\":"+std::to_string(radarInteriorRgbOnly.load())+",\"tilesForced\":"+std::to_string(radarTilesForced.load())+"}";
+        std::string(radarMapHooked.load()?"true":"false")+",\"mapRgbOnly\":"+std::to_string(radarMapRgbOnly.load())+",\"quadHooked\":"+std::string(radarQuadHooked.load()?"true":"false")+",\"interiorRgbOnly\":"+std::to_string(radarInteriorRgbOnly.load())+",\"tilesForced\":"+std::to_string(radarTilesForced.load())+
+        ",\"letterbox\":{\"hooked\":"+std::string(blackBoxHooked.load()?"true":"false")+",\"dropped\":"+std::to_string(blackBoxDropped.load())+",\"passed\":"+std::to_string(blackBoxPassed.load())+"}}";
 }
 #endif
 using Scene=CameraCallBoundary::Scene;
@@ -1623,9 +1662,77 @@ bool (*uiMenuActiveNative)(){};bool (*uiCutscenePlayingNative)(){};
 // with an empty menu stack is not a menu (the camera context decides). Counters per answer in vr.uiMenu.
 std::atomic<std::uint64_t> uiMenuCalls{},uiMenuNative{},uiMenuStack{},uiMenuHudOnly{},uiMenuCutscene{},uiMenuStackUnread{};
 std::atomic<int> uiMenuLever{1},uiMenuLastStack{-1};
+// GAME MENU (vr/VrGameMenu.h): the game's own pause scene; SATCHEL (vr/VrSatchel.h): its SatchelMenu. Runs where IsMenuActive runs (the NativeUiContext owner = the
+// engine main thread, the UI singleton already checked ready). rage::UIManager::GetUIObject 0x1a61314 (null while the UI reboots), then the same vtable +0xe0 IsVisible(true) the game
+// calls in ShowPauseMenu / rdrHudScene::HandleInputs. An open scene is Menu even when IsMenuActive says no or a cutscene plays, so it is never invisible behind the stereo world
+// (forcing: only after the mod sent the press this session and the scene was seen hidden).
+void* (*uiGetObjectNative)(void*,const char*){};
+static bool uiObjectVisible(std::uintptr_t ui,const char* name) noexcept {
+    void* const object=uiGetObjectNative(reinterpret_cast<void*>(ui),name);if(!object)return false;
+    using IsVisible=bool(*)(void*,bool);
+    return (*reinterpret_cast<IsVisible* const*>(object))[0xe0/sizeof(void*)](object,true);
+}
+// The gates of rdrHudScene::HandleInputs that are cheap to read, for the report and the row's refusal text: rdrSatchel::IsEnabled = vtable +0x60 (the game's call at 0x29fa598), HudSceneOffline visible.
+static void uiSatchelProbe(std::uintptr_t ui) noexcept {
+    namespace sa=::rdrvr::vr::satchel;
+    void* const object=uiGetObjectNative(reinterpret_cast<void*>(ui),sa::sceneName);
+    if(!object)sa::enabled.store(-1,std::memory_order_relaxed);
+    else{using IsEnabled=bool(*)(void*,bool);sa::enabled.store((*reinterpret_cast<IsEnabled* const*>(object))[0x60/sizeof(void*)](object,false)?1:0,std::memory_order_relaxed);}
+    void* const offline=uiGetObjectNative(reinterpret_cast<void*>(ui),"HudSceneOffline");
+    sa::hudOffline.store(offline?(uiObjectVisible(ui,"HudSceneOffline")?1:0):-1,std::memory_order_relaxed);
+    std::uintptr_t input{};unsigned char touch{};
+    sa::touchMode.store(readMemory(nullptr,engineBase+sa::gameActionInstanceOffset,&input,sizeof input)&&input&&readMemory(nullptr,input,&input,sizeof input)&&input&&readMemory(nullptr,input+0x37,&touch,1)?int(touch):-1,std::memory_order_relaxed);
+}
+using IsShowingHelpFn=bool(*)();static IsShowingHelpFn nativeIsShowingHelp{}; // hudScript::IsShowingHelp (vr/VrGameMsg.h)
+// SATCHEL evidence (vr/VrSatchel.h). Main thread, while an accepted use runs. Report only.
+static void uiSatchelUsePoll(std::uint64_t now) noexcept {
+    namespace sa=::rdrvr::vr::satchel;
+    std::uintptr_t hud{},item{};std::int32_t useState{-1},count{-1};
+    if(!readMemory(nullptr,engineBase+sa::hudInstanceOffset,&hud,sizeof hud)||!hud||!readMemory(nullptr,hud+sa::hudUseItemField,&item,sizeof item))return;
+    readMemory(nullptr,hud+sa::hudUseStateField,&useState,sizeof useState);
+    if(const auto tracked=sa::usePointer.load(std::memory_order_relaxed))readMemory(nullptr,tracked+sa::itemCountField,&count,sizeof count);
+    sa::useStep(item,useState,count,now);
+}
+static bool uiSatchelForced{}; // The last answer of uiGameMenuOpen came from the satchel (which counter a forced answer goes to)
+static bool uiGameMenuOpen() noexcept {
+    namespace gm=::rdrvr::vr::gamemenu;namespace sa=::rdrvr::vr::satchel;
+    if(!uiGetObjectNative)return false;
+    static unsigned calls=0;static bool open=false,satchel=false;
+    const unsigned call=calls++;
+    if((call&255u)==0){char v[PROP_VALUE_MAX]{};
+        gm::force.store(__system_property_get("debug.rdrvr.vr.gamemenu.force",v)>0&&v[0]=='0'?0:1,std::memory_order_relaxed);
+        sa::lever.store(__system_property_get("debug.rdrvr.vr.satchel",v)>0&&v[0]=='0'?0:1,std::memory_order_relaxed);}
+    const auto answer=[&]{uiSatchelForced=sa::forcing(satchel,gm::force.load(std::memory_order_relaxed));return gm::forcing(open)||uiSatchelForced;};
+    if(call&3u)return answer();
+    std::uintptr_t ui{};
+    if(!readMemory(nullptr,engineBase+uiSingletonOffset,&ui,sizeof ui)||!ui)return false;
+    const bool pauseScene=uiObjectVisible(ui,"PauseMenuScene");
+    open=pauseScene||uiObjectVisible(ui,"Cutscenes_Paused");
+    satchel=uiObjectVisible(ui,sa::sceneName);
+    const auto now=::rdrvr::vr::nowNs();
+    if((call&1023u)==0||sa::state.load(std::memory_order_relaxed)==sa::WaitOpen)uiSatchelProbe(ui);
+    gm::step(open);sa::step(satchel,pauseScene,now);
+    if(sa::useActive.load(std::memory_order_relaxed))uiSatchelUsePoll(now);
+    if(nativeIsShowingHelp&&::rdrvr::vr::gamemsg::wantBox.load(std::memory_order_relaxed))::rdrvr::vr::gamemsg::noteBox(nativeIsShowingHelp()); // Is the game's own HelpBox up with the notice? Report only
+    { // The re-arm into the pause menu / satchel and back to the world must not wait for a hand that holds a VR weapon
+        static std::uint64_t lastOpenNs=0;if(open||satchel)lastOpenNs=now;
+        runtime::padArmIgnoreGrips.store(open||satchel||(lastOpenNs&&now-lastOpenNs<gm::armGraceNs),std::memory_order_relaxed);
+    }
+    if(open&&!gm::armed.load(std::memory_order_relaxed))gm::stuckAtBoot.fetch_add(1,std::memory_order_relaxed);
+    if(satchel&&!sa::armed.load(std::memory_order_relaxed))sa::stuckAtBoot.fetch_add(1,std::memory_order_relaxed);
+    return answer();
+}
+static bool uiCutscenePlayingChecked() noexcept {
+    std::uintptr_t manager{},table{};
+    return uiCutscenePlayingNative&&readMemory(nullptr,engineBase+uiCutsceneSingletonOffset,&manager,sizeof manager)&&manager&&readMemory(nullptr,manager,&table,sizeof table)&&
+        (table==engineBase+uiCutsceneTableOffset||table==engineBase+uiCutsceneSingletonTableOffset)&&uiCutscenePlayingNative();
+}
 bool uiMenuUnlessCutscene(){
     uiMenuCalls.fetch_add(1,std::memory_order_relaxed);
-    if(!uiMenuActiveNative||!uiMenuActiveNative())return false;
+    const bool gameMenuOpen=uiGameMenuOpen();
+    if(!uiMenuActiveNative||!uiMenuActiveNative()){
+        if(gameMenuOpen)(uiSatchelForced?::rdrvr::vr::satchel::forcedNative: ::rdrvr::vr::gamemenu::forcedNative).fetch_add(1,std::memory_order_relaxed);
+        return gameMenuOpen;}
     uiMenuNative.fetch_add(1,std::memory_order_relaxed);
     static unsigned calls=0;
     if((calls++&255u)==0){char v[PROP_VALUE_MAX]{};const int n=__system_property_get("debug.rdrvr.vr.cutscene.menu",v);
@@ -1639,14 +1746,117 @@ bool uiMenuUnlessCutscene(){
     else if(depth>=1)uiMenuStack.fetch_add(1,std::memory_order_relaxed);
     else uiMenuHudOnly.fetch_add(1,std::memory_order_relaxed);
     if(lever==0)return true;
-    if(uiCutscenePlayingNative){
-        std::uintptr_t manager{},table{};
-        if(readMemory(nullptr,engineBase+uiCutsceneSingletonOffset,&manager,sizeof manager)&&manager&&readMemory(nullptr,manager,&table,sizeof table)&&
-           (table==engineBase+uiCutsceneTableOffset||table==engineBase+uiCutsceneSingletonTableOffset)&&uiCutscenePlayingNative()){
-            uiMenuCutscene.fetch_add(1,std::memory_order_relaxed);return false;}
-    }
+    if(uiCutscenePlayingChecked()){
+        if(gameMenuOpen){(uiSatchelForced?::rdrvr::vr::satchel::forcedCutscene: ::rdrvr::vr::gamemenu::forcedCutscene).fetch_add(1,std::memory_order_relaxed);return true;} // A pause over a stereo cutscene (Cutscenes_Paused) goes flat too
+        uiMenuCutscene.fetch_add(1,std::memory_order_relaxed);return false;}
+    if(gameMenuOpen)return true; // Lever 2 below must not hide an open pause scene
     if(lever>=2&&stackOk&&depth<1)return false;
     return true;
+}
+#endif
+#ifdef RDRVR_NATIVE_MENUS
+// SATCHEL evidence (vr/VrSatchel.h): what A did, read on the UI thread inside the game's own call; the game's call and result stay as they are.
+using SatchelItemUsedFn=void(*)(void*);SatchelItemUsedFn nativeSatchelItemUsed{};
+using SatchelSelectedFn=void*(*)(const void*);SatchelSelectedFn nativeSatchelSelected{};
+using SetHelpMessageFn=std::uint64_t(*)(const char*,float,bool,bool,int,bool,const char*,const char*);SetHelpMessageFn nativeSetHelpMessage{};
+static std::uintptr_t satchelHudUseItem() noexcept {
+    std::uintptr_t hud{},item{};
+    return readMemory(nullptr,engineBase+::rdrvr::vr::satchel::hudInstanceOffset,&hud,sizeof hud)&&hud&&readMemory(nullptr,hud+::rdrvr::vr::satchel::hudUseItemField,&item,sizeof item)?item:0;
+}
+__attribute__((noinline)) void vrSatchelItemUsed(void* satchel){
+    namespace sa=::rdrvr::vr::satchel;
+    const int saved=errno;
+    sa::ItemUse use{};use.ns=::rdrvr::vr::nowNs();
+    const auto self=reinterpret_cast<std::uintptr_t>(satchel);
+    std::int32_t mode{-1};unsigned char detail{},useButton{},touch{};std::uintptr_t input{};
+    if(readMemory(nullptr,self+sa::modeField,&mode,sizeof mode))use.mode=mode;
+    if(readMemory(nullptr,self+sa::detailField,&detail,1))use.detail=detail;
+    if(readMemory(nullptr,self+sa::useButtonField,&useButton,1))use.useButton=useButton;
+    // IsTouchInterfaceEnabled: the scene ignores ACCEPT while it is set
+    if(readMemory(nullptr,engineBase+sa::gameActionInstanceOffset,&input,sizeof input)&&input&&readMemory(nullptr,input,&input,sizeof input)&&input&&readMemory(nullptr,input+0x37,&touch,1))use.touch=touch;
+    const auto before=satchelHudUseItem();
+    std::uintptr_t item{};
+    if(mode>=1&&mode<=3&&nativeSatchelSelected){
+        const auto row=reinterpret_cast<std::uintptr_t>(nativeSatchelSelected(satchel));
+        std::uintptr_t type{},vtable{},slot{},name{};
+        if(row&&readMemory(nullptr,row+sa::rowItemField,&item,sizeof item)&&item&&readMemory(nullptr,item+sa::itemTypeField,&type,sizeof type)&&type){
+            char text[sizeof use.item]{};
+            if(readMemory(nullptr,type+sa::typeNameField,&name,sizeof name)&&name)for(std::size_t i=0;i+1<sizeof text&&readMemory(nullptr,name+i,&text[i],1)&&text[i];++i){}
+            sa::copyText(use.item,sizeof use.item,text);
+            // The game's own check (GetInvTypeID)
+            if(readMemory(nullptr,type,&vtable,sizeof vtable)&&vtable&&readMemory(nullptr,vtable+sa::typeIdSlot,&slot,sizeof slot)&&slot)use.typeId=reinterpret_cast<int(*)(std::uintptr_t)>(slot)(type);
+            std::int32_t count{-1};
+            if((use.typeId==1||use.typeId==2)&&readMemory(nullptr,item+sa::itemCountField,&count,sizeof count))use.count=use.countLast=count;
+        }
+    }
+    errno=saved;
+    nativeSatchelItemUsed(satchel);
+    const int after=errno;
+    use.pointer=item;
+    const auto running=satchelHudUseItem();
+    use.result=before?sa::UseBusy:mode<1||mode>3?sa::UseOtherTab:!item?sa::UseNoItem:running==item?sa::UseAccepted:sa::UseNotUsable;
+    sa::noteItemUsed(use);
+    errno=after;
+}
+// GAME MESSAGES (vr/VrGameMsg.h): the text the game is about to show, in panel glyphs. Caller's thread, the same call and thread that do RDRUIGame::AllocateMessage -> UIStringTable::GetString(key).
+using UiStringGetFn=const void*(*)(void*,const char*);static UiStringGetFn nativeUiStringGet{};
+static void gameMessageText(const char* text,bool literalText,char* out,std::size_t size) noexcept {
+    namespace ms=::rdrvr::vr::gamemsg;
+    out[0]=0;
+    ms::Cleaned got{};
+    if(literalText){
+        ms::literal.fetch_add(1,std::memory_order_relaxed);
+        got=ms::clean(text,out,size); // UTF-8: guiTextOutput::Format 0x29e1200 builds an atString with GetStringUTF8 / WideToUtf8Char, a script's string is char too
+    }else{
+        std::uintptr_t table{},wide{};
+        const auto entry=nativeUiStringGet&&readMemory(nullptr,engineBase+ms::stringTableOffset,&table,sizeof table)&&table?reinterpret_cast<std::uintptr_t>(nativeUiStringGet(reinterpret_cast<void*>(table),text)):std::uintptr_t{};
+        if(entry&&readMemory(nullptr,entry+ms::entryTextField,&wide,sizeof wide)&&wide){
+            got=ms::clean(reinterpret_cast<const char16_t*>(wide),out,size);
+            ms::decoded.fetch_add(1,std::memory_order_relaxed);
+        }else ms::missing.fetch_add(1,std::memory_order_relaxed);
+    }
+    if(got.other&&got.other>=got.latin){
+        // A language the panel cannot draw: the key's words are English
+        ms::foreign.fetch_add(1,std::memory_order_relaxed);
+        out[0]=0;
+        if(!literalText)ms::clean(text,out,size);
+    }else if(!out[0]&&!literalText)ms::clean(text,out,size);
+}
+__attribute__((noinline)) std::uint64_t vrSetHelpMessage(const char* text,float seconds,bool a,bool b,int c,bool d,const char* e,const char* f){
+    namespace ms=::rdrvr::vr::gamemsg;
+    const int saved=errno;
+    const auto now=::rdrvr::vr::nowNs();
+    ms::seen.fetch_add(1,std::memory_order_relaxed);
+    char shown[ms::textChars]{};
+    if(text&&*text){
+        if(std::strcmp(text,ms::skippedKey))gameMessageText(text,b,shown,sizeof shown);
+        else ms::skipped.fetch_add(1,std::memory_order_relaxed);
+    }
+    ::rdrvr::vr::satchel::noteHelp(text,shown,now);
+    ms::note(text,shown,seconds,now);
+    errno=saved;
+    return nativeSetHelpMessage(text,seconds,a,b,c,d,e,f);
+}
+// IDLE CAMERA (vr/VrIdleCam.h): a push of the script camera "idlecam" on the primary channel never reaches the channel. Same release of
+// the transitions as the engine's own "already on top" path; every other camera goes through unchanged.
+using SetCameraOnChannelFn=void(*)(void*,int,const void*,void*,void*);SetCameraOnChannelFn nativeSetCameraOnChannel{};
+void (*nativeReleaseTransition)(void**){};
+__attribute__((noinline)) void vrSetCameraOnChannel(void* manager,int channel,const void* camera,void* in,void* out){
+    namespace ic=vr::idlecam;
+    ic::pushes.fetch_add(1,std::memory_order_relaxed);
+    if(!channel&&camera&&ic::guarding()){
+        const int saved=errno;std::uintptr_t wrapper{};char name[sizeof ic::cameraName]{};
+        const bool idle=readMemory(nullptr,reinterpret_cast<std::uintptr_t>(camera)+ic::cameraWrapperOffset,&wrapper,sizeof wrapper)&&wrapper&&
+            readMemory(nullptr,wrapper+ic::wrapperNameOffset,name,sizeof name)&&!std::memcmp(name,ic::cameraName,sizeof name);
+        errno=saved;
+        if(idle){
+            ic::noteBlocked(vr::nowNs());
+            if(in)nativeReleaseTransition(&in);
+            if(out)nativeReleaseTransition(&out);
+            return;
+        }
+    }
+    nativeSetCameraOnChannel(manager,channel,camera,in,out);
 }
 #endif
 VisibilityCallBoundary::Original originalVisibility{};
@@ -1789,7 +1999,26 @@ __attribute__((noinline)) void shadowRenderInto(void* map,bool a,void* sun,bool 
     const shadowupdate::Request request{shadowupdate::stats.level.load(std::memory_order_relaxed),mode==stereo::testModeFreezeShadowAtlas,
         graphicsDrawPolicy.disabled(GraphicsDrawPolicy::Feature::SunShadows)&&shadowupdate::receiverRecentlyOff(postfx::sceneSerial.load(std::memory_order_relaxed))};
     ablate::Scope ablateAtlas(ablate::PSunAtlas); // Ablate: sun cascade atlas casters (one relaxed load when off)
+    ::rdrvr::vr::cssteady::noteSun(sun);
     errno=saved;shadowupdate::renderInto(map,a,sun,b,c,d,caller,request);
+}
+// CUTSCENE SHADOWS (CutsceneShadowCam.h): the camera argument of the cascade spheres and the viewport of the caster cull planes.
+__attribute__((noinline)) void shadowCalcOrtho(void* map,void* tile,void* viewport,void* out,const void* camera,const void* sun){
+    namespace cc=shadowupdate::cscam;
+    const auto caller=reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));const int saved=errno;
+    float eye[16];const void* use=camera;
+    if(shadowupdate::shadowMap(map)&&cc::eye(eye,camera,caller==engineBase+cc::calcOrthoRenderReturnOffset))use=eye;
+    errno=saved;cc::originalCalcOrtho(map,tile,viewport,out,use,sun);
+}
+__attribute__((noinline)) int shadowCullPlanes(const void* map,const void* viewport,void* planes,bool b){
+    namespace cc=shadowupdate::cscam;
+    const auto caller=reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));const int saved=errno;
+    const void* use=viewport;
+    if(caller==engineBase+cc::cullPlanesMainReturnOffset&&cc::active.load(std::memory_order_relaxed)){
+        if(const void* clone=gameCutsceneShadowCull()){use=clone;cc::stats.planeSwaps.fetch_add(1,std::memory_order_relaxed);}
+        else cc::stats.planeNoClone.fetch_add(1,std::memory_order_relaxed);
+    }
+    errno=saved;return cc::originalCullPlanes(map,use,planes,b);
 }
 __attribute__((noinline)) void shadowBeginTile(void* map,int tile,bool b){
     shadowupdate::beginTile(map,tile,b,reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)));
@@ -1913,6 +2142,7 @@ __attribute__((noinline)) void observeScene(void* renderer,void* viewport,const 
     postfx::tail::early::sceneBegin(postfx::sceneSerial.load(std::memory_order_relaxed)); // debug.rdrvr.tail every 64 scenes
     ablate::sceneBegin(stereo::gpuStagesArmed.load(std::memory_order_relaxed)); // Ablate: debug.rdrvr.ablate every 64 scenes; window schedule
     creaturelod::sceneBegin(); // CREATURE LOD: debug.rdrvr.lod.creature* at most once per second; perScene window every 64 scenes
+    clothgate::sceneBegin(); // CLOTH GATE / RING, only after debug.rdrvr.cloth.hooks 1 at boot: debug.rdrvr.cloth.* at most once per second (ring count written here)
     staticlod::sceneBegin();terrainlod::sceneBegin(); // STATIC / TERRAIN LOD: debug.rdrvr.lod.static* / lod.terrain* once per second, 1 s window
     lowfreq::sceneBegin(); // LOW-FREQUENCY PASSES: 1 s window of coarse draws per scene, property re-read (restartPending only)
     lampshadow::sceneBegin(settings.lampShadows); // LAMP SHADOWS row; debug.rdrvr.lamp* / spotcascade every 64 scenes
@@ -3173,7 +3403,7 @@ void arm(void* entry) {
                 if(weaponFireInterposed&&checkedWeapon(weaponLaunchOffset,weaponLaunchFingerprint)&&
                    checkedWeapon(projectileLaunchReturnOffset-4,projectileLaunchCallFingerprint)&&
                    checkedWeapon(projectileLaunchPreludeOffset,projectileLaunchPreludeFingerprint)){
-                    projectileLaunchBoundary.configure(reinterpret_cast<ProjectileLaunchBoundary::Original>(engineBase+weaponLaunchOffset),observeProjectileLaunch);
+                    projectileLaunchBoundary.configure(reinterpret_cast<ProjectileLaunchBoundary::Original>(engineBase+weaponLaunchOffset),observeProjectileLaunch,nullptr,adjustProjectileLaunch);
                     projectileLaunchInterposed=replacePointer(engineBase+projectileLaunchGotOffset,engineBase+weaponLaunchOffset,reinterpret_cast<std::uintptr_t>(launchProjectile));
                     if(projectileLaunchInterposed)gameConfigureProjectileLaunch({readMemory,nullptr,engineBase+projectileObjectTableOffset},true);
                 }
@@ -3479,11 +3709,15 @@ void arm(void* entry) {
                     c.inventoryTable=engineBase+weaponInventoryTableOffset; // Ammo rows use only a verified inventory component
                 }
                 vc::install(c,engineBase,checkedWeapon,cheatGot);
+                // VR DUEL (vr/VrDuelControl.h): its own prints and GOT words, any mismatch = no hook = the stock duel. debug.rdrvr.vr.duel.vr 0 = the stock route per duel.
+                ::rdrvr::vr::duelctl::install(readMemory,engineBase,[](std::uintptr_t a,std::uintptr_t e,std::uintptr_t r){try{return replacePointer(a,e,r);}catch(...){return false;}});
+                // CUTSCENE PROPS / LIGHTS / SUN (vr/VrCutsceneSteady.h): prints and GOT words, any mismatch = no hook = stock. debug.rdrvr.vr.cutscene.steady 0 = no hooks.
+                ::rdrvr::vr::cssteady::install(readMemory,engineBase,[](std::uintptr_t a,std::uintptr_t e,std::uintptr_t r){try{return replacePointer(a,e,r);}catch(...){return false;}});
                 // RAIN QUALITY: DROPS = print-checked rain quad count scaled around the
                 // early TAIL IN EYES weather call (PostFxSkip.h); DRY = GOT hook CVfxWeather::PreRender (0x2e5d838) zeroing the lights-manager
                 // wetness copy. Row appended to CHEATS (next to WEATHER); debug.rdrvr.rain 0..6 overrides it, debug.rdrvr.rainhook 0 = no hook.
                 ::rdrvr::vr::rain::install(engineBase,checkedWeapon,cheatGot,[](std::uintptr_t a,std::uintptr_t e,std::uintptr_t r){return replacePointer(a,e,r);});
-                // SAVE FIX 2: AddItem watcher (VrCheats.h); the slot must hold exactly the engine's AddItem. debug.rdrvr.vr.cheats 0 = none.
+                // AddItem watcher (VrCheats.h); the slot must hold exactly the engine's AddItem. debug.rdrvr.vr.cheats 0 = none.
                 if(!::rdrvr::vr::killed(::rdrvr::vr::Feature::Cheats)&&cheatGot(vc::addItemSlotOffset,vc::addItemOffset)){
                     vc::addItemOriginal.store(reinterpret_cast<vc::AddItemFn>(engineBase+vc::addItemOffset),std::memory_order_release);
                     if(!replacePointer(engineBase+vc::addItemSlotOffset,engineBase+vc::addItemOffset,reinterpret_cast<std::uintptr_t>(&vc::addItemHook)))
@@ -3515,13 +3749,20 @@ void arm(void* entry) {
                    checkedWeapon(uiCameraChannelUpdateOffset,uiCameraChannelUpdateFingerprint)&&
                    checkedWeapon(uiCameraTransitionUpdateOffset,uiCameraTransitionUpdateFingerprint)&&
                    checkedWeapon(uiCameraTransitionResetOffset,uiCameraTransitionResetFingerprint))
-                    camera={readMemory,nullptr,engineBase+uiCameraSingletonOffset,engineBase+uiCameraTableOffset,engineBase+uiCameraChannelTableOffset,engineBase+uiCameraSingletonTableOffset};
+                    camera={readMemory,nullptr,engineBase+uiCameraSingletonOffset,engineBase+uiCameraTableOffset,engineBase+uiCameraChannelTableOffset,engineBase+uiCameraSingletonTableOffset,
+                        engineBase+0x2d8ad30u, // camCutsceneCamera vtable (_ZTV17camCutsceneCamera 0x2d8ad20 + 0x10; slot 0 = its D1 0x26521fc)
+                        engineBase+0x2d74278u,engineBase}; // Diagnostics: camCamera vtable (_ZTV9camCamera 0x2d74268 + 0x10), the base for report offsets
                 NativeScopeApi scope{};
                 if(checkedWeapon(uiScopeActiveOffset,uiScopeActiveFingerprint)&&checkedWeapon(uiScopeSetStateOffset,uiScopeSetStateFingerprint)&&
                    checkedWeapon(uiScopePreDrawOffset,uiScopePreDrawFingerprint)&&checkedWeapon(uiScopeInitOffset,uiScopeInitFingerprint)&&
                    checkedWeapon(uiScopeConstructorOffset,uiScopeConstructorFingerprint))
                     scope={readMemory,nullptr,engineBase+uiScopeSingletonOffset,engineBase+uiScopeTableOffset,engineBase+uiScopeDisableParamOffset,engineBase+uiScopeSingletonTableOffset};
                 uiMenuActiveNative=reinterpret_cast<bool(*)()>(engineBase+uiMenuOffset);uiCutscenePlayingNative=reinterpret_cast<bool(*)()>(engineBase+uiCutsceneOffset);
+                { // GAME MENU / SATCHEL: rage::UIManager::GetUIObject (same pinned engine as the IsMenuActive print above)
+                    Mapping go{};if(mapping(engineBase+0x1a61314u,16,go)&&(go.protection&PROT_EXEC)){
+                        uiGetObjectNative=reinterpret_cast<void*(*)(void*,const char*)>(engineBase+0x1a61314u);
+                        ::rdrvr::vr::gamemenu::engineReady.store(true,std::memory_order_relaxed);}
+                }
 #ifdef RDRVR_HEAD_CAMERA
                 gameConfigureCutsceneActors(engineBase+uiCutsceneSingletonOffset,engineBase+uiCutsceneTableOffset,
                     uiCutsceneSingletonTableOffset?engineBase+uiCutsceneSingletonTableOffset:0,
@@ -3530,6 +3771,33 @@ void arm(void* entry) {
 #endif
                 gameConfigureUi({readMemory,&uiMenuUnlessCutscene,engineBase+uiSingletonOffset,engineBase+uiTableOffset,
                     reinterpret_cast<bool(*)()>(engineBase+uiCutsceneOffset),engineBase+uiCutsceneSingletonOffset,engineBase+uiCutsceneTableOffset,camera,scope,engineBase+uiSingletonTableOffset,engineBase+uiCutsceneSingletonTableOffset});
+                { // IDLE CAMERA (vr/VrIdleCam.h): each part stands alone, a failed one is visible in vr.idleCam
+                    namespace ic=vr::idlecam;Mapping tracker{};
+                    if(mapping(engineBase+ic::trackingOffset,48,tracker)&&(tracker.protection&(PROT_READ|PROT_WRITE))==(PROT_READ|PROT_WRITE))
+                        ic::tracking.store(reinterpret_cast<float*>(engineBase+ic::trackingOffset),std::memory_order_release);
+                    if(checkedWeapon(ic::setCameraOffset,ic::setCameraFingerprint)&&checkedWeapon(ic::releaseTransitionOffset,ic::releaseTransitionFingerprint)){
+                        nativeSetCameraOnChannel=reinterpret_cast<SetCameraOnChannelFn>(engineBase+ic::setCameraOffset);
+                        nativeReleaseTransition=reinterpret_cast<void(*)(void**)>(engineBase+ic::releaseTransitionOffset);
+                        ic::guardInstalled.store(replacePointer(engineBase+ic::setCameraGotOffset,engineBase+ic::setCameraOffset,reinterpret_cast<std::uintptr_t>(vrSetCameraOnChannel)),std::memory_order_relaxed);
+                    }
+                }
+                { // SATCHEL evidence (vr/VrSatchel.h): two GOT hooks, report only; each stands alone. debug.rdrvr.vr.satchel.evidence 0 = none
+                    namespace sa=vr::satchel;char v[PROP_VALUE_MAX]{};
+                    if(!(__system_property_get("debug.rdrvr.vr.satchel.evidence",v)>0&&v[0]=='0')){
+                        if(checkedWeapon(sa::itemUsedOffset,sa::itemUsedFingerprint)&&checkedWeapon(sa::selectedOffset,sa::selectedFingerprint)){
+                            nativeSatchelSelected=reinterpret_cast<SatchelSelectedFn>(engineBase+sa::selectedOffset);
+                            nativeSatchelItemUsed=reinterpret_cast<SatchelItemUsedFn>(engineBase+sa::itemUsedOffset);
+                            sa::itemUsedHook.store(replacePointer(engineBase+sa::itemUsedGotOffset,engineBase+sa::itemUsedOffset,reinterpret_cast<std::uintptr_t>(vrSatchelItemUsed)),std::memory_order_relaxed);
+                        }
+                        if(checkedWeapon(sa::helpOffset,sa::helpFingerprint)){
+                            // Each stands alone: no lookup = the key's words on the notice, no poll = boxPolls stays 0
+                            if(checkedWeapon(vr::gamemsg::stringGetOffset,vr::gamemsg::stringGetFingerprint))nativeUiStringGet=reinterpret_cast<UiStringGetFn>(engineBase+vr::gamemsg::stringGetOffset);
+                            if(checkedWeapon(vr::gamemsg::showingHelpOffset,vr::gamemsg::showingHelpFingerprint))nativeIsShowingHelp=reinterpret_cast<IsShowingHelpFn>(engineBase+vr::gamemsg::showingHelpOffset);
+                            nativeSetHelpMessage=reinterpret_cast<SetHelpMessageFn>(engineBase+sa::helpOffset);
+                            sa::helpHook.store(replacePointer(engineBase+sa::helpGotOffset,engineBase+sa::helpOffset,reinterpret_cast<std::uintptr_t>(vrSetHelpMessage)),std::memory_order_relaxed);
+                        }
+                    }
+                }
 #ifdef RDRVR_HEAD_CAMERA
                 if(camera&&checkedWeapon(turnSetOrientationOffset,turnSetOrientationFingerprint)&&
                    checkedWeapon(turnViewportOrientationOffset,turnViewportOrientationFingerprint)&&
@@ -3594,6 +3862,15 @@ void arm(void* entry) {
                             }
                         }
                         if(!pixValid)::rdrvr::vr::hud::noteClearAlphaFingerprint(false);
+                        { // LETTERBOX: DrawBlackBox JUMP_SLOT, its three LetterboxManager::Render calls only
+                            Mapping bb{};
+                            if(mapping(engineBase+blackBoxOffset,16,bb)&&(bb.protection&PROT_EXEC)&&fingerprint(engineBase+blackBoxOffset,blackBoxFingerprint)&&
+                               fingerprint(engineBase+blackBoxReturnOffsets[0]-4,blackBoxCalls[0])&&fingerprint(engineBase+blackBoxReturnOffsets[1]-4,blackBoxCalls[1])&&
+                               fingerprint(engineBase+blackBoxReturnOffsets[2]-4,blackBoxCalls[2])){
+                                originalBlackBox=reinterpret_cast<BlackBoxFn>(engineBase+blackBoxOffset);
+                                if(replacePointer(engineBase+blackBoxGotOffset,engineBase+blackBoxOffset,reinterpret_cast<std::uintptr_t>(hudDrawBlackBox)))blackBoxHooked.store(true);
+                            }
+                        }
                         // RADAR FIX: SetWindow / SetScissor JUMP_SLOTs, only DrawRadar's two calls are changed
                         Mapping rw{},rs{};
                         if(mapping(engineBase+radarSetWindowOffset,16,rw)&&(rw.protection&PROT_EXEC)&&fingerprint(engineBase+radarSetWindowOffset,radarSetWindowFingerprint)&&
@@ -3630,6 +3907,7 @@ void arm(void* entry) {
                             if(mapping(engineBase+0x29ed288u,16,sm)&&(sm.protection&PROT_EXEC)&&fingerprint(engineBase+0x29ed288u,fp))
                                 gameConfigureSubtitles(engineBase+0x4e6ed0d8u,reinterpret_cast<void(*)(void*,bool)>(engineBase+0x29ed288u));
                             {std::uintptr_t q{};if(readMemory(nullptr,engineBase+0x2e10bb0u,&q,sizeof q)&&q==engineBase+0x4e85f560u)gameConfigureWaterQuery(q);} // g_WaterQuery (GOT 0x2e10bb0)
+                            {std::uintptr_t q{};if(readMemory(nullptr,engineBase+0x2e01528u,&q,sizeof q)&&q==engineBase+0x4e7f0050u)gameConfigureGunUp(q);} // sagTargetTuning::sm_Instance (GOT 0x2e01528): +0x3c blind-fire limit
                         }
                         touchHooked.store(fingerprint(engineBase+touchGetViewportReturnOffset-4,touchGetViewportCall));
                         {
@@ -4046,6 +4324,15 @@ void arm(void* entry) {
                             if(count==std::size(routes))su::stats.hooked.store(true);
                             else while(count){const auto& route=routes[--count];if(!replacePointer(engineBase+route.slot,route.replacement,engineBase+route.original))patchFault=true;}
                         }
+                        if(su::stats.hooked.load()){ // CUTSCENE SHADOWS: pass through until a stereo cutscene publishes the eye camera
+                            namespace cc=su::cscam;
+                            cc::originalCalcOrtho=reinterpret_cast<cc::CalcOrtho>(engineBase+cc::calcOrthoOffset);
+                            cc::originalCullPlanes=reinterpret_cast<cc::CullPlanes>(engineBase+cc::cullPlanesOffset);
+                            if(code(cc::calcOrthoOffset,cc::calcOrthoFingerprint)&&code(cc::calcOrthoCallOffset,cc::calcOrthoCallFingerprint)&&code(cc::calcOrthoTailOffset,cc::calcOrthoTailFingerprint))
+                                cc::hooked.store(replacePointer(engineBase+cc::calcOrthoGotOffset,engineBase+cc::calcOrthoOffset,reinterpret_cast<std::uintptr_t>(shadowCalcOrtho)));
+                            if(code(cc::cullPlanesOffset,cc::cullPlanesFingerprint)&&code(cc::cullPlanesCallOffset,cc::cullPlanesCallFingerprint))
+                                cc::planesHooked.store(replacePointer(engineBase+cc::cullPlanesGotOffset,engineBase+cc::cullPlanesOffset,reinterpret_cast<std::uintptr_t>(shadowCullPlanes)));
+                        }
                         runtime::shadowUpdateReady.store(su::stats.hooked.load()?1:0,std::memory_order_relaxed);
                         // Indoor signal (env byte + rooms provenance) and CASCADE CULL (CS2/CS3) fingerprints
                         indoor::configure(engineBase,code,readMemory);su::configureCascadeCull(engineBase,code,readMemory);
@@ -4097,6 +4384,15 @@ void arm(void* entry) {
                             return vb::published.load(p)&&p.skel?p.skel:vb::collapseSkeleton.load(std::memory_order_relaxed);};
                         api.playerCreature=[]()->std::uintptr_t{return shadowupdate::stagger::playerCreature.load(std::memory_order_relaxed);};
                         if(creaturelod::install(api)<0)patchFault=true;
+                    }
+                    { // CLOTH GATE (ClothUpdateGate.h): FNV prints of sagClothMgr::ShouldUpdate + the UpdateCloth call site, the call word,
+                      // the GOT word, then one JUMP_SLOT (0x2e5fff0); CLOTH RING: SwapBuffers / Draw prints + 3 GLOB_DAT words + boot count 4.
+                      // Any mismatch = that lever stays off. Only debug.rdrvr.cloth.hooks 1 installs anything; otherwise native.
+                        clothgate::Api api{};api.base=engineBase;
+                        api.read=[](std::uintptr_t a,void* o,std::size_t n){return readMemory(nullptr,a,o,n);};
+                        api.exec=[](std::uintptr_t a,std::size_t n){Mapping m{};return mapping(a,n,m)&&(m.protection&PROT_EXEC)!=0;};
+                        api.replace=[](std::uintptr_t a,std::uintptr_t e,std::uintptr_t r){return replacePointer(a,e,r);};
+                        if(clothgate::install(api)<0)patchFault=true;
                     }
                     { // STEREO TEST 16 SKIP POSTFX (needs the d11 draw wrappers of nativeDrawSuppression)
                         namespace pf=postfx;
@@ -4171,8 +4467,6 @@ void arm(void* entry) {
                       // while the requested mask (debug.rdrvr.s02, else graphics.cfg s02Mask, default 0x1F) or
                       // debug.rdrvr.s02ab asks for the lever; debug.rdrvr.s02 0 = native; s02Mask=0x0 = native
                       // except LR (cfgRequest adds LR to every cfg mask; EYE CULL never joins a zero cfg mask).
-                      // asks for the lever; debug.rdrvr.s02 0 = native; s02Mask=0x0 = native except LR (forces LR into every
-                      // cfg mask; EYE CULL never joins a zero cfg mask, S02Levers.h cfgRequest).
                         const auto code=[&](std::uintptr_t offset,const auto& bytes){
                             Mapping m{};return mapping(engineBase+offset,bytes.size(),m)&&(m.protection&PROT_EXEC)&&fingerprint(engineBase+offset,bytes);};
                         const auto got=[&](std::uintptr_t slot,std::uintptr_t target){
@@ -4375,22 +4669,27 @@ std::string vrReport() {
     out+=",\"camera\":"+::rdrvr::vr::camera::rig.report();
     out+=",\"hands\":"+::rdrvr::vr::hands::report();
     out+=",\"taa\":"+::rdrvr::vr::taa::report();
+    out+=",\"scope\":"+::rdrvr::vr::scope::report();
     out+=",\"holsters\":"+::rdrvr::vr::holsters::report();
     out+=",\"weapon\":"+::rdrvr::vr::weapon::report();
     out+=",\"throw\":"+::rdrvr::vr::throwing::report();
+    out+=",\"throwable\":"+::rdrvr::vr::throwable::report();
     out+=",\"spin\":"+::rdrvr::vr::spin::report();
     out+=",\"controls\":"+::rdrvr::vr::controls::report();
     out+=",\"melee\":"+::rdrvr::vr::melee::report();
     out+=",\"cover\":"+::rdrvr::vr::cover::report();
     out+=",\"body\":"+::rdrvr::vr::bodyik::report();
     out+=",\"cheats\":"+::rdrvr::vr::cheats::report();
+    out+=",\"deadEye\":"+::rdrvr::vr::deadeye::report(); // DEAD EYE (vr/VrDeadEye.h)
     out+=",\"rain\":"+::rdrvr::vr::rain::report();
     out+=",\"arc\":"+::rdrvr::vr::arc::report();          // ARC: main side (contexts, start, tracer, commit, channels, jitter)
     out+=",\"probes\":"+::rdrvr::vr::arc::probesReport(); // ARC: main-thread probe ledger (laser, throw flight, arcs, commit, ...)
     out+=",\"tploco\":"+::rdrvr::vr::tploco::report();
     out+=",\"lasso\":"+::rdrvr::vr::lasso::report();
     out+=",\"marker\":"+::rdrvr::vr::marker::report();
-    out+=",\"cutscene\":"+::rdrvr::vr::cutscene::report();
+    {auto cutsceneReport=::rdrvr::vr::cutscene::report();
+     if(!cutsceneReport.empty()&&cutsceneReport.back()=='}'){cutsceneReport.pop_back();cutsceneReport+=",\"steady\":"+::rdrvr::vr::cssteady::report()+"}";}
+     out+=",\"cutscene\":"+cutsceneReport;}
     out+=",\"hud\":"+::rdrvr::vr::hud::report();
     { // rage::grcViewport::sm_ScreenViewport (0x4e6e14e0, a grcViewport*) width/height (+0x330/+0x334): the window
       // hudStreamingMap::DrawMap resets to (SetCurrent(screen) + ResetWindow) - the minimap interior lands there, not on the eye target
@@ -4411,6 +4710,8 @@ std::string vrReport() {
         out+=",\"uiMenu\":{\"lever\":"+std::to_string(uiMenuLever.load())+",\"calls\":"+std::to_string(uiMenuCalls.load())+",\"native\":"+std::to_string(uiMenuNative.load())+
              ",\"stack\":"+std::to_string(uiMenuStack.load())+",\"hudOnly\":"+std::to_string(uiMenuHudOnly.load())+",\"cutscene\":"+std::to_string(uiMenuCutscene.load())+
              ",\"unread\":"+std::to_string(uiMenuStackUnread.load())+",\"lastStack\":"+std::to_string(uiMenuLastStack.load())+"}";
+        out+=",\"presentationHistory\":"+gamePresentationHistory();
+        out+=",\"idleCam\":"+vr::idlecam::report(vr::nowNs());
 #endif
     }
     out+=",\"mvactors\":"+::rdrvr::vr::mvactors::report();
@@ -4420,6 +4721,8 @@ std::string vrReport() {
 }
 #endif
 std::string traceReport() {
+    static std::mutex oneAtATime; // The Java trace writer and SAVE LOG
+    std::lock_guard oneReport(oneAtATime);
     auto json=traceBaseReport();
 #ifdef RDRVR_HEAD_CAMERA
     std::ostringstream ordinary;
@@ -4484,7 +4787,7 @@ std::string traceReport() {
             for(unsigned i=0;i<postfx::tail::Count;++i){const char* x=postfx::tail::fingerprint[i].load();f<<(i?",":"")<<'"'<<postfx::tail::names[i]<<"\":\""<<(x?x:"unconfigured")<<'"';}
             f<<"},\"ptMarkers\":\""<<postfx::tail::markerFingerprint.load()<<"\",\"irReflection\":\""<<indoorrt::stats.reflectionFp.load()<<"\",\"itTree\":\""<<indoorrt::stats.treeFp.load()
              <<"\",\"ao\":\""<<indoorrt::stats.aoFp.load()<<'"';return f.str();}())
-        <<','<<colorrestart::report()<<','<<indoorrt::report()<<','<<ablate::report()<<','<<creaturelod::report()<<','<<staticlod::report()<<','<<terrainlod::report()
+        <<','<<colorrestart::report()<<','<<indoorrt::report()<<','<<ablate::report()<<','<<creaturelod::report()<<','<<clothgate::report()<<','<<staticlod::report()<<','<<terrainlod::report()
         <<','<<lowfreq::report(gameFragmentRateBridge().coarsePipelines(),runtime::foveationLiveLevel.load(std::memory_order_relaxed))<<"}"
         <<",\"stereoOcclusion\":{\"available\":"<<nativeEarlyRuntimeAvailable()<<",\"backend\":\"early-main-before-native-drawcommon\"}"<<",\"textureQuality\":"<<diagnostics::textureQualityTelemetry.report();
     json.pop_back();json+=graphics.str()+"}";
@@ -4532,7 +4835,7 @@ std::string traceReport() {
         ",\"directReads\":{\"ranges\":"+std::to_string(directReads.count())+",\"mappedBytes\":"+std::to_string(directReads.bytes())+'}'+
         ",\"replayInterposed\":"+std::string(replayInterposed?"true":"false")+
         ",\"profileInterposed\":"+std::string(profileInterposed?"true":"false")+
-        ",\"worldProfile\":"+gameWorldProfile().report()+ // cpu02: debug.rdrvr.profile.plain state, per-eye calls/filtered identity
+        ",\"worldProfile\":"+gameWorldProfile().report()+ // debug.rdrvr.profile.plain state, per-eye calls/filtered identity
         ",\"retailInterposed\":"+std::string(retailInterposed?"true":"false")+
         ",\"resolutionInterposed\":"+std::string(resolutionInterposed?"true":"false")+
         ",\"nativeResolution\":"+resolutionPolicy.report()+
@@ -4630,7 +4933,9 @@ void entry(ANativeActivity* activity,void* saved,std::size_t size) noexcept {
                  ::rdrvr::vr::vrSettings.configurePath(dir+"/vr.cfg"); // VR page settings next to graphics.cfg
                  ::rdrvr::vr::controlmap::configurePath(dir+"/controls.cfg");::rdrvr::vr::controlmap::loadOnce();
                  ::rdrvr::vr::inputrec::configureDirectory(dir); // Input-rec-*.bin recordings / replay files
-                 runtime::framePacer.setFlightFile(dir+"/flight.json");} // Flight recorder timeline every 10 s
+                 runtime::framePacer.setFlightFile(dir+"/flight.json"); // Flight recorder timeline every 10 s
+                 diagnostics::perfrec::recorder().configureDirectory(dir); // PERF RECORD: <dir>/profiles/profile-*.csv
+                 diagnostics::savedlog::configure(dir,&traceReport);} // SAVE LOG: <dir>/saved-logs/log-*.json
         }
         runtime::graphicsSettings.loadOnce();
         ::rdrvr::vr::vrSettings.loadOnce(); // Missing file = defaults; malformed = defaults + SAVE FAILED until the next save

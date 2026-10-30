@@ -1,5 +1,5 @@
 // PRIVATE actual TraceEntry composition. Included after original PFN fields.
-// These exact OBJECT8 dispatch RVAs are in saved librdr-dynsym.txt (no new scan).
+// These exact OBJECT8 dispatch RVAs come from the librdr.so dynamic symbol table.
 constexpr std::uintptr_t cameraCreateLayoutSlot=0x4e693f80;
 constexpr std::uintptr_t cameraDestroyLayoutSlot=0x4e693f88;
 constexpr std::uintptr_t cameraBindPipelineSlot=0x4e694048;

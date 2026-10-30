@@ -22,6 +22,8 @@ HEADERS = [
       ('hands_arc.vert', 'arcVertex'), ('hands_arc.frag', 'arcFragment'), ('hands_arc_marker.vert', 'arcMarkerVertex'),
       ('hands_arc_marker.frag', 'arcMarkerFragment'), ('hands_cartridge.vert', 'cartridgeVertex'),
       ('hands_cartridge.frag', 'cartridgeFragment')]),
+    ('native/src/vr/ScopeShaders.h', 'rdrvr::vr::scope::shaders', 'native/src/vr/shaders', 'sniper scope', True, True,
+     [('scope.vert', 'vertex'), ('scope.frag', 'fragment')]),
     ('native/src/vr/TaaShaders.h', 'rdrvr::vr::taa::shaders', 'native/src/vr/shaders', 'TAA', True, True,
      [('taa.vert', 'vertex'), ('taa_resolve.frag', 'resolve'), ('taa_apply.frag', 'apply'), ('taa_lite.frag', 'lite')]),
     ('native/src/runtime/SpaceWarpShaders.h', 'rdrvr::runtime::spacewarp::shaders', 'native/src/runtime/shaders', 'SpaceWarp',

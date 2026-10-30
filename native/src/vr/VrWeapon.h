@@ -32,6 +32,7 @@
 #include "VrTeleportLink.h" // TELEPORT: warp note -> the prediction's warp bridge
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -91,6 +92,7 @@ struct Config {
     // declines, calibration, rigidity repair.
     HoldMode hold{HoldMode::Auto};bool thrown{true},lasso{true},holdLast{true},calibration{true};std::uint64_t holdLastNs{300'000'000};
     bool knifeFlip{false}; // debug.rdrvr.vr.weapon.knifeflip 1 = turn HAND-held melee 180 deg (diagnostic)
+    int leftMirror{-1}; // debug.rdrvr.vr.weapon.leftmirror: auto (-1) | x / y / z = forced item symmetry axis | off = 3
     float handRollDeg{}; // debug.rdrvr.vr.weapon.handroll: extra roll of the engine thumb axis about wrist->knuckle (HAND, -90..90)
 };
 inline Config config{};
@@ -167,6 +169,7 @@ inline void startup() noexcept {
         c.thrown=!off(H::property("debug.rdrvr.vr.weapon.thrown"));c.lasso=!off(H::property("debug.rdrvr.vr.weapon.lasso"));
         c.holdLast=!off(H::property("debug.rdrvr.vr.weapon.holdlast"));c.calibration=!off(H::property("debug.rdrvr.vr.weapon.calibration"));
         c.knifeFlip=H::property("debug.rdrvr.vr.weapon.knifeflip")=="1";
+        {const auto t=H::property("debug.rdrvr.vr.weapon.leftmirror");c.leftMirror=t=="x"?0:t=="y"?1:t=="z"?2:t=="off"?3:-1;}
         {const auto t=H::property("debug.rdrvr.vr.weapon.handroll");if(!t.empty()){char* e{};const float v=std::strtof(t.c_str(),&e);
             if(e!=t.c_str()&&std::isfinite(v)&&v>=-90.f&&v<=90.f)c.handRollDeg=v;}}
     }
@@ -176,6 +179,7 @@ inline void startup() noexcept {
     H::meleeTrigger.store(H::property("debug.rdrvr.vr.weapon.meleeTrigger")=="1",std::memory_order_relaxed);
     // "native" = triggers of empty VR hands reach the game
     H::emptyTriggerNative.store(H::property("debug.rdrvr.vr.weapon.emptytrig")=="native",std::memory_order_relaxed);
+    ::rdrvr::vr::deadeye::vrAim.store(H::property("debug.rdrvr.vr.deadeye.aim")!="native",std::memory_order_relaxed);
     H::triggerSink.store(c.enabled?&noteTrigger:nullptr,std::memory_order_release);
     if(c.enabled){::rdrvr::vr::reload::startup();::rdrvr::vr::hammer::startup();} // HAMMER: after the reload (it uses the reload's gate sink)
     calib::store.ensureLoaded(); // weapons.cfg next to vr.cfg (retried lazily by the menu / owner if vr.cfg is not loaded yet)
@@ -210,6 +214,14 @@ inline std::atomic<std::uint64_t> poseCompleted{},poseCompletedNative{},aimFromP
 // it: after riding, the on-foot camera stays high and pitched down and its ray hits the ground at the player's feet. For the
 // VR-held firearm on foot, the barrel-line point is written there after each reticle Update.
 inline std::atomic<std::uint64_t> reticleTargetSet{},reticleTargetNear{},reticleTargetSkipped{};inline std::atomic<float> reticleNativeM{-1.f};
+// GUN-UP BYPASS (GameXr vrGunUpBypass): aniAim::RequestFire's gun-up (wall) and blind-fire (cover) refusals are lifted for the
+// VR-held firearm; debug.rdrvr.vr.weapon.gunup 1 = the stock checks. Report aim.gunUp: checks (frames evaluated), bypassWrites (+0x450
+// bit4 set: sweep = cause 2 swept spheres, near = cause 4 target within the weapon minimum), refusalsAvoided (a bypass write in a frame
+// with a forwarded trigger press), scriptedKept / scriptedPresses (causes 1 / 3 left stock), restores (a bit4 the hook set
+// cleared again on a frame it does not bypass - scripted cause, lever 1, no VR firearm), blind* (the cover blind-fire target push).
+inline std::atomic<std::uint64_t> gunUpChecks{},gunUpWrites{},gunUpSweep{},gunUpNear{},gunUpAvoided{},gunUpScripted{},gunUpScriptedPress{},
+    gunUpSkipped{},gunUpRestores{},blindWrites{},blindAvoided{},blindInactive{};
+inline std::atomic<int> gunUpLastCause{-1};inline std::atomic<bool> gunUpStock{};
 // NATIVE RETICLE: the game draws its free-aim dot into the HUD while sagPlayerStates+0xc (the reticle prevention mask) is 0.
 // The VR-held firearm aims with its barrel and laser, so while one is held the mod sets its own mask bit (mission scripts hide the
 // reticle the same way with 0x10000). EvaluateReticleDraw then fades the reticle UI alpha to 0; aiming and firing do not read it.
@@ -272,8 +284,12 @@ inline ContextGates gates(const E::WeaponContext& c,E::WeaponClass kind,const Co
     g.force=g.pose&&firearm(kind)&&!c.deadEye&&!c.duel&&!c.cover;
     const auto seen=deadEyeSeenNs.load(std::memory_order_relaxed);
     const bool deadEyeTail=c.deadEye||(seen&&now>=seen&&now-seen<deadEyeTailNs);
-    // Dead Eye / duel / cover / blind fire / scripted DrV launch keep the native target (they aim and fire by themselves).
-    g.aim=g.force&&!c.blindFiring&&!c.driveLaunchOverride&&!(c.trackedShot&&deadEyeTail);
+    // Duel / cover / blind fire / scripted DrV launch keep the native target (they aim and fire by themselves).
+    // DEAD EYE: the VR gun keeps aiming while Dead Eye runs (the world slows, the hand does not); the engine's own tracked shots
+    // (painted targets, +0x188 bit5) stay native. debug.rdrvr.vr.deadeye.aim native = the native Dead Eye target.
+    const bool deadEyeAim=c.deadEye&&::rdrvr::vr::deadeye::vrAim.load(std::memory_order_relaxed)&&g.pose&&firearm(kind)&&!c.duel&&!c.cover;
+    g.aim=(g.force||deadEyeAim)&&!c.blindFiring&&!c.driveLaunchOverride&&!(c.trackedShot&&deadEyeTail);
+    if(deadEyeAim&&g.aim)::rdrvr::vr::deadeye::bump(::rdrvr::vr::deadeye::vrAimFrames);
     return g;
 }
 // Per-flag counters while a weapon is in a VR hand (WeaponContext::flags() bit order) - which native field is set.
@@ -1037,6 +1053,7 @@ inline Reason preparePlan(const PoseRequest& r,E::StereoCameraPlan& plan,PlanPre
     out.total=total;out.extra=extra;out.pivot=pivot;out.shifted=shifted;out.bridged=bridged;out.kind=kind;out.latest=la;out.haveLatest=haveLatest;
     return Ok;
 }
+inline std::atomic<std::uint64_t> calibMirrored{}; // Placements of the LEFT hand with a mirrored calibration entry
 inline Reason computePlacement(const PoseRequest& r,Latest& out) noexcept {
     if(!r.owner)return NoOwner;
     const auto& o=*r.owner;const Config& cfg=config;
@@ -1060,8 +1077,16 @@ inline Reason computePlacement(const PoseRequest& r,Latest& out) noexcept {
     anchor.handBone=o.geometry.bone[side];anchor.handLocator=side;
     anchor.flipBlade=cfg.knifeFlip&&o.kind==E::WeaponClass::Melee;
     if(cfg.calibration){const auto e=calib::store.effective(int(o.kind),calib::typeKey(int(o.kind),int(o.typeId)));anchor.calibrate=e.source!=calib::SourceNone;anchor.calib=e.entry;}
+    // The calibration / offsets are right-hand values (the hand the weapon is set up in); the LEFT hand holds the mirror image: the
+    // sideways offset, the yaw and the roll change sign (the same entry used as-is turned a left-held gun / knife the wrong way).
+    Offset offset=cfg.offsets[unsigned(o.kind)%classCount];
+    if(r.hold==0){
+        offset.right=-offset.right;offset.rollDeg=-offset.rollDeg;
+        if(anchor.calibrate){auto& v=anchor.calib.v;v[calib::OffsetX]=std::int16_t(-v[calib::OffsetX]);v[calib::Yaw]=std::int16_t(-v[calib::Yaw]);
+            v[calib::Roll]=std::int16_t(-v[calib::Roll]);calibMirrored.fetch_add(1,std::memory_order_relaxed);}
+    }
     Placement placed{};
-    if(const auto why=place(frame,o.geometry,r.alt,r.scale,cfg.offsets[unsigned(o.kind)%classCount],placed,anchor))return why;
+    if(const auto why=place(frame,o.geometry,r.alt,r.scale,offset,placed,anchor))return why;
     notePlacementMode(o,anchor,placed);
     if(firearm(o.kind)&&!placed.hand&&anchor.handBone.anatomy)compareHandHold(frame,o,anchor,r,placed);
     Latest l{};l.weapon=o.weapon;l.ns=r.now;l.placement=placed;l.shift=total;l.shifted=shifted;l.hand=r.hold;
@@ -1296,8 +1321,11 @@ inline void noteFire(std::uintptr_t weapon,std::uint64_t now) noexcept {
 // thrown, lasso, rigid) whose hand the BODY IK drove are left to the engine's native attachment (the item hangs in the IK'd hand).
 struct BodyPre {std::uint64_t serial{};std::uintptr_t weapon{};bool alt{};float scale{1};Latest latest{};};
 inline thread_local BodyPre bodyPre{};
+inline thread_local BodyPre bodyPrePhantom{}; // DUAL: the same for the phantom in the other VR hand (vrBodyFrame -> vrPhantomPose)
+inline std::atomic<std::uint64_t> bodyPrePhantomComputed{},bodyPrePhantomUsed{};
 inline std::atomic<bool> lastPoseAlt{};inline std::atomic<float> lastPoseScale{0.f}; // the last weapon Update's alt flag / attachment scale
 inline std::atomic<std::uint64_t> bodyPreComputed{},bodyPreUsed{},bodyPreMismatch{},bodyPreFailed{},bodyNativeHold{};
+inline std::atomic<std::uint64_t> bodyLeftHold{},bodyLeftHoldFailed{}; // LEFT-hand item on the IK'd left attachment bone (VrBody leftHold)
 // The engine's own alt flag of the last Update (lastPoseAlt is the EFFECTIVE alt the placement used), and the
 // side-alt counters: placements whose locator side differs from the engine's flag, the attachment handed back converted to the
 // engine's locator (model * inverse(locator[native])), conversions that failed (the placement's own attachment is passed then).
@@ -1318,15 +1346,73 @@ inline bool engineAttachment(const Geometry& g,bool native,const RT::Mat4& model
     if(!rigidize(a,scale))return false;
     out=a;return true;
 }
+// LEFT hand-held item on the IK'd wrist_l_attachment (GameXr vrLeftHoldPose).
+// The engine's rigid Update multiplies the ONE authored (right-hand) locator +0x80 whatever the alt flag (weapWeapon::Update
+// 0x2543848). The rig is mirror-built (G_l = M G_r E, E a reflection ~ diag(-1,1,1)), the item mesh is not: the mirror of the right
+// hold G_r*L is G_l*(E*L*Dk), Dk = the item's own symmetry reflection (its axis closest to the right palm normal = a knife's blade
+// flat). E is measured from the hand anatomy of both attachment frames; animated items use their authored alt locator (+0x100).
+inline std::atomic<std::uint64_t> leftMirrorAxis[3]{},leftMirrorOff{},leftMirrorAuthored{},leftMirrorAssumedD{},leftMirrorFailed{};
+inline std::atomic<float> leftMirrorEvsDdeg{-1.f},leftMirrorWristMm{-1.f};
+inline bool handBasis(const HandBone& b,RT::Vec3& u,RT::Vec3& v,RT::Vec3& w) noexcept { // u wrist->knuckle, v thumb side, w = palm normal
+    if(!b.valid||!b.anatomy)return false;
+    for(unsigned i=0;i<3;++i){u[i]=b.knuckle[i]-b.wrist[i];v[i]=b.thumb[i]-b.wrist[i];}
+    if(!(len3(u)>1e-4f))return false;
+    normalize(u);const float k=dot3(v,u);for(unsigned i=0;i<3;++i)v[i]-=k*u[i];
+    if(!(len3(v)>1e-4f))return false;normalize(v);w=cross3(u,v);return std::isfinite(w[0]+w[1]+w[2]);
+}
+inline bool leftMirrorLocator(const Geometry& g,RT::Mat4& out,bool mirrorAnimated=false) noexcept {
+    if(config.leftMirror==3){leftMirrorOff.fetch_add(1,std::memory_order_relaxed);return false;}
+    // the knife is ANIMATED (flags bit5); its working right
+    // hold is G_r * locator[0] (+0xc0, weapWeapon::Update 0x25438ec csel on the alt flag) - the left gets the same mirror E*L0*Dk
+    if(g.animated&&!mirrorAnimated){leftMirrorAuthored.fetch_add(1,std::memory_order_relaxed);return false;} // animated guns: unchanged
+    const RT::Mat4& L=g.locator[0];
+    RT::Vec3 ur{},vr{},wr{},ul{},vl{},wl{};
+    const bool rOk=handBasis(g.bone[0],ur,vr,wr),lOk=handBasis(g.bone[1],ul,vl,wl);
+    float E[3][3]{{-1,0,0},{0,1,0},{0,0,1}};bool measured=false;
+    if(rOk&&lOk){float M[3][3];
+        for(unsigned r=0;r<3;++r)for(unsigned c=0;c<3;++c)M[r][c]=ul[r]*ur[c]+vl[r]*vr[c]-wl[r]*wr[c]; // u->u, v->v, w->-w (det -1)
+        float d2=0;for(unsigned r=0;r<3;++r){float p=0;for(unsigned k=0;k<3;++k)p+=M[r][k]*g.bone[0].wrist[k];const float e=p-g.bone[1].wrist[r];d2+=e*e;}
+        const float d=std::sqrt(d2);leftMirrorWristMm.store(d*1000.f,std::memory_order_relaxed);
+        if(std::isfinite(d)&&d<=.015f){std::memcpy(E,M,sizeof E);measured=true;
+            const float tr=-E[0][0]+E[1][1]+E[2][2];
+            leftMirrorEvsDdeg.store(std::acos(std::clamp((tr-1.f)*.5f,-1.f,1.f))*57.29578f,std::memory_order_relaxed);}}
+    if(!measured)leftMirrorAssumedD.fetch_add(1,std::memory_order_relaxed);
+    // the auto pick (axis closest to the palm normal) takes
+    // Z = the blade's LENGTH (locator convention as a gun: -Z along, +Y spine, +X = the blade flat) and reverses the blade. Default X.
+    // debug.rdrvr.vr.weapon.leftmirror x|y|z|off re-read every 2 s (live)
+    static std::uint64_t propNs{};const auto t0=std::uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+    if(!propNs||t0-propNs>2'000'000'000ull){propNs=t0;const auto t=::rdrvr::vr::holsters::property("debug.rdrvr.vr.weapon.leftmirror");
+        config.leftMirror=t=="x"?0:t=="y"?1:t=="z"?2:t=="off"?3:t=="auto"?4:-1;}
+    if(config.leftMirror==3){leftMirrorOff.fetch_add(1,std::memory_order_relaxed);return false;}
+    unsigned axis=0;
+    if(config.leftMirror>=0&&config.leftMirror<3)axis=unsigned(config.leftMirror);
+    else if(config.leftMirror==4){if(!rOk){leftMirrorOff.fetch_add(1,std::memory_order_relaxed);return false;}
+        float best=-1.f;for(unsigned c=0;c<3;++c){const float d=std::fabs(L[c*4]*wr[0]+L[c*4+1]*wr[1]+L[c*4+2]*wr[2]);if(d>best){best=d;axis=c;}}}
+    RT::Mat4 m=L;
+    for(unsigned c=0;c<4;++c){const float x=L[c*4],y=L[c*4+1],z=L[c*4+2]; // E*L: 3 rotation columns + translation
+        for(unsigned r=0;r<3;++r)m[c*4+r]=E[r][0]*x+E[r][1]*y+E[r][2]*z;}
+    for(unsigned r=0;r<3;++r)m[axis*4+r]=-m[axis*4+r];                    // *Dk: det back to +1
+    for(float x:m)if(!std::isfinite(x)){leftMirrorFailed.fetch_add(1,std::memory_order_relaxed);return false;}
+    leftMirrorAxis[axis].fetch_add(1,std::memory_order_relaxed);out=m;return true;
+}
 inline std::string bodyReport() {
-    char b[512];std::snprintf(b,sizeof b,"{\"preComputed\":%llu,\"preUsed\":%llu,\"preMismatch\":%llu,\"preFailed\":%llu,\"nativeHold\":%llu,"
+    char b[1024];std::snprintf(b,sizeof b,"{\"preComputed\":%llu,\"preUsed\":%llu,\"preMismatch\":%llu,\"preFailed\":%llu,\"nativeHold\":%llu,"
+        "\"leftHold\":%llu,\"leftHoldFailed\":%llu,\"calibMirrored\":%llu,\"phantomPre\":[%llu,%llu],"
         "\"lastAlt\":%s,\"lastNativeAlt\":%s,\"lastScale\":%.4f,\"sideAlt\":{\"enabled\":%s,\"frames\":%llu,\"poses\":%llu,\"converted\":%llu,\"convertFailed\":%llu}}",
         (unsigned long long)bodyPreComputed.load(),(unsigned long long)bodyPreUsed.load(),
         (unsigned long long)bodyPreMismatch.load(),(unsigned long long)bodyPreFailed.load(),(unsigned long long)bodyNativeHold.load(),
+        (unsigned long long)bodyLeftHold.load(),(unsigned long long)bodyLeftHoldFailed.load(),(unsigned long long)calibMirrored.load(),
+        (unsigned long long)bodyPrePhantomComputed.load(),(unsigned long long)bodyPrePhantomUsed.load(),
         lastPoseAlt.load()?"true":"false",lastNativeAlt.load()?"true":"false",double(lastPoseScale.load()),sideAltEnabled.load()?"true":"false",
         (unsigned long long)sideAltFrames.load(),(unsigned long long)sideAltPoses.load(),(unsigned long long)sideAltConverted.load(),
         (unsigned long long)sideAltConvertFailed.load());
-    return b;
+    std::string s=b;s.pop_back();
+    std::snprintf(b,sizeof b,",\"leftMirror\":{\"axis\":[%llu,%llu,%llu],\"off\":%llu,\"authored\":%llu,\"assumedD\":%llu,\"failed\":%llu,"
+        "\"eVsDdeg\":%.1f,\"wristMm\":%.1f}}",(unsigned long long)leftMirrorAxis[0].load(),(unsigned long long)leftMirrorAxis[1].load(),
+        (unsigned long long)leftMirrorAxis[2].load(),(unsigned long long)leftMirrorOff.load(),(unsigned long long)leftMirrorAuthored.load(),
+        (unsigned long long)leftMirrorAssumedD.load(),(unsigned long long)leftMirrorFailed.load(),double(leftMirrorEvsDdeg.load()),
+        double(leftMirrorWristMm.load()));
+    return s+b;
 }
 
 // ---- report "vr":{"weapon":...} ----
@@ -1365,7 +1451,14 @@ inline std::string report() {
             "\"nativeNear\":%llu,\"skipped\":%llu,\"lastNativeM\":%.2f},\"nativeReticle\":{\"hide\":%s,\"hiddenFrames\":%llu,\"shownFrames\":%llu}",(unsigned long long)aimFromPose.load(),
             (unsigned long long)aimFromController.load(),config.reticleTarget?"true":"false",(unsigned long long)reticleTargetSet.load(),
             (unsigned long long)reticleTargetNear.load(),(unsigned long long)reticleTargetSkipped.load(),double(reticleNativeM.load()),
-            config.hideReticle?"true":"false",(unsigned long long)reticleHiddenFrames.load(),(unsigned long long)reticleShownFrames.load());out+=b;}
+            config.hideReticle?"true":"false",(unsigned long long)reticleHiddenFrames.load(),(unsigned long long)reticleShownFrames.load());out+=b;
+            std::snprintf(b,sizeof b,",\"gunUp\":{\"stock\":%s,\"checks\":%llu,\"bypassWrites\":%llu,\"sweep\":%llu,\"near\":%llu,\"refusalsAvoided\":%llu,"
+                "\"scriptedKept\":%llu,\"scriptedPresses\":%llu,\"skipped\":%llu,\"restores\":%llu,\"lastCause\":%d,\"blindWrites\":%llu,\"blindAvoided\":%llu,\"blindInactive\":%llu}",
+                gunUpStock.load()?"true":"false",(unsigned long long)gunUpChecks.load(),(unsigned long long)gunUpWrites.load(),
+                (unsigned long long)gunUpSweep.load(),(unsigned long long)gunUpNear.load(),(unsigned long long)gunUpAvoided.load(),
+                (unsigned long long)gunUpScripted.load(),(unsigned long long)gunUpScriptedPress.load(),(unsigned long long)gunUpSkipped.load(),(unsigned long long)gunUpRestores.load(),
+                gunUpLastCause.load(),(unsigned long long)blindWrites.load(),(unsigned long long)blindAvoided.load(),
+                (unsigned long long)blindInactive.load());out+=b;}
         out+="},";
     }
     std::snprintf(b,sizeof b,"\"placement\":{\"ageMs\":%.1f,\"hand\":%d,\"grip\":%s,\"muzzle\":%s,\"barrel\":%s,\"shift\":%s,\"shifted\":%s,"

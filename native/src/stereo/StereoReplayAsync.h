@@ -5,13 +5,13 @@
 //               launched at the start of each LEFT stage with predicted FrameMaps and STREAM: the worker records every
 //               op as soon as the render thread has recorded it (published offset); endRecording finalizes the job and
 //               the right-eye stage splices it (wait for the last chunk / record the tail / inline on a mismatch).
-//  1 (Step 1):  every tape render pass is recorded into its own secondary command buffer
+//  1:           every tape render pass is recorded into its own secondary command buffer
 //               (RENDER_PASS_CONTINUE, inheritance = tape pass + resolved right framebuffer) and spliced into the
 //               primary with vkCmdBeginRenderPass(SECONDARY_COMMAND_BUFFERS) + vkCmdExecuteCommands; everything
 //               outside render passes stays in the primary. Recording still happens on the render thread, inside
 //               the replay call; any unsupported tape content declines the job and the inline replay runs.
 // The job is split prepare (render thread) / record (no primary, tracked state, texture objects or DUD) /
-// splice (render thread) so that Step 2 can move record to a worker thread.
+// splice (render thread) so that mode 2 can run record on a worker thread.
 #include "StereoReplay.h"
 #include <string>
 

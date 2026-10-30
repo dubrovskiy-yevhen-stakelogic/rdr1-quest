@@ -1,7 +1,7 @@
 #pragma once
 // EYE CULL B: per-draw eye bits from bodyDraw (EyeCull.h decide) to the left-eye draw hooks
 // (CameraIntegration.h cameraDraw*), the stereo tape (StereoReplayInternal.h Header.pad:
-// now set by StereoReplay.cpp recordDraw* BEFORE publishTape, so a streaming worker never reads it unset) and the right-eye replay
+// set by StereoReplay.cpp recordDraw* BEFORE publishTape, so a streaming worker never reads it unset) and the right-eye replay
 // loops (StereoReplay.cpp inline, StereoReplayAsync.cpp secondaries / worker). No engine or Vulkan headers: the replay TUs and the
 // host tests include it.
 // Pad bits (u16):

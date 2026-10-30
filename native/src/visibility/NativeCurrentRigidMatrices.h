@@ -18,7 +18,7 @@ class NativeCurrentRigidMatrices {
 public:
  struct Model {Address native{};std::uint16_t ordinal{};std::uint8_t paletteIndex{};Matrix modelToWorld{};};
  // Storage capacity is independent of the freshly decoded native count.
- // The legacy Output still has exactly the 128-model layout; warm callers may
+ // Output has exactly the 128-model layout; warm callers may
  // request smaller scratch, with a fresh larger native count declining safely.
  template<std::size_t N> struct BoundedOutput {
   static_assert(N>0&&N<=128);
@@ -32,7 +32,7 @@ public:
   auto& d=owner.decoder_;Record record{};
   if(!(handoff?handoff->copy(owner,index,paletteContext,record):owner.record(index,record))||!record.ordinaryFields||!record.drawMethodKnown||record.creature||(record.flags&0xe000)||record.modelFamily!=ModelFamily::Rigid||(record.family!=Family::StaticCommon&&record.family!=Family::RigidMatrixSet))return false;
   // Production supplies cached-bank provenance before the first palette read.
-  // The optional legacy fixture API retains its explicit external pose lease.
+  // The optional fixture API retains its explicit external pose lease.
   if(record.matrixSet&&paletteCurrent&&!paletteCurrent(paletteContext,record.matrixSet))return false;
   Address holder{},ptr{};std::uint16_t count{};
   if(record.lod>=4||!d.at(record.drawable,0x50+record.lod*8,holder)||!holder||!d.at(holder,0,ptr)||!d.at(holder,8,count)||!count||count>N||count!=record.modelCount||!ptr)return false;

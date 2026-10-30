@@ -10,7 +10,7 @@ struct PerformancePolicy {
         if(world&&!used&&!thermal){used=true;expires=now+boostNs;}
         return expires&&now<expires&&!thermal?75:50;
     }
-    static constexpr int gpuLevel() noexcept {return 75;} // stereo-replay: GPU-bound test (was 50)
+    static constexpr int gpuLevel() noexcept {return 75;} // The scene is GPU-bound: above the resting level of 50
     void warning(){thermal=true;expires=0;}
 };
 }

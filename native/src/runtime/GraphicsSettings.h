@@ -30,8 +30,8 @@ inline std::atomic<int> sunStaggerGate{-1};
 // signature. -1 = not published yet (subsystem not built or not initialised). Writers in brackets.
 inline std::atomic<int> postFxMenuState{-1};      // [TraceEntry/PostFxSkip] 0 missing, 1 ready, 2 calibrating, 3 OFF FAST active, 4 fallback
 inline std::atomic<int> postFxMenuProperty{-1};   // [TraceEntry/PostFxSkip] debug.rdrvr.postfx override in effect (-1 none)
-inline std::atomic<int> textureFilterReady{-1};   // [EN] 0 unavailable (fingerprint), 1 live, 2 boot-only (applies at restart)
-inline std::atomic<int> cascadeCullReady{-1};     // [SH via TraceEntry] CS2/CS3 fingerprint 0/1
+inline std::atomic<int> textureFilterReady{-1};   // [TraceEntry] 0 unavailable (fingerprint), 1 live, 2 boot-only (applies at restart)
+inline std::atomic<int> cascadeCullReady{-1};     // [TraceEntry] CS2/CS3 fingerprint 0/1
 inline std::atomic<int> lampShadowsReady{-1};     // [TraceEntry] LAMP SHADOWS hooks (LampShadows.h) 0/1
 inline std::atomic<int> lampShadowsProperty{-1};  // [TraceEntry] 1 while a debug.rdrvr.lamp*/spotcascade property overrides the row
 // [VisibleTrims.h] SUN SHADOWS 7 STAGGER / NIGHT OFF gate (SunNight.h). Low 3 bits: 0 not engaged,
@@ -41,32 +41,32 @@ inline std::atomic<int> sunNightMenu{-1};
 // [VisibleTrims.h] LAMP SHADOWS point-light cap lever (LampShadows.h applyCap): -1 not published, 0 unavailable
 // (code/GOT/SelectionParams fingerprint), 1 usable, 2 suspended (a foreign value holds the cap).
 inline std::atomic<int> lampCapMenu{-1};
-// w02 WATER row: graphics.cfg water (0 OFF / 1 ON), published by GraphicsSettings on load / set / defaults and read every stereo frame by
+// WATER row: graphics.cfg water (0 OFF / 1 ON), published by GraphicsSettings on load / set / defaults and read every stereo frame by
 // GameXr (eyeWaterMode); waterMenuProperty = debug.rdrvr.vr.water as GameXr last read it (-1 unset, 0 OFF, 1 ON, 2 ON NO FILTER) for PROP.
 inline std::atomic<int> waterSetting{1},waterMenuProperty{-1};
 inline std::atomic<int> cameraIndoorMenu{-1};     // [GameXr from indoor::flag()] -1 unknown, 0 outside, 1 in a room
-inline std::atomic<int> frameRateGovernorHz{0};   // [PC] FRAME RATE ADAPTIVE target 36/24; 0 = governor idle / not built
-inline std::atomic<int> foveationLiveLevel{-1};   // [FV] foveation level applied this frame (AUTO/SWEEP/property/clamp)
+inline std::atomic<int> frameRateGovernorHz{0};   // [XrHarness] FRAME RATE ADAPTIVE target 36/24; 0 = governor idle / not built
+inline std::atomic<int> foveationLiveLevel{-1};   // [GameFoveation] foveation level applied this frame (AUTO/SWEEP/property/clamp)
 inline std::atomic<int> xrTimespecEnabled{-1};       // [GameXr] XR_KHR_convert_timespec_time enabled on the instance (0/1)
 inline std::atomic<int> xrLayerSettingsEnabled{-1};  // [GameXr] XR_FB_composition_layer_settings enabled (0/1)
 inline std::atomic<int> xrAutoLayerFilterEnabled{-1};// [GameXr] XR_META_automatic_layer_filter enabled (0/1)
-inline std::atomic<int> xrDynresEnabled{-1};         // [GameXr] dynres01: XR_META_recommended_layer_resolution enabled (0/1; debug.rdrvr.dynres 0 = not requested)
-// dynres01 [XrHarness]: xrGetRecommendedLayerResolutionMETA on the world projection layer, once per XR frame that submits it. Experiment
+inline std::atomic<int> xrDynresEnabled{-1};         // [GameXr] XR_META_recommended_layer_resolution enabled (0/1; debug.rdrvr.dynres 0 = not requested)
+// [XrHarness]: xrGetRecommendedLayerResolutionMETA on the world projection layer, once per XR frame that submits it. Experiment
 // (GPU levels 5/6 on battery need "dynamic resolution" on Quest 3/3S): query + report only (gameBootstrap.xrOptionalExtensions.dynres),
 // the render resolution never follows it. listed/prop [GameXr]: runtime offers it / debug.rdrvr.dynres not "0"; fn: 1 resolved, 0 missing.
 struct XrDynresTelemetry {std::atomic<int> listed{-1},prop{-1},fn{-1},lastResult{0},valid{-1},w{0},h{0},rectW{0},rectH{0};
                           std::atomic<std::uint64_t> calls{0},ok{0},fail{0},validFrames{0};};
 inline XrDynresTelemetry xrDynres;
 inline std::atomic<int> xrOptionalExtensionsRetryResult{0}; // [GameXr] XrResult of xrCreateInstance WITH the optional extensions when it failed and was retried without them (0 = no retry)
-inline std::atomic<int> sharpenEffective{0};      // [PC] SHARPEN value really chained on the projection layer (0 none)
-inline std::atomic<int> xrQueueLayoutActive{-1};  // [QU] layout the device was created with: 0 Appended, 2 SplitHigh, 3 SplitNormal
-inline std::atomic<const char*> xrQueueLayoutReason{nullptr}; // [QU] why that layout (static string; nullptr = not decided)
-inline std::atomic<std::uint64_t> xrLayerFramesSubmitted{0};  // [PC] XR frames submitted with a world STEREO layer
+inline std::atomic<int> sharpenEffective{0};      // [XrHarness] SHARPEN value really chained on the projection layer (0 none)
+inline std::atomic<int> xrQueueLayoutActive{-1};  // [GameVulkanBridge] layout the device was created with: 0 Appended, 2 SplitHigh, 3 SplitNormal
+inline std::atomic<const char*> xrQueueLayoutReason{nullptr}; // [GameVulkanBridge] why that layout (static string; nullptr = not decided)
+inline std::atomic<std::uint64_t> xrLayerFramesSubmitted{0};  // [XrHarness] XR frames submitted with a world STEREO layer
 // VR-only configuration. Never points at the retail game's options or saves.
 class GraphicsSettings {
 public:
     enum class ProfilerMode : unsigned { Off=0,Fps=1,Detail=2 };
-    // SUN SHADOWS keeps STAGGER / NIGHT OFF (user's moon-shadows-off request).
+    // SUN SHADOWS keeps STAGGER / NIGHT OFF (no moon shadows).
     struct Settings {
         unsigned resolutionPercent{100}; // Default 100: the scene is geometry bound, so resolution is the wrong lever
         bool shadows{true},grass{true};
@@ -96,15 +96,15 @@ public:
         unsigned sharpen{};        // 0 OFF, 1 NORMAL, 2 QUALITY, 3 AUTO (XR_FB_composition_layer_settings, sharpenLayerFlags)
         unsigned cascadeCull{1};
         unsigned xrQueuePriority{};// 0 NORMAL (Appended), 1 PRIORITY (SplitHigh); device creation: applies after restart
-        bool xrQueueVerified{true};// no row: false while a PRIORITY start has not yet shown 300 layer frames (QU gate)
+        bool xrQueueVerified{true};// no row: false while a PRIORITY start has not yet shown 300 layer frames (queue layout gate)
         unsigned lampShadows{3};   // LAMP SHADOWS 0 NATIVE, 1 1/2, 2 1/2 NO CASCADE, 3 1/3 NO CASC CULL X2 (live
                                    // 4 1/3 CAP 2 (preset 3 + at most 2 shadowed point lamps), 5 OFF (no lamp shadows)
         //  lever mask (stereo/S02Levers.h bits; no menu row). Cfg key s02Mask, always hex (optional 0x, like the property), clamped
         // to s02MaskBits; written as 0x%04x. Applied every RenderScene unless debug.rdrvr.s02 is set (the property wins, 0 = native).
         unsigned s02Mask{0x1Fu};   // default 0x1F = COLOUR RESTARTS OFF | R EYE MERGE | PX TAIL | PX NO-FLUSH | INDOOR RT
-        bool heatWarning{true};    // heat01: red HEADSET OVERHEATING lines (HeatWarning.h; live, published as heatWarningSetting; cfg version stays 4)
-        unsigned gpuBoost{2};      // boost01: GPU BOOST 0 OFF, 1 640, 2 690 (GpuBoost.h; live, published as gpuBoostSetting; written only when not 2)
-        bool water{true};          // w02: WATER in the eyes (GameXr eyeWaterMode; live, published as waterSetting; written only when OFF)
+        bool heatWarning{true};    // The CLOCK NOTICE lines (HeatWarning.h; live, published as heatWarningSetting; cfg version stays 4)
+        unsigned gpuBoost{2};      // GPU BOOST 0 OFF, 1 640, 2 690 (GpuBoost.h; live, published as gpuBoostSetting; written only when not 2)
+        bool water{true};          // WATER in the eyes (GameXr eyeWaterMode; live, published as waterSetting; written only when OFF)
         bool operator==(const Settings&) const = default;
     };
     struct Extent {std::uint32_t width{},height{};bool operator==(const Extent&) const = default;};
@@ -233,11 +233,11 @@ public:
     bool setXrQueuePriority(unsigned) noexcept;
     bool setXrQueueVerified(bool) noexcept;
     bool setLampShadows(unsigned) noexcept;
-    bool setHeatWarning(bool) noexcept;       // heat01
-    bool setGpuBoost(unsigned) noexcept;      // boost01
-    bool setWater(bool) noexcept;             // w02
-    static constexpr unsigned gpuBoostModes=3; // boost01
-    static const char* gpuBoostName(unsigned v) noexcept {return v==1?"640":v==2?"690":"OFF";} // boost01
+    bool setHeatWarning(bool) noexcept;
+    bool setGpuBoost(unsigned) noexcept;
+    bool setWater(bool) noexcept;
+    static constexpr unsigned gpuBoostModes=3;
+    static const char* gpuBoostName(unsigned v) noexcept {return v==1?"640":v==2?"690":"OFF";}
     bool setSunShadows(bool on,unsigned update) noexcept; // SUN SHADOWS row: shadows + shadowUpdate (pass the stored update when off)
     bool setGrassRow(bool on,unsigned distance) noexcept; // GRASS row: grass + grassDistance (pass the stored distance when off)
     bool restoreDefaults() noexcept;                      // settings = Settings{}, one save
@@ -270,9 +270,9 @@ public:
     bool xrQueueVerified() const noexcept;
     unsigned lampShadows() const noexcept;
     unsigned s02Mask() const noexcept;
-    bool heatWarning() const noexcept;       // heat01 (requested; debug.rdrvr.heatwarn may override it: HeatWarning::enabled)
-    unsigned gpuBoost() const noexcept;      // boost01 (requested; debug.rdrvr.boost may override it: GpuBoost.h)
-    bool water() const noexcept;             // w02 (requested; debug.rdrvr.vr.water may override it)
+    bool heatWarning() const noexcept;       // Requested; debug.rdrvr.heatwarn may override it (HeatWarning::enabled)
+    unsigned gpuBoost() const noexcept;      // Requested; debug.rdrvr.boost may override it (GpuBoost.h)
+    bool water() const noexcept;             // Requested; debug.rdrvr.vr.water may override it
     int legacyOcclusion() const noexcept;    // -1: the loaded file had no pre-V2 "occlusion" key
 private:
     mutable std::mutex mutex_;
@@ -288,5 +288,6 @@ private:
     bool saveLocked() noexcept;
     bool setFlag(bool Settings::*member,bool value) noexcept;
 };
+static_assert(GraphicsSettings::Settings{}.profilerMode==GraphicsSettings::ProfilerMode::Off,"a new install has no FPS readout");
 extern GraphicsSettings graphicsSettings;
 }

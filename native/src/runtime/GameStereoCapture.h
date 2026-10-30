@@ -80,7 +80,7 @@ class StereoCaptureSlot {
     // so the mailbox can dump both 420x440 results of the same frame (SpaceWarp.h dumpProducer). warpDualRecorded_: eyes copied.
     bool warpDual_{};unsigned warpDualRecorded_{};std::uint64_t warpDualPairs_{},warpDualFailures_{};
     bool recordCopy(VkCommandBuffer,unsigned eye,const PassImage&,bool time); // the full-size copy path of one eye (caller: mutex_)
-    // MAILBOX DIRECT (debug.rdrvr.mailbox.direct 1, re-read ~1 Hz in recordEye; 0 = images_ exactly as before; 2 = 1 + bounded
+    // MAILBOX DIRECT (debug.rdrvr.mailbox.direct 1, re-read ~1 Hz in recordEye; 0 = the copy path through images_; 2 = 1 + bounded
     // busy retry in reserveDirect, A/B only): recordEye(eye 0)
     // reserves a mailbox ring slot (StereoMailbox::reserveDirect) and both eyes are copied straight into it, so StereoMailbox::capture skips
     // its own full-eye copy. md_: this pair's reservation, until capture() consumed it (publishInFlight / finish) or, unconsumed, until

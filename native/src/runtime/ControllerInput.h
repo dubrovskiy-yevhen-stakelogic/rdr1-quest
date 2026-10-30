@@ -1,6 +1,7 @@
 #pragma once
 #include "contracts/Contracts.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <mutex>
 
@@ -9,7 +10,8 @@ enum PadButton : std::uint32_t {
     PadA=1u<<0,PadB=1u<<1,PadX=1u<<2,PadY=1u<<3,PadMenu=1u<<4,
     PadLeftStick=1u<<5,PadRightStick=1u<<6,PadLeftGrip=1u<<7,PadRightGrip=1u<<8,
     PadLeftTrigger=1u<<9,PadRightTrigger=1u<<10,
-    PadDpadUp=1u<<11 // PadState output only (Android key 19 -> d11 pad 10 = WHISTLE); never in a ControllerSample
+    PadDpadUp=1u<<11, // PadState output only (Android key 19 -> d11 pad 10 = WHISTLE); never in a ControllerSample
+    PadSelect=1u<<12  // PadState output only (Android key 109 BUTTON_SELECT -> d11 pad 13 = INVENTORY); never in a ControllerSample
 };
 struct ControllerSample {
     std::uint64_t sequence{},publishedNs{},epoch{},continuity{},referenceSpace{};
@@ -19,7 +21,7 @@ struct ControllerSample {
     std::array<Pose,2> aim{},grip{};
     bool focused{},active{};
     // Separate visual epoch retirement (World <-> Optic) from focus/recenter
-    // invalidation. Zero keeps the original epoch behavior for legacy producers.
+    // invalidation. Zero = no separate visual epoch (the ordinary epoch rules alone).
     std::uint64_t inputEpoch{};
 };
 struct PadState {
@@ -52,13 +54,19 @@ public:
         out=latest_;out.continuity=continuity_;return true;
     }
 };
+// The game's own menu must stay usable: a hand on a VR weapon / support grip / rein keeps its grip squeezed; the re-arm of a
+// presentation change would leave the whole pad dead in the pause menu until every hand lets go. Published by the GAME MENU step (TraceEntry)
+// only around an open pause scene: no grip blocks the arming, a squeezed one stays off the pad (no LB / RB edge) until it is released once.
+// All grips, not vr::calib::menuHoldHand: clearOwner sets that to -1 as soon as the presentation leaves World.
+inline std::atomic<bool> padArmIgnoreGrips{false};
 // Game-thread policy. Regaining focus cannot turn a held trigger into a shot.
 // The game owns button edges; this class emits held state only, once per update.
 class ControllerPolicy {
     std::uint64_t epoch_{},continuity_{};bool armed_{};
     std::array<bool,4> analogButtons_{};
+    std::array<bool,2> maskedGrips_{};
 public:
-    void invalidate(){armed_=false;analogButtons_={};epoch_=continuity_=0;}
+    void invalidate(){armed_=false;analogButtons_={};epoch_=continuity_=0;maskedGrips_={};}
     PadState sample(const ControllerSample* input){
         PadState out{};
         if(!input||!validController(*input)){invalidate();return out;}
@@ -67,8 +75,10 @@ public:
         if(!armed_){
             bool neutral=input->buttons==0;
             for(float x:input->sticks)neutral=neutral&&std::abs(x)<=0.15f;
-            for(const auto& axes:{input->triggers,input->grips})for(float x:axes)neutral=neutral&&x<=0.15f;
-            if(neutral)armed_=true;
+            for(float x:input->triggers)neutral=neutral&&x<=0.15f;
+            const bool ignore=padArmIgnoreGrips.load(std::memory_order_relaxed);
+            if(!ignore)for(float x:input->grips)neutral=neutral&&x<=0.15f;
+            if(neutral){armed_=true;for(unsigned h=0;h<2;++h)maskedGrips_[h]=ignore&&input->grips[h]>0.15f;}
             return out;
         }
         out.ready=true;out.buttons=input->buttons;
@@ -76,7 +86,8 @@ public:
         for(unsigned i=0;i<2;++i)out.triggers[i]=std::clamp(input->triggers[i],0.0f,1.0f);
         const float values[]{input->grips[0],input->grips[1],input->triggers[0],input->triggers[1]};
         const std::uint32_t bits[]{PadLeftGrip,PadRightGrip,PadLeftTrigger,PadRightTrigger};
-        for(unsigned i=0;i<4;++i){analogButtons_[i]=values[i]>=(analogButtons_[i]?0.45f:0.55f);if(analogButtons_[i])out.buttons|=bits[i];}
+        for(unsigned h=0;h<2;++h)if(input->grips[h]<=0.15f)maskedGrips_[h]=false;
+        for(unsigned i=0;i<4;++i){analogButtons_[i]=!(i<2&&maskedGrips_[i])&&values[i]>=(analogButtons_[i]?0.45f:0.55f);if(analogButtons_[i])out.buttons|=bits[i];}
         return out;
     }
 };

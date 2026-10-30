@@ -30,7 +30,7 @@ private:
     const char* lastStatus_{"UNKNOWN"};
 public:
     // Press, release, two held samples, and failures while held; bounded even if
-    // a user leaves the trigger squeezed. Called only by the native input thread.
+    // the player leaves the trigger squeezed. Called only by the native input thread.
     bool wanted(const Event& e) noexcept {
         const bool down=e.physicalLt>.45f||e.physicalRt>.45f;
         bool take=down!=down_;

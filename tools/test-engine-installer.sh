@@ -13,7 +13,7 @@ import hashlib,json,pathlib,sys
 root=pathlib.Path(sys.argv[1]);out=root/'out';out.mkdir(exist_ok=True)
 payload=b'offline fixture';(out/'base.apk').write_bytes(payload)
 hashes=['3f80845edec32a663c42a8570e3131446813e695076c4bc96e2142c190bc22f3','0f288e2f9255d04277190bb5ffca742ec395d33a47fb305ddb22b9f0e904ef72']
-data=dict(formatVersion=1,modVersion='0.1.1',package=sys.argv[2],versionCode='63226194',versionName='1.58.63226194',
+data=dict(formatVersion=1,modVersion='0.2.0',package=sys.argv[2],versionCode='63226194',versionName='1.58.63226194',
     engineSha256=hashes[int(sys.argv[3])-1],engineVariant='variant-'+sys.argv[3],trade=0,buildId='a'*64,
     sourceSignerSha256='b'*64,outputSignerSha256='c'*64,outputSignerHashCode='12345678',
     outputs=[dict(file='base.apk',split=None,size=len(payload),sha256=hashlib.sha256(payload).hexdigest())])

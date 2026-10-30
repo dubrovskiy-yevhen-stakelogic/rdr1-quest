@@ -72,11 +72,11 @@ namespace mainthread {
 // THROW (tick only = the flight; its ops OpThrow / OpCatch go through the holsters module) id 5;
 // RELOAD 6 (ops acks, fires, reconcile), ARC 7 (DEBUG producer, live levers),
 // LASSO 8 (shown box, LASSO arc), TELEPORT 9 LAST (state machine, TELEPORT arc, warp: every other tick of the frame sees the pre-warp
-// state). Tick order = id order, commands after all ticks. 10..15 free.
+// state). Tick order = id order, commands after all ticks. MARKER 10, MVACTORS 11, THROWABLE 12 (aim arc, pre-launch flight). 13..15 free.
 enum Module : std::uint16_t {ModuleNone=0,ModuleHolsters=1,ModuleCheats=2,ModuleMelee=3,ModuleBody=4,ModuleThrow=5,
-    ModuleReload=6,ModuleArc=7,ModuleLasso=8,ModuleTeleport=9,ModuleMarker=10,ModuleMotionActors=11,ModuleCount=16};
-inline constexpr std::array<Module,11> namedModules{ModuleHolsters,ModuleCheats,ModuleMelee,ModuleBody,ModuleThrow,ModuleReload,ModuleArc,
-    ModuleLasso,ModuleTeleport,ModuleMarker,ModuleMotionActors};
+    ModuleReload=6,ModuleArc=7,ModuleLasso=8,ModuleTeleport=9,ModuleMarker=10,ModuleMotionActors=11,ModuleThrowable=12,ModuleCount=16};
+inline constexpr std::array<Module,12> namedModules{ModuleHolsters,ModuleCheats,ModuleMelee,ModuleBody,ModuleThrow,ModuleReload,ModuleArc,
+    ModuleLasso,ModuleTeleport,ModuleMarker,ModuleMotionActors,ModuleThrowable};
 inline constexpr bool moduleIdsUnique() noexcept {
     for(std::size_t i=0;i<namedModules.size();++i){if(namedModules[i]==ModuleNone||namedModules[i]>=ModuleCount)return false;
         for(std::size_t j=i+1;j<namedModules.size();++j)if(namedModules[i]==namedModules[j])return false;}

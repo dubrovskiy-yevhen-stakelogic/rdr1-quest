@@ -44,15 +44,24 @@ class PerfPanel {
         }
     }
 public:
-    // heat01: 414 -> 430 px: the GRAPHICS page has 26 lines (+ HEAT WARNING row) at the 16 px pitch (12+25*16+14 = 426).
-    // boost01: 430 -> 446 px: 27 lines (+ GPU BOOST row), 12+26*16+14 = 442.
+    // 446 px: the GRAPHICS page has 27 lines at the 16 px pitch (12+26*16+14 = 442).
     static constexpr unsigned width=640,height=446;
-    // heat01: red = the rest of its line in red (the marker draws nothing, takes no column); a newline returns to the normal ink.
+    // red = the rest of its line in red (the marker draws nothing, takes no column); a newline returns to the normal ink.
     static constexpr char red='\x01';
     static constexpr char keepCase='\x02'; // The rest of the line keeps its lower case
     static constexpr char gold='\x03',cyan='\x04'; // Header / sub-header colour for the rest of the line
     static constexpr std::uint32_t goldInk=0xff40c8ffu,cyanInk=0xffffc860u;
     static constexpr std::uint32_t ink=0xffe0f4ffu,redInk=0xff3038ffu; // RGBA8 sRGB, little endian (R in the low byte)
+    // Category colours for the menu (weapons red, horse brown etc., so players build associations) + plain = back to the
+    // normal ink inside a line. Like the codes above they draw nothing and take no column; \x09 \x0a \x0d stay free (whitespace).
+    // In a string literal always close the literal after the code ("\x05" "FOR"): a following A-F / 0-9 would extend the escape.
+    // Brown is darker than orange on purpose: same hue, so only the brightness tells HORSE from WEAPON CALIBRATION / SCOPE LENS in the lens.
+    static constexpr char orange='\x05',brown='\x06',green='\x07',blue='\x08',yellow='\x0b',purple='\x0c',grey='\x0e',plain='\x0f',weapon='\x10';
+    static constexpr std::uint32_t orangeInk=0xff40a0ffu,brownInk=0xff5888c4u,greenInk=0xff78e078u,blueInk=0xffffb478u,yellowInk=0xff58e8ffu,
+        purpleInk=0xffff98ccu,greyInk=0xffc0b8b0u,weaponInk=0xff6070ffu; // lighter than redInk: thin red glyphs on the dark panel are hard to read
+    static constexpr std::uint32_t inkOf(char c) noexcept { // 0 = no colour code
+        switch(c){case red:return redInk;case gold:return goldInk;case cyan:return cyanInk;case orange:return orangeInk;case brown:return brownInk;case green:return greenInk;
+        case blue:return blueInk;case yellow:return yellowInk;case purple:return purpleInk;case grey:return greyInk;case plain:return ink;case weapon:return weaponInk;default:return 0;}}
     std::array<std::uint32_t,width*height> pixels{};
     void draw(std::string_view text){
         pixels.fill(0xff14100cu);unsigned x=12,y=12;std::uint32_t colour=ink;bool keep=false;
@@ -60,7 +69,7 @@ public:
         // tighter pitch (>= 16 px, glyphs are 14 px tall) instead of losing the last lines.
         unsigned lines=1;for(char c:text)lines+=c=='\n';
         const unsigned pitch=lines>1&&12+(lines-1)*25+14>height?std::max(16u,(height-26)/(lines-1)):25u;
-        for(char c:text){if(c=='\n'){x=12;y+=pitch;colour=ink;keep=false;continue;}if(c==red){colour=redInk;continue;}if(c==keepCase){keep=true;continue;}if(c==gold){colour=goldInk;continue;}if(c==cyan){colour=cyanInk;continue;}
+        for(char c:text){if(c=='\n'){x=12;y+=pitch;colour=ink;keep=false;continue;}if(c==keepCase){keep=true;continue;}if(const auto code=inkOf(c)){colour=code;continue;}
             if(!keep&&c>='a'&&c<='z')c=char(c-'a'+'A');
             auto rows=glyph(c);if(y+14>height)break;
             if(x+10<width)for(unsigned row=0;row<7;++row)for(unsigned col=0;col<5;++col)

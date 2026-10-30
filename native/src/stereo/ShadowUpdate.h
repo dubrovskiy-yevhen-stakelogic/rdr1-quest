@@ -40,6 +40,8 @@
 #include "IndoorState.h"
 #include "StereoTestMode.h"
 #include "SunNight.h" // SUN SHADOWS 7 STAGGER / NIGHT OFF (clock gate, report shadowUpdate.sunNight, signature "z")
+#include "CutsceneShadowCam.h" // CUTSCENE SHADOWS: the cascades of a stereo cutscene follow the eye
+#include "ShadowTimeline.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -150,7 +152,7 @@ inline Decision decide(const Request& r,bool snapshot,bool forced,unsigned skipp
     if(skippedSince+1>=t.adaptiveFrames)return {true,TrigInterval};
     return {false,SkipAdaptive};
 }
-// Render-thread bookkeeping of the atlas snapshot (no atomics: every user runs on the render thread, checked by token).
+// Render-thread bookkeeping of the atlas snapshot (no atomics: every caller runs on the render thread, checked by token).
 struct Tracker {
     std::array<unsigned char,sphereBytes> spheres{},pending{};
     const void* owner{};const void* pendingMap{};
@@ -614,6 +616,8 @@ inline std::string report() {
      <<",\"forcedNoCloud\":"<<r.forcedNoCloud.load()<<",\"capped\":"<<r.capped.load()<<",\"capM\":"<<rangeCapM<<'}';
     o<<',';stagger::report(o);
     o<<',';sunnight::report(o);
+    o<<',';cscam::report(o);
+    o<<',';shadowtimeline::report(o);
     o<<'}';
     return o.str();
 }

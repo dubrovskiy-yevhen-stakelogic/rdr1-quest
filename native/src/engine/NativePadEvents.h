@@ -18,12 +18,13 @@ inline bool submitPadEvents(NativePadEventApi api,void* ownedPad,int deviceId,co
         for(unsigned i=0;i<6;++i)api.axis(ownedPad,deviceId,axes[i],values[i],significant);
         // AxisEvent's default threshold can classify zero as down. Explicit
         // button states run AFTER axes so neutral triggers always release.
-        // Also key 19 (D-pad up -> d11 pad 10, AndroidGamepad_c::GamepadButtonEvent 0x198cb0c), driven by PadDpadUp.
-        const int keys[]{96,97,99,100,108,106,107,102,103,104,105,19};
+        // Also key 19 (D-pad up -> d11 pad 10, AndroidGamepad_c::GamepadButtonEvent 0x198cb0c), driven by PadDpadUp, and key 109
+        // (BUTTON_SELECT -> d11 pad 13 = INVENTORY, branch 0x198caa4 shared with key 4 BACK), driven by PadSelect.
+        const int keys[]{96,97,99,100,108,106,107,102,103,104,105,19,109};
         const std::uint32_t bits[]{runtime::PadA,runtime::PadB,runtime::PadX,runtime::PadY,runtime::PadMenu,
             runtime::PadLeftStick,runtime::PadRightStick,runtime::PadLeftGrip,runtime::PadRightGrip,runtime::PadLeftTrigger,runtime::PadRightTrigger,
-            runtime::PadDpadUp};
-        for(unsigned i=0;i<12;++i)api.button(ownedPad,deviceId,keys[i],(state.buttons&bits[i])!=0);
+            runtime::PadDpadUp,runtime::PadSelect};
+        for(unsigned i=0;i<13;++i)api.button(ownedPad,deviceId,keys[i],(state.buttons&bits[i])!=0);
         errno=incoming;return true;
     }catch(...){errno=incoming;return false;}
 }

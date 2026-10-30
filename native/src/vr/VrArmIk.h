@@ -366,7 +366,8 @@ inline FingerCurl BuildFingerCurl(const FingerJointBind bind[kFingers][kJoints],
     }
     return p;
 }
-enum class FingerMode : std::uint8_t {Native,Free,Support,Fist};
+// Grip: an item held in the hand (fingers round the handle, the index on the trigger as far as the trigger is pulled).
+enum class FingerMode : std::uint8_t {Native,Free,Support,Fist,Grip};
 // Curl fraction of the fist angle per finger (VC 4-pose blend open/grip/trigger/fist from analog grip g and trigger t).
 inline float FingerFraction(FingerMode mode,int finger,float grip,float trigger){
     const float g=Clamp01(grip),t=Clamp01(trigger);
@@ -375,10 +376,52 @@ inline float FingerFraction(FingerMode mode,int finger,float grip,float trigger)
         const float wg=g*(1-t),wt=(1-g)*t,wf=g*t;
         const float pg=finger==kIndexFinger?0.f:1.f,pt=finger==kIndexFinger?1.f:finger==kThumb?.5f:0.f;
         return wg*pg+wt*pt+wf;}
-    case FingerMode::Support:return .8f;
+    case FingerMode::Support:return finger==kThumb?.45f:.75f; // wrapped round the fore-end, the thumb along it
     case FingerMode::Fist:return 1.f;
+    case FingerMode::Grip:return finger==kThumb?.6f:finger==kIndexFinger?.45f+.45f*t:.85f;
     default:return 0.f;
     }
+}
+
+// ============================== left <-> right mirror ==============================
+// A mirror-built rig: a left bone frame is the world mirror of the right one with its local X negated (G_l = M G_r D,
+// D = diag(-1, 1, 1); measured on the RDR1 player: the hand frames in the wrist frames differ only in the sign of X). A local
+// rotation then mirrors as D R D = quaternion (x, -y, -z, w), a local offset as (-x, y, z).
+inline Quat MirrorLocalX(Quat q){return {q.x,-q.y,-q.z,q.w};}
+inline Vec3 MirrorLocalX(Vec3 v){return {-v.x,v.y,v.z};}
+// The finger chains of both hands are mirror images (bind locals, every joint within maxDeg): the right hand's pose can be copied
+// onto the left one through MirrorLocalX. At least 3 fingers valid on both sides.
+inline bool FingersMirror(const FingerCurl& right,const FingerCurl& left,float maxDeg){
+    const float c=std::cos(.5f*maxDeg*kDegToRad);int fingers=0;
+    for(int f=0;f<kFingers;++f){
+        if(!right.valid[f]||!left.valid[f])continue;
+        for(int j=0;j<kJoints;++j)if(std::fabs(Dot(Normalize(MirrorLocalX(right.bind[f][j])),Normalize(left.bind[f][j])))<c)return false;
+        ++fingers;
+    }
+    return fingers>=3;
+}
+
+// ============================== support hand on a long gun ==============================
+// The wrist of the support hand under a fore-end: the palm under the gun facing its bore, rolled tiltRad towards the gun's middle
+// (the left hand from the gun's left, the right hand from its right), the fingers wrapped across the barrel with the knuckles turned
+// yawRad from straight across towards the muzzle (the fore-end lies diagonally in the palm, the wrist stays in line with the forearm),
+// the grip origin (the curled fingers) on `grip`, the wrist wristBack behind it along the knuckles and wristDepth towards the back of
+// the hand (world units, as HandInGrip). gunUp = the gun's up (only its part normal to the barrel is used).
+inline Mat34 SupportWrist(const HandFrame& hf,Vec3 barrel,Vec3 gunUp,Vec3 grip,bool right,float tiltRad,float yawRad,float wristBack,
+                          float wristDepth){
+    const Vec3 s=Normalize(barrel,{0,0,-1});
+    const Vec3 up=Normalize(gunUp-s*Dot(gunUp,s),detail::AnyPerp(s));
+    const Vec3 gunRight=Cross(s,up);
+    const Vec3 palm=Normalize(up*std::cos(tiltRad)+gunRight*((right?-1.f:1.f)*std::sin(tiltRad)),up);
+    // knuckles straight across the barrel (index side towards the muzzle; left: palmOut = knuckle x index side, right: the opposite
+    // - MeasureHandFrame), then turned towards the muzzle in the palm plane
+    const Vec3 across=right?Cross(palm,s):Cross(s,palm);
+    const Vec3 fwd=Normalize(s-palm*Dot(s,palm),s);
+    const Vec3 k=Normalize(across*std::cos(yawRad)+fwd*std::sin(yawRad),across);
+    const Vec3 hk=hf.knuckle,hp=Normalize(hf.palmOut-hk*Dot(hf.palmOut,hk),{0,0,-1});
+    const Mat33 H{hk,hp,Cross(hk,hp)};
+    const Mat33 W{k,palm,Cross(k,palm)};
+    return MakeMat34(Orthonormalize(W*Transpose(H)),grip-k*wristBack-palm*wristDepth);
 }
 
 // ============================== subtree re-propagation (crSkeleton::PartialUpdate rule) ==============================
@@ -416,6 +459,9 @@ struct ArmPoseInput {
     Vec3 lastPerp{0,0,0},hingeLocal{0,0,0};
     bool clavicleReach=true;float clavicleStart=0.98f,clavicleMaxRadians=15.0f*kDegToRad;
     FingerMode fingers=FingerMode::Native;float grip=0,trigger=0;
+    // Optional finger joint locals (rotation) per [finger * kJoints + joint] where bit k of fingerPoseMask is set: they replace the
+    // curl of `fingers` for that joint (e.g. the other hand's pose mirrored).
+    const Quat* fingerPose=nullptr;std::uint16_t fingerPoseMask=0;
 };
 struct ArmPoseOutput {
     ArmIkOutput ik;float twist=0;bool clavicleMoved=false;float clavicleAngle=0;bool fingersPosed=false;
@@ -471,7 +517,9 @@ inline bool PoseArm(const ArmRig& rig,const ArmPoseInput& in,Mat34* obj,Mat34* l
             const float frac=FingerFraction(in.fingers,f,in.grip,in.trigger);
             for(int j=0;j<kJoints;++j){
                 const int r=rig.fingerRel[f][j];if(r<=0||r>=n||rig.pinned[r])continue;
-                const Quat target=CurlJoint(rig.curl.bind[f][j],rig.curl.axis[f][j],frac*rig.curl.fist[f][j]);
+                const int k=f*kJoints+j;
+                const Quat target=in.fingerPose&&((in.fingerPoseMask>>k)&1u)?Normalize(in.fingerPose[k]):
+                    CurlJoint(rig.curl.bind[f][j],rig.curl.axis[f][j],frac*rig.curl.fist[f][j]);
                 const Quat anim=ToQuat(Orthonormalize(local[r].Rot()));
                 const Quat q=w>=1.0f?target:Normalize(Slerp(anim,target,w));
                 const float s=Length(local[r].a);

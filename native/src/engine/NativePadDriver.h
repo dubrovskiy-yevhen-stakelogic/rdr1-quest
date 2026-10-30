@@ -27,15 +27,17 @@ public:
     // Last word on the pad state before it is submitted (VR holsters: grip masking, weapon-hand trigger
     // routing). input is null when no ready Touch sample exists (the filter suspends); state.ready may be false.
     using PadFilter=void(*)(void*,const runtime::ControllerSample*,std::uint64_t,runtime::PadState&);
+    using PadObserver=void(*)(std::uint64_t,std::uint32_t,bool) noexcept;
 private:
     Movement movement_{};void* movementContext_{};
     HorizontalLook look_{};void* lookContext_{};
     PadFilter filter_{};void* filterContext_{};std::atomic<std::uint64_t> filterRejected_{};
     PadFilter controls_{};void* controlsContext_{};std::atomic<std::uint64_t> controlsRejected_{}; // Controls: button layout, BEFORE filter_
+    PadObserver observer_{}; // sees the buttons exactly as they are submitted
     // A filter may rewrite buttons/axes, never readiness; out-of-range or non-finite output is discarded.
-    // controls: bit 11 (PadDpadUp, output only) is a valid pad button.
+    // controls: bits 11 / 12 (PadDpadUp / PadSelect, output only) are valid pad buttons.
     static bool saneFilterOutput(const runtime::PadState& before,const runtime::PadState& after){
-        if(after.ready!=before.ready||(after.buttons&~0xfffu))return false;
+        if(after.ready!=before.ready||(after.buttons&~0x1fffu))return false;
         for(float x:after.sticks)if(!std::isfinite(x)||std::abs(x)>1.001f)return false;
         for(float x:after.triggers)if(!std::isfinite(x)||x<0.f||x>1.001f)return false;
         return true;
@@ -92,6 +94,7 @@ public:
     void setPadFilter(PadFilter filter,void* context=nullptr){filter_=filter;filterContext_=context;}
     std::uint64_t filterRejected()const{return filterRejected_.load();}
     void setControlsFilter(PadFilter filter,void* context=nullptr){controls_=filter;controlsContext_=context;}
+    void setPadObserver(PadObserver observer){observer_=observer;}
     std::uint64_t controlsRejected()const{return controlsRejected_.load();}
     const char* status()const{return status_.load();}
     std::uint64_t updates()const{return updates_.load();}
@@ -201,6 +204,7 @@ public:
             }
             else{delivery_.requestedRt=state.triggers[1];delivery_.requestedBit=(state.buttons&runtime::PadRightTrigger)!=0;}
             delivery_.ready=state.ready;delivery_.submittedRt=state.triggers[1];delivery_.submittedBit=(state.buttons&runtime::PadRightTrigger)!=0;
+            if(observer_)observer_(now,state.buttons,state.ready);
             if(!submitPadEvents(api_.events,pad_,deviceId,state)){
                 // Best-effort release uses the same checked owning object.
                 submitPadEvents(api_.events,pad_,deviceId,{});failed_=true;policy_.invalidate();status_="PAD_EVENTS_FAILED";return;

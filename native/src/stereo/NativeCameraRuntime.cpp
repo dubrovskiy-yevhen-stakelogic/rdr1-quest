@@ -102,7 +102,7 @@ bool NativeCameraRuntime::bindOriginals(Dispatch api)noexcept {
  }catch(...){return false;}
 }
 bool NativeCameraRuntime::initializeDevice(VkPhysicalDevice physical,VkDevice device,std::uint64_t generation,Limits limits,RecordingOwnerThread predicate)noexcept {
- // This branch uses the existing native EyeViewports and stereo globals.
+ // The runtime uses the existing native EyeViewports and stereo globals.
  // Optional camera variants and their recording consumers stay unavailable.
  (void)physical;(void)device;(void)generation;(void)limits;(void)predicate;return false;
 }
@@ -143,7 +143,7 @@ VkResult NativeCameraRuntime::submit(VkQueue q,std::uint32_t n,const VkSubmitInf
  if(!impl_||!impl_->bound.load(std::memory_order_acquire))return VK_ERROR_INITIALIZATION_FAILED;return impl_->api.submit(q,n,c,f);
 }
 void NativeCameraRuntime::commandUnknown(VkCommandBuffer h)noexcept {
- // No optional recording consumer exists in this branch.
+ // No optional recording consumer exists.
  (void)h;
 }
 void NativeCameraRuntime::executeCommands(VkCommandBuffer h,std::uint32_t n,const VkCommandBuffer*c)noexcept {

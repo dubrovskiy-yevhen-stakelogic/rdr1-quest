@@ -5,7 +5,7 @@
 // - A site is the pair (pc0, pc1): pc0 = return address into the direct caller of the
 //   reader, pc1 = that caller's own return address (one frame-record step, validated
 //   against the current stack; 0 when unavailable). Wrappers/lambdas therefore show
-//   their real user in pc1.
+//   their real caller in pc1.
 // - Calls made on the render thread (the thread that calls frame()) are counted
 //   separately per site.
 // - The site table (frame-record walk + table insert per guarded read) runs only

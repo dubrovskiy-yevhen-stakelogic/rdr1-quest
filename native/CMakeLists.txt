@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(rdrvr VERSION 0.1.1 LANGUAGES CXX)
+project(rdrvr VERSION 0.2.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -116,6 +116,7 @@ add_library(rdrvr SHARED
   src/stereo/GameFoveation.cpp
   src/vr/HandsPass.cpp
   "${RDRVR_GENERATED_DIR}/vr/HandsAssets.cpp"
+  src/vr/ScopePass.cpp
   src/vr/TaaPass.cpp
   src/vr/VrHud.cpp
 )

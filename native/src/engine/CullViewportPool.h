@@ -57,6 +57,8 @@ public:
     void visibility(const void* viewport,const void* shaft,bool success) noexcept;
     const void* shaft(std::uintptr_t renderer,std::uint64_t serial)const noexcept;
     const void* viewport(std::uintptr_t renderer,std::uint64_t serial)const noexcept;
+    // The stereo clone of this visibility call as soon as it is leased (its visibility list may still be running); read-only use.
+    const void* leased(std::uintptr_t renderer,std::uint64_t serial)const noexcept;
     bool stereoCull(std::uintptr_t renderer,std::uint64_t serial)const noexcept;
     bool complete(std::uintptr_t renderer,std::uint64_t serial) noexcept;
     unsigned collect() noexcept;

@@ -9,7 +9,7 @@ struct HeadCameraAnchor {
     std::uint64_t sampledNs{},presentationRevision{};
     std::uintptr_t bodyCreature{},hatNode{};
     // Published together with `position` so the render thread never pairs a capsule of one frame with the
-    // body point B of another (camera continuity while roomscale moves the capsule). origin.valid=false = legacy latch.
+    // body point B of another (camera continuity while roomscale moves the capsule). origin.valid=false = the adapter's own latch.
     TrackingOrigin origin{};
     enum class Kind : std::uint8_t {LegacyHead,Body,BodyFiltered,Head};
     Kind kind{Kind::LegacyHead};

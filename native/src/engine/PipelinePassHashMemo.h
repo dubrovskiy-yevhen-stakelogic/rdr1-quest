@@ -20,7 +20,7 @@ public:
     using Original = std::uint32_t(*)(const void*,std::size_t,std::uint32_t);
     static constexpr std::size_t bytes=148;
     static_assert(bytes==18*8+4);
-    // cpu02: key equality as 18 u64 + 1 u32 XOR/OR (same result as !memcmp over the 148 bytes, no libc call).
+    // Key equality as 18 u64 + 1 u32 XOR/OR (same result as !memcmp over the 148 bytes, no libc call).
     static bool sameKey(const std::byte* a,const void* other)noexcept{
         const auto* b=static_cast<const std::byte*>(other);std::uint64_t d{};
         for(std::size_t i=0;i<144;i+=8){std::uint64_t x,y;std::memcpy(&x,a+i,8);std::memcpy(&y,b+i,8);d|=x^y;}
@@ -32,7 +32,7 @@ private:
     static thread_local Local local_;
     std::atomic<std::uint64_t> hits_{},misses_{};
     std::atomic<bool> installed_{};
-    // cpu02: the first thread with a qualified call (the render thread) keeps its cache in owner_, found by comparing its thread
+    // The first thread with a qualified call (the render thread) keeps its cache in owner_, found by comparing its thread
     // pointer (one mrs) instead of the dynamic TLS resolver; every other thread keeps local_. Entries are a pure function of
     // (bytes, seed) and each cache stays private to one live thread. debug.rdrvr.passmemo.fast 0 = thread_local + memcmp.
     Local owner_{};std::atomic<std::uintptr_t> ownerTp_{};
@@ -56,7 +56,7 @@ private:
         return true;
 #endif
     }
-    // cpu02: at install and at most once per second from a publish (every 1024 calls of one thread), never per call.
+    // At install and at most once per second from a publish (every 1024 calls of one thread), never per call.
     void refresh(bool force)noexcept{
         const auto t=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
         auto last=lastReadNs_.load(std::memory_order_relaxed);
@@ -100,7 +100,7 @@ public:
         std::ostringstream o;o<<"{\"installed\":"<<(installed_.load()?"true":"false")
           <<",\"scope\":\"native-render-pass-descriptor-hash\",\"keyBytes\":148,\"capacityPerThread\":4"
           <<",\"hits\":"<<hits()<<",\"misses\":"<<misses()<<",\"unpublishedPerThreadMax\":1023"
-          // cpu02: fast 0/1 A/B must keep the hit ratio; ownerHits/ownerMisses = calls served by the owner-thread cache
+          // fast 0/1 A/B must keep the hit ratio; ownerHits/ownerMisses = calls served by the owner-thread cache
           <<",\"fast\":"<<(fast_.load(std::memory_order_relaxed)?"true":"false")<<",\"propertyReads\":"<<propertyReads_.load(std::memory_order_relaxed)
           <<",\"ownerClaimed\":"<<(ownerTp_.load(std::memory_order_relaxed)?"true":"false")
           <<",\"ownerHits\":"<<ownerHits_.load(std::memory_order_relaxed)<<",\"ownerMisses\":"<<ownerMisses_.load(std::memory_order_relaxed)<<'}';

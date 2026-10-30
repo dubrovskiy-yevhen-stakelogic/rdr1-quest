@@ -160,7 +160,12 @@ struct BonePairCache {std::array<PreparedParts,maxBoneActors> entry{};};
 // poses, no padSteps widening). The half-step widening of a walker's parts (~2 cm) lets thighs /
 // hands / arms take coat and torso pixels; tight keeps the limbs and frees most of those, but loses
 // limb pixels if the snapshot lags the drawn frame by a tick.
-inline bool prepareBoneParts(const ActorBones& cb,const ActorBones& pb,const double mid[3],double padSteps,double upm,PreparedParts& out,BoneStats& st,bool tight=false) noexcept {
+// rootRel (optional, RIG actors: the player body, the ridden horse's parts - SpaceWarp::prepareActorPair) = Mcur * inverse(Mprev) of the
+// actor root: the capsule is centred / widened by the part's step RELATIVE TO THE ROOT (its own animation), not by its world step. A rig
+// actor's world step is the camera rig's (~0.2 m per pair running, ~0.3 m at a gallop): centring on it put the capsule half a rig step
+// behind the drawn limb and widened it by a quarter metre over the ground / grass behind it. D (the reprojection) is unchanged.
+inline bool prepareBoneParts(const ActorBones& cb,const ActorBones& pb,const double mid[3],double padSteps,double upm,PreparedParts& out,BoneStats& st,bool tight=false,
+                             const M4* rootRel=nullptr) noexcept {
     out.valid=false;out.count=0;out.boundR=0;out.boundTop=-1e30;out.maxStep=0;
     if(!cb.count||cb.count!=pb.count||cb.layout!=pb.layout||cb.count>maxActorBones){++st.unmatched;return false;}
     for(unsigned k=0;k<cb.count;++k)if(cb.part[k].spec!=pb.part[k].spec||cb.part[k].bone!=pb.part[k].bone){++st.unmatched;return false;}
@@ -172,7 +177,10 @@ inline bool prepareBoneParts(const ActorBones& cb,const ActorBones& pb,const dou
         for(int e=0;e<2;++e){const float* q=e?cb.part[k].b:cb.part[k].a;auto& w=moved[k][std::size_t(e)];
             for(int r=0;r<3;++r)w[std::size_t(r)]=D[0*4+r]*q[0]+D[1*4+r]*q[1]+D[2*4+r]*q[2]+D[3*4+r];
             stepOf[k][std::size_t(e)]=std::sqrt((w[0]-q[0])*(w[0]-q[0])+(w[1]-q[1])*(w[1]-q[1])+(w[2]-q[2])*(w[2]-q[2]));
-            out.maxStep=std::max(out.maxStep,stepOf[k][std::size_t(e)]);}
+            out.maxStep=std::max(out.maxStep,stepOf[k][std::size_t(e)]);
+            if(rootRel){const auto& R=*rootRel;const double x=w[0],y=w[1],z=w[2]; // the previous pose carried back with the root
+                for(int r=0;r<3;++r)w[std::size_t(r)]=R[0*4+r]*x+R[1*4+r]*y+R[2*4+r]*z+R[3*4+r];
+                stepOf[k][std::size_t(e)]=std::sqrt((w[0]-q[0])*(w[0]-q[0])+(w[1]-q[1])*(w[1]-q[1])+(w[2]-q[2])*(w[2]-q[2]));}}
     }
     if(!(out.maxStep<=1.5*u)){++st.jump;return false;}                                      // a skeleton swap / teleport: root only
     for(unsigned k=0;k<cb.count;++k){

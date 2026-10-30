@@ -60,7 +60,7 @@ struct Config {
     // barely moves for stuckS after an impact (sliding / jittering on a steep or thin surface) and a run of tinyBounces bounces slower
     // than tinyBounceSpeed settle where they are (RESTING: the ground pick-up still works until totalS).
     float totalS{12.f},stillS{3.f},stillM{.05f},belowM{2.f},stuckS{.6f},stuckM{.10f},tinyBounceSpeed{.8f};unsigned tinyBounces{3u};
-    unsigned slots{2u};               // bit (1 << slot): 2 = SIDEARM; 3 adds MELEE (knife); long guns are never thrown
+    unsigned slots{6u};               // bit (1 << slot): 2 = SIDEARM, 1 = MELEE (knife), 4 = THROWN (VrThrowable.h hand tosses only); long guns never
     bool closedCatch{true},physics{},pull{true};unsigned returnMs{300};
     std::uint64_t graceNs{150'000'000},catchingNs{400'000'000},placementMaxAgeNs{150'000'000},ackTimeoutNs{500'000'000};
     float gravity() const noexcept {return -9.81f*gravityScale;}
@@ -69,7 +69,7 @@ inline Config config{};
 inline std::atomic<bool> killed{},menuOn{true},started{};
 inline bool active() noexcept {return !killed.load(std::memory_order_relaxed)&&menuOn.load(std::memory_order_relaxed);}
 inline void setMenu(bool on) noexcept {menuOn.store(on,std::memory_order_relaxed);}
-inline bool slotThrowable(int slot) noexcept {return slot>=0&&slot<2&&(config.slots>>unsigned(slot)&1u);} // MELEE / SIDEARM only
+inline bool slotThrowable(int slot) noexcept {return slot>=0&&slot<3&&(config.slots>>unsigned(slot)&1u);} // MELEE / SIDEARM / THROWN
 // engine::WeaponClass values (WeaponTypeReader): 1 Pistol, 2 DualPistol, 10 Melee.
 inline bool kindThrowable(int kind) noexcept {return ((kind==1||kind==2)&&slotThrowable(1))||(kind==10&&slotThrowable(0));}
 
@@ -794,7 +794,7 @@ inline void startup() noexcept {
     real("debug.rdrvr.vr.throw.total",config.totalS,0.f,120.f);real("debug.rdrvr.vr.throw.still",config.stillS,0.f,60.f);
     real("debug.rdrvr.vr.throw.below",config.belowM,0.f,50.f);real("debug.rdrvr.vr.throw.stuck",config.stuckS,0.f,10.f);
     {float t=float(config.tinyBounces);real("debug.rdrvr.vr.throw.tiny",t,0.f,10.f);config.tinyBounces=unsigned(t);}
-    {float s=float(config.slots);real("debug.rdrvr.vr.throw.slots",s,0.f,3.f);config.slots=unsigned(s)&3u;}
+    {float s=float(config.slots);real("debug.rdrvr.vr.throw.slots",s,0.f,7.f);config.slots=unsigned(s)&7u;}
     {float r=float(config.returnMs);real("debug.rdrvr.vr.throw.returnms",r,0.f,2000.f);config.returnMs=unsigned(r);}
     {const auto c=property("debug.rdrvr.vr.throw.closedcatch");if(!c.empty())config.closedCatch=c[0]!='0';}
     {const auto c=property("debug.rdrvr.vr.throw.physics");config.physics=!c.empty()&&c[0]=='1';} // no physics mode is built: reported only

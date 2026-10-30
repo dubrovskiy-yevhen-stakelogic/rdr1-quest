@@ -67,7 +67,7 @@ $forbiddenExtensions = @(
     '.class', '.jar', '.wasm', '.bin', '.rpf', '.sav'
 )
 $forbiddenFileNames = @(
-    '.env', 'local.properties', 'release-signing.properties', 'changelog.md', 'source_snapshot.md',
+    '.env', 'local.properties', 'release-signing.properties', 'source_snapshot.md',
     'agents.md', 'claude.md', 'handoff.md', 'status.md', 'contract.md', 'memory.md'
 )
 $binaryExtensions = @('.png', '.jpg', '.jpeg', '.webp', '.ktx', '.ktx2', '.rgba', '.uxrh', '.spv', '.ttf', '.otf', '.wav', '.ogg')

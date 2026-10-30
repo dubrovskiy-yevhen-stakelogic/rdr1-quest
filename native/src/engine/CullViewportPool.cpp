@@ -94,6 +94,14 @@ const void* CullViewportPool::viewport(std::uintptr_t renderer,std::uint64_t ser
     }catch(...){}
     return nullptr;
 }
+const void* CullViewportPool::leased(std::uintptr_t renderer,std::uint64_t serial)const noexcept {
+    Errno preserve;
+    try{std::lock_guard guard(state_->mutex);
+        for(const auto& slot:state_->slots)if(slot.viewport&&!slot.complete&&slot.ticket.renderer==renderer&&
+            slot.ticket.serial==serial&&slot.ticket.stereoCull)return slot.viewport;
+    }catch(...){}
+    return nullptr;
+}
 std::uint64_t CullViewportPool::serial(std::uintptr_t renderer,std::uint32_t marker)const noexcept {
     Errno preserve;
     try{std::lock_guard guard(state_->mutex);std::uint64_t found{};

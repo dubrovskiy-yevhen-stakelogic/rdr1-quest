@@ -1,5 +1,5 @@
 #pragma once
-// BUTTONS (user: "a full control map so people can change the buttons"): per layout (ON FOOT / HORSE) every action of the VR
+// BUTTONS: per layout (ON FOOT / HORSE) every action of the VR
 // layout (VrControls.h Mapper) can be put on any of the six Touch buttons A B X Y L3 R3. Implemented as a permutation of the PHYSICAL
 // Touch buttons into the LOGICAL ones the Mapper already understands (logical A = the jump on foot, logical B = reload / interact, ...),
 // applied before the Mapper in the Foot / Mounted layouts only (menus, cutscenes and unknown contexts keep the stock pad). Every special
@@ -7,6 +7,7 @@
 // whatever physical button now carries it. Assigning a button that another action uses swaps the two (always a permutation).
 // Stored in rdrvr/controls.cfg ("foot.A=B" ...: action key = physical button); malformed lines are skipped.
 #include "VrControls.h"
+#include "VrReins.h" // REINS: CONTROLS > REINS GESTURES (stored here as horse.reins)
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -23,8 +24,8 @@ enum Layout : unsigned {Foot,Horse,LayoutCount};
 inline constexpr std::array<const char*,LayoutCount> layoutCfg{"foot","horse"};
 // The action each LOGICAL button means in that layout (the VrControls.h Mapper).
 inline constexpr std::array<std::array<const char*,buttonCount>,LayoutCount> actionNames{{
-    {"JUMP","RELOAD / INTERACT","WHISTLE","USE / MOUNT","SPRINT","CROUCH"},
-    {"SPUR / GALLOP","JUMP","X BUTTON","DISMOUNT / USE","L3 - UNUSED","DEAD EYE (LT +)"}}};
+    {"JUMP","RELOAD / INTERACT","WHISTLE / HOLD: INVENTORY","USE / MOUNT","SPRINT","CROUCH / GUN: DEAD EYE"},
+    {"SPUR / GALLOP","JUMP","X BUTTON / HOLD: INVENTORY","DISMOUNT / USE","L3 - UNUSED","DEAD EYE (GUN OR LT +)"}}};
 // physical[layout][logical] = the physical button index that performs logical button `logical`
 struct Map {std::array<std::array<std::uint8_t,buttonCount>,LayoutCount> physical{{{0,1,2,3,4,5},{0,1,2,3,4,5}}};};
 inline std::atomic<std::uint64_t> packed{0}; // published Map (6 x 2 x 3 bits); 0 = identity (never valid otherwise: logical 0 -> physical 0 ...)
@@ -53,6 +54,7 @@ inline bool save(const Map& m) noexcept {
     const auto tmp=path+".tmp";FILE* f=std::fopen(tmp.c_str(),"w");if(!f){saveFailures.fetch_add(1);return false;}
     std::fprintf(f,"version=1\n");
     for(unsigned l=0;l<LayoutCount;++l)for(unsigned b=0;b<buttonCount;++b)std::fprintf(f,"%s.%s=%s\n",layoutCfg[l],buttonNames[b],buttonNames[m.physical[l][b]]);
+    std::fprintf(f,"horse.reins=%s\n",reins::menuOn.load(std::memory_order_relaxed)?"ON":"OFF");
     const bool ok=std::fflush(f)==0&&std::fclose(f)==0&&std::rename(tmp.c_str(),path.c_str())==0;
     (ok?saves:saveFailures).fetch_add(1);return ok;
 }
@@ -63,6 +65,7 @@ inline void loadOnce() noexcept {
         char line[96];
         while(std::fgets(line,sizeof line,f)){
             char key[32]{},val[8]{};if(std::sscanf(line," %31[^=]=%7s",key,val)!=2)continue;
+            if(std::strcmp(key,"horse.reins")==0){reins::menuOn.store(std::strcmp(val,"OFF")!=0,std::memory_order_relaxed);continue;}
             const char* dot=std::strchr(key,'.');if(!dot)continue;
             unsigned l=0;while(l<LayoutCount&&std::strncmp(key,layoutCfg[l],std::size_t(dot-key))!=0)++l;
             unsigned b=0;while(b<buttonCount&&std::strcmp(dot+1,buttonNames[b])!=0)++b;
@@ -83,7 +86,9 @@ inline void step(unsigned row,int dir) noexcept {
     m.physical[l][logical]=std::uint8_t(next);
     const auto v=pack(m);packed.store(v==pack(Map{})?0:v,std::memory_order_release);edits.fetch_add(1);save(m);
 }
-inline void resetDefaults() noexcept {loadOnce();packed.store(0,std::memory_order_release);edits.fetch_add(1);save(Map{});}
+inline void resetDefaults() noexcept {loadOnce();packed.store(0,std::memory_order_release);reins::menuOn.store(true,std::memory_order_relaxed);edits.fetch_add(1);save(Map{});}
+// REINS row: OFF / ON (saved with the button map)
+inline void toggleReins() noexcept {loadOnce();reins::menuOn.store(!reins::menuOn.load(std::memory_order_relaxed),std::memory_order_relaxed);edits.fetch_add(1);save(current());}
 inline std::string report() {
     const auto m=current();std::string o="{\"loadOk\":";o+=loadOk.load()?"true":"false";o+=",\"remapped\":";o+=packed.load()?"true":"false";
     o+=",\"frames\":"+std::to_string(remappedFrames.load())+",\"edits\":"+std::to_string(edits.load())+",\"saves\":"+std::to_string(saves.load())+",\"saveFailures\":"+std::to_string(saveFailures.load());

@@ -15,6 +15,7 @@
 // raw signal: both live -> env==1 && rooms; only env live -> env; only rooms live -> rooms; neither -> -1 (unknown).
 // Hysteresis: enter after enterFrames consecutive raw==1 samples; any other sample leaves at once and sets exitPending
 // (ShadowUpdate.h forces one atlas render on that frame). An unknown signal counts as outside.
+#include "ShadowTimeline.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -139,7 +140,7 @@ inline void sample(const float* cameraPos) noexcept {
     const int moved=r.filter.step(raw);
     if(r.filter.in)s.indoorFrames.fetch_add(1,std::memory_order_relaxed);
     if(moved){
-        (moved>0?s.enters:s.exits).fetch_add(1,std::memory_order_relaxed);
+        (moved>0?s.enters:s.exits).fetch_add(1,std::memory_order_relaxed);shadowtimeline::bump(shadowtimeline::IndoorFlip);
         auto& t=s.ring[unsigned(s.transitions.load(std::memory_order_relaxed)%ringSize)];
         t.sample.store(n,std::memory_order_relaxed);t.in.store(moved>0?1:0,std::memory_order_relaxed);
         t.env.store(env,std::memory_order_relaxed);t.rooms.store(rooms,std::memory_order_relaxed);

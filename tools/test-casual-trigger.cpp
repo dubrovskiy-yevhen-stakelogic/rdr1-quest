@@ -1,4 +1,5 @@
-// Host regression: run with a temporary directory for vr.cfg as argv[1].
+// Host regression: run with a temporary directory for vr.cfg as argv[1]. Build without NDEBUG, with native/src, native/src/vr and the
+// tools/gamecode.py output folder on the include path, plus a stub sys/system_properties.h. MSVC also needs stubs of clock_gettime and __builtin_return_address.
 #include "vr/VrControls.h"
 #include "vr/VrHammer.h"
 #include <cassert>
@@ -48,6 +49,9 @@ int main(int argc,char** argv) {
     assert(hammerCalls==0&&phaseCalls==0&&gateCalls==0);
     // Realistic keeps its manual gates, including after switching from Casual.
     assert(V::vrSettings.applyWeaponPreset(V::PresetRealistic));
+    // TWO HAND FIRE (REALISTIC = ON): a long gun held in one hand stays blocked before any gate; the gates below run with it OFF.
+    tick(0,0);{auto one=tick(0,1);assert(one.triggers[1]==0&&phaseCalls==0);}tick(0,0);
+    assert(V::vrSettings.set(V::Key::TwoHandFire,0));
     V::hammer::heldAction=V::hammer::ActionSingle;
     assert(V::hammer::modeOf(V::settings())==V::hammer::ModeSingle);
     tick(0,0);auto p=tick(0,1);assert(p.triggers[1]==0); // open cylinder
@@ -64,5 +68,13 @@ int main(int argc,char** argv) {
     H::holdHand=-1;++H::holdGeneration;p=tick(0,1);assert(p.triggers[1]==0&&p.triggers[0]==0);
     H::holdHand=0;H::currentSlot=H::SlotMelee;H::heldKind=H::kindMelee;++H::holdGeneration;
     tick(0,0);p=tick(0,1);assert(p.triggers[1]==0);
+    // SNIPER: a held sniper rifle fires on every pull with the Realistic gates in force (stale open cylinder, ONE_SHOT gate);
+    // debug.rdrvr.vr.scope.free 0 (sniperFreeFire false) gives it the preset's gates back.
+    assert(V::vrSettings.applyWeaponPreset(V::PresetRealistic));
+    assert(V::vrSettings.set(V::Key::TwoHandFire,0));
+    H::hammerSinks=nullptr;phaseValue=2;
+    H::currentSlot=H::SlotSniper;H::heldKind=H::kindSniper;H::holdHand=1;++H::holdGeneration;tick(1,0);
+    for(int i=0;i<3;++i){p=tick(1,1);assert(p.triggers[1]==1&&(p.buttons&R::PadRightTrigger));tick(1,0);}
+    H::sniperFreeFire=false;p=tick(1,1);assert(p.triggers[1]==0);tick(1,0);H::sniperFreeFire=true;
     std::cout<<"Casual held-trigger, redraw, transfer, preset switch and Realistic gate tests passed\n";
 }

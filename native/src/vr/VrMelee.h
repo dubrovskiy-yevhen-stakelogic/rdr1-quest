@@ -485,7 +485,7 @@ inline Gate Engine::gate(const Player& p,bool& freshContext) noexcept {
     if(b.deadEye)return GateDeadEye;
     if(b.riding||b.mountingHorse)return GateRiding;
     if(b.ridingVehicle||b.vehicleTransition)return GateVehicle;
-    if(b.duel)return GateDuel;
+    if(b.duel||b.duelRaw)return GateDuel;
     if(b.mountedWeapon)return GateMountedWeapon;
     if(b.cover)return GateCover;
     if(b.linkedAnimation)return GateLinked;

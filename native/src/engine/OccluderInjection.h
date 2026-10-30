@@ -270,7 +270,7 @@ public:
         configured_.store(true,std::memory_order_release);
     }
     bool configured()const noexcept{return configured_.load(std::memory_order_acquire);}
-    void body()noexcept{bodies_.store(bodies_.load(std::memory_order_relaxed)+1,std::memory_order_relaxed);} // cpu02: render thread only (pinned DrawCommon): no atomic RMW per object
+    void body()noexcept{bodies_.store(bodies_.load(std::memory_order_relaxed)+1,std::memory_order_relaxed);} // render thread only (pinned DrawCommon): no atomic RMW per object
     // Visibility task, audited MAIN union scope, after native CreateVisibleShaftList.
     void afterCached(void* requestPointer,const void* viewport,bool rooms,bool special)noexcept{
         if(!configured_.load(std::memory_order_acquire)||!requestPointer)return;

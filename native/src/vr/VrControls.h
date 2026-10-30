@@ -10,7 +10,9 @@
 //      TARGET = 16, USE = 3, USE2 = 2, WHISTLE = 10 (D-pad up), LOOK_AT = 1;  camera group 2: LOOK_BACK = pad 19 (R3);
 //      HORSE group 7: JUMP = pad 2 (X), SPUR = pad 0 (A);  menus group 19: ACCEPT = 0, CANCEL = 1, ACTION_4 = 19.
 //    Android key -> d11 pad button (AndroidGamepad_c::GamepadButtonEvent 0x198ca7c): 96->0 A, 97->1 B, 99->2 X, 100->3 Y,
-//    19->10 D-pad up, 106->18 L3, 107->19 R3.
+//    19->10 D-pad up, 106->18 L3, 107->19 R3, 108->12 Start, 109->13 Select (4 BACK -> 13 too).
+//    INVENTORY = pad 13 (Select; decoded binding "INVENTORY = 13/20"): the Touch controllers have no Select, so it is the HOLD
+//    of the logical X (whistle) >= Tuning::inventoryHold (bit::Select, Android key 109).
 //  - Sprint: sagPlayerInputFoot::UpdateParameters reads input 0x18 (0x26b3a78) - press edges pump the sprint machine
 //    foot+0x184 (states 2..4, SprintPumpTimeout foot+0x80), foot+0x18a selects "held" instead of "pressed" (0x26b396c..0x26b3998).
 //    A pump train (down 2 updates / up 1 update) drives both variants.
@@ -35,17 +37,18 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include "VrDeadEye.h" // DEAD EYE: press counters (light header, no engine)
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
 #endif
 
 namespace rdrvr::vr::controls {
 
-// Pad bits: identical to rdrvr::runtime::PadButton (static_assert in the GameXr glue). DpadUp is output-only.
+// Pad bits: identical to rdrvr::runtime::PadButton (static_assert in the GameXr glue). DpadUp / Select are output-only.
 namespace bit {
 inline constexpr std::uint32_t A=1u<<0,B=1u<<1,X=1u<<2,Y=1u<<3,Menu=1u<<4,L3=1u<<5,R3=1u<<6,LGrip=1u<<7,RGrip=1u<<8,
-    LT=1u<<9,RT=1u<<10,DpadUp=1u<<11;
-inline constexpr std::uint32_t mapped=A|B|X|Y|L3|R3|DpadUp; // the only bits the mapper owns
+    LT=1u<<9,RT=1u<<10,DpadUp=1u<<11,Select=1u<<12;
+inline constexpr std::uint32_t mapped=A|B|X|Y|L3|R3|DpadUp|Select; // the only bits the mapper owns
 }
 
 inline constexpr std::uint64_t ms(std::uint64_t v) noexcept {return v*1'000'000ull;}
@@ -113,8 +116,11 @@ inline constexpr std::array<const char*,4> layoutNames{"NATIVE","GAMEPLAY","FOOT
 // Native   = menus / frontend / unknown presentation: the Touch buttons are the stock pad (incl. R3 = menu ACTION_4).
 // Gameplay = world / optic / cutscene / camera override with no readable player context: stock pad, R3 only with LT.
 // Foot     = player state 2 (on foot): A jump, B reload (manual reload may consume it), X whistle, Y use,
-//            L3 sprint toggle, R3 crouch toggle, LT+R3 Dead Eye.
-// Mounted  = any other player state (horse / wagon / vehicle): A = spur/accelerate (pad A, one press per tap; user: repeated taps
+//            L3 sprint toggle, R3 crouch toggle, LT+R3 Dead Eye; R3 with a firearm in a VR hand / while Dead Eye runs = Dead Eye.
+// INVENTORY (every layout, not in a lasso catch / minigame): X held >= inventoryHold = pad Select (d11 13) while it stays held.
+//            Foot / Mounted: X's own action (whistle / pad X) is sent as a pulse on RELEASE of a shorter press, so a hold never
+//            whistles; Native / Gameplay: X goes down at once (menus) and the hold adds Select.
+// Mounted  = any other player state (horse / wagon / vehicle): A = spur/accelerate (pad A, one press per tap,
 //            like the stock game), B = jump, the manual reload keeps B while it owns it, L3 nothing, X = X, LT+R3 Dead Eye.
 inline Layout layoutFor(bool menuOrUnknown,bool playerRead,std::uint32_t playerMode) noexcept {
     if(menuOrUnknown)return Layout::Native;
@@ -129,6 +135,8 @@ struct Tuning {
     std::uint64_t armWindow{ms(1500)};   // L3 clicked with a neutral stick: sprint waits this long for a deflection
     unsigned pumpDown{2},pumpUp{1};  // sprint A pump train in pad updates
     unsigned crouchPulse{2};         // L3 (CROUCH) pulse length in pad updates
+    std::uint64_t inventoryHold{ms(500)}; // X held this long = INVENTORY (pad Select)
+    unsigned tapPulse{3};            // a released short X press: whistle / pad X pulse length in pad updates
 };
 struct MapIn {
     bool ready{};std::uint32_t buttons{};float stickX{},stickY{};Layout layout{Layout::Native};std::uint64_t now{};
@@ -140,6 +148,9 @@ struct MapIn {
     // Touch X -> pad X on foot (whistle off meanwhile) so the HUD prompts match; lassoMinigame = a lasso minigame has the focus: every face
     // button and the stick clicks are the stock pad (prompt codes 4-7 = the labelled button; 9 / 10 = L3 / R3), no sprint, no crouch toggle.
     bool lassoRemap{},lassoMinigame{};int promptCode{32};
+    // DEAD EYE (VrDeadEye.h): deadEyeGun = a firearm is in a VR hand (holsters heldFirearm) -> R3 = the game's DEADEYE press
+    // (the gun in hand is the aim; LT is the free hand's trigger in VR); deadEyeActive = Dead Eye runs -> R3 = the stock "end it".
+    bool deadEyeGun{},deadEyeActive{};
 };
 enum class Sprint : std::uint8_t {Off,Armed,On};
 inline constexpr std::array<const char*,3> sprintNames{"OFF","ARMED","ON"};
@@ -158,7 +169,8 @@ inline std::atomic<ReloadConsumer> reloadConsumer{nullptr};
 inline std::atomic<std::uint64_t> updateFrame{};         // pad updates seen by the mapper (one per game frame)
 inline std::atomic<std::uint64_t> jumpPresses{},sprintToggles{},sprintPumps{},sprintOnFrames{},sprintEndsNeutral{},sprintEndsContext{},
     sprintArmExpired{},crouchPulses{},deadEyePresses{},r3Suppressed{},spurPresses{},whistlePresses{},reloadConsumed{},reloadPassed{},
-    reloadErrors{},notReady{},sprintTeleportIgnored{},stickOwnedFrames{},lassoRemapFrames{},lassoMinigameFrames{},lassoRemapPresses{};
+    reloadErrors{},notReady{},sprintTeleportIgnored{},stickOwnedFrames{},lassoRemapFrames{},lassoMinigameFrames{},lassoRemapPresses{},
+    inventoryPresses{},xTaps{};
 inline std::array<std::atomic<std::uint64_t>,4> layoutFrames{};
 inline std::atomic<bool> whistleRequest{false}; // The holsters' mouth gesture -> one D-pad up (whistle) pulse on foot
 inline std::atomic<unsigned> lastLayout{0};inline std::atomic<unsigned> sprintState{0};inline std::atomic<bool> sprintWanted{false};
@@ -208,11 +220,14 @@ class Mapper {
     std::array<Latch,6> latch_{}; // A B X Y L3 R3
     Sprint sprint_{Sprint::Off};std::uint64_t armedUntil_{},neutralSince_{};unsigned pump_{},crouch_{},whistle_{};
     bool lastJumping_{};bool jumpKnown_{};
+    // INVENTORY: the X press that may still become a hold (pending), its press time, whether its own action waits for the release
+    // (Foot / Mounted) and which bit that release pulses (DpadUp whistle on foot / pad X).
+    bool xPending_{},xDeferred_{};std::uint64_t xSince_{};std::uint32_t xTapBit_{},tapBit_{};unsigned tap_{};
     void endSprint(std::atomic<std::uint64_t>* reason) noexcept {if(sprint_!=Sprint::Off&&reason)reason->fetch_add(1,std::memory_order_relaxed);sprint_=Sprint::Off;pump_=0;neutralSince_=0;}
 public:
     Tuning tuning{};
     Sprint sprint() const noexcept {return sprint_;}
-    void reset() noexcept {latch_={};endSprint(nullptr);crouch_=0;jumpKnown_=false;}
+    void reset() noexcept {latch_={};endSprint(nullptr);crouch_=0;jumpKnown_=false;xPending_=xDeferred_=false;tap_=0;}
     // Returns the new button word: bits outside bit::mapped are passed unchanged.
     std::uint32_t apply(const MapIn& in,std::uint32_t buttons) noexcept {
         const auto frame=updateFrame.fetch_add(1,std::memory_order_relaxed)+1;
@@ -222,7 +237,7 @@ public:
         else jumpKnown_=false;
         if(!in.ready){
             if(sprint_!=Sprint::Off)endSprint(&sprintEndsContext);
-            latch_={};crouch_=0;notReady.fetch_add(1,std::memory_order_relaxed);
+            latch_={};crouch_=0;xPending_=xDeferred_=false;tap_=0;notReady.fetch_add(1,std::memory_order_relaxed);
             sprintState.store(0,std::memory_order_relaxed);sprintWanted.store(false,std::memory_order_relaxed);
             return buttons&~bit::mapped;
         }
@@ -231,11 +246,11 @@ public:
         const float mag=!in.stickOwned&&std::isfinite(in.stickX)&&std::isfinite(in.stickY)?std::hypot(in.stickX,in.stickY):0.f;
         if(in.stickOwned)stickOwnedFrames.fetch_add(1,std::memory_order_relaxed);
         static constexpr std::uint32_t touch[6]{bit::A,bit::B,bit::X,bit::Y,bit::L3,bit::R3};
-        bool rising[6]{};
+        bool rising[6]{},falling[6]{};
         for(unsigned i=0;i<6;++i){
             const bool down=(in.buttons&touch[i])!=0;auto& l=latch_[i];
             if(down&&!l.held){l.held=true;rising[i]=true;l.out=0;}
-            else if(!down&&l.held){l.held=false;l.out=0;}
+            else if(!down&&l.held){l.held=false;falling[i]=true;l.out=0;}
         }
         const bool gameplayMap=L==Layout::Foot||L==Layout::Mounted;
         // LASSO: face remap while a catch is on the rope / stock face buttons in a lasso minigame (pressed buttons keep their mapping)
@@ -255,9 +270,19 @@ public:
             latch_[1].out=bOwned?0:jump?bit::X:bit::B;
             if(!jump&&gameplayMap)(bOwned?reloadConsumed:reloadPassed).fetch_add(1,std::memory_order_relaxed);
         }
-        // X: whistle (D-pad up) on foot; X while a catch is on the rope / in a lasso minigame (LASSO)
-        if(rising[2]&&lassoFace){latch_[2].out=bit::X;lassoRemapPresses.fetch_add(1,std::memory_order_relaxed);}
-        else if(rising[2]){latch_[2].out=L==Layout::Foot?bit::DpadUp:bit::X;if(L==Layout::Foot)whistlePresses.fetch_add(1,std::memory_order_relaxed);}
+        // X: whistle (D-pad up) on foot; X while a catch is on the rope / in a lasso minigame (LASSO); HOLD = INVENTORY (pad Select)
+        if(rising[2]&&lassoFace){latch_[2].out=bit::X;xPending_=false;lassoRemapPresses.fetch_add(1,std::memory_order_relaxed);}
+        else if(rising[2]){
+            xPending_=true;xDeferred_=gameplayMap;xSince_=in.now;xTapBit_=L==Layout::Foot?bit::DpadUp:bit::X;
+            latch_[2].out=xDeferred_?0:bit::X; // Native / Gameplay: stock X at once (menus)
+        }
+        if(xPending_&&latch_[2].held&&in.now>=xSince_&&in.now-xSince_>=tuning.inventoryHold){
+            xPending_=false;latch_[2].out=xDeferred_?bit::Select:bit::X|bit::Select; // Select held while X stays held
+            inventoryPresses.fetch_add(1,std::memory_order_relaxed);
+        }else if(xPending_&&falling[2]){ // a short press: X's own action now (deferred) or already sent (stock)
+            xPending_=false;xTaps.fetch_add(1,std::memory_order_relaxed);
+            if(xDeferred_){tapBit_=xTapBit_;tap_=tuning.tapPulse;if(xTapBit_==bit::DpadUp)whistlePresses.fetch_add(1,std::memory_order_relaxed);}
+        }
         if(rising[3])latch_[3].out=bit::Y;
         // L3: sprint toggle on foot, spur when mounted
         if(rising[4]&&lassoStock)latch_[4].out=bit::L3; // LASSO minigame: stock L3 (prompt code 9)
@@ -271,10 +296,11 @@ public:
             }else if(L==Layout::Mounted)latch_[4].out=0; // No L3 gallop on a horse (B taps)
             else latch_[4].out=bit::L3;
         }
-        // R3: crouch on foot, Dead Eye with LT, look-back never in gameplay
+        // R3: crouch on foot, Dead Eye with LT / a gun in a VR hand / while it runs, look-back never in gameplay
         if(rising[5]){
             if(L==Layout::Native||lassoStock)latch_[5].out=bit::R3; // LASSO minigame: stock R3 (prompt code 10)
-            else if(lt){latch_[5].out=bit::R3;deadEyePresses.fetch_add(1,std::memory_order_relaxed);}
+            else if(lt||in.deadEyeGun||in.deadEyeActive){latch_[5].out=bit::R3;deadEyePresses.fetch_add(1,std::memory_order_relaxed);
+                deadeye::bump(in.deadEyeActive?deadeye::endPresses:lt?deadeye::ltPresses:deadeye::gunPresses);}
             else if(L==Layout::Foot){latch_[5].out=0;crouch_=tuning.crouchPulse;crouchPulses.fetch_add(1,std::memory_order_relaxed);}
             else{latch_[5].out=0;r3Suppressed.fetch_add(1,std::memory_order_relaxed);}
         }
@@ -304,6 +330,7 @@ public:
         if(crouch_){out|=bit::L3;--crouch_;}
         if(whistleRequest.exchange(false,std::memory_order_relaxed)&&L==Layout::Foot){whistle_=3;whistlePresses.fetch_add(1,std::memory_order_relaxed);}
         if(whistle_){out|=bit::DpadUp;--whistle_;}
+        if(tap_){out|=tapBit_;--tap_;}
         sprintState.store(unsigned(sprint_),std::memory_order_relaxed);
         sprintWanted.store(sprint_==Sprint::On,std::memory_order_relaxed);
         return out;
@@ -377,11 +404,12 @@ inline std::string report() {
         (unsigned long long)reloadPassed.load(),(unsigned long long)reloadErrors.load());
     out+=b;
     std::snprintf(b,sizeof b,"\"clicks\":{\"l3\":%llu,\"r3\":%llu,\"chords\":%llu,\"recenters\":%llu,\"chordsAborted\":%llu,\"resets\":%llu},"
-        "\"sprintTeleportIgnored\":%llu,\"stickOwnedFrames\":%llu,\"lasso\":{\"remapFrames\":%llu,\"minigameFrames\":%llu,\"presses\":%llu},",
+        "\"sprintTeleportIgnored\":%llu,\"stickOwnedFrames\":%llu,\"lasso\":{\"remapFrames\":%llu,\"minigameFrames\":%llu,\"presses\":%llu},"
+        "\"inventory\":%llu,\"xTaps\":%llu,",
         (unsigned long long)clicksL.load(),(unsigned long long)clicksR.load(),(unsigned long long)chords.load(),(unsigned long long)recenters.load(),
         (unsigned long long)chordsAborted.load(),(unsigned long long)clickResets.load(),(unsigned long long)sprintTeleportIgnored.load(),
         (unsigned long long)stickOwnedFrames.load(),(unsigned long long)lassoRemapFrames.load(),(unsigned long long)lassoMinigameFrames.load(),
-        (unsigned long long)lassoRemapPresses.load());
+        (unsigned long long)lassoRemapPresses.load(),(unsigned long long)inventoryPresses.load(),(unsigned long long)xTaps.load());
     out+=b;
     std::snprintf(b,sizeof b,"\"jump\":{\"presses\":%llu,\"fastInstalled\":%s,\"install\":\"%s\",\"fastEnabled\":%s,\"launchMs\":%.1f,\"calls\":%llu,"
         "\"fast\":%llu,\"fastFailed\":%llu,\"native\":%llu,\"notLocal\":%llu,\"noLaunch\":%llu,\"wrongCaller\":%llu,\"retimed\":%llu,"

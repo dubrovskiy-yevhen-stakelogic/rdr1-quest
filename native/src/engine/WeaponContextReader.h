@@ -1,12 +1,14 @@
 #pragma once
 #include "WeaponOwnerReader.h"
+#include "vr/VrDuelRoute.h"
 #include <array>
 #include <cmath>
 #include <cstring>
 namespace rdrvr::engine {
 struct WeaponContext {
     bool alive{},controlDisabled{},deadEye{},riding{},ridingVehicle{},vehicleTransition{};
-    bool duel{},mountedWeapon{},mountingHorse{},blindFiring{},cover{},linkedAnimation{},usingGringo{};
+    // duel = a duel the stock way (the game owns the gun); a VR DUEL (VrDuelRoute.h) plays with the normal gun rules. duelRaw = the player is in any duel.
+    bool duel{},duelRaw{},mountedWeapon{},mountingHorse{},blindFiring{},cover{},linkedAnimation{},usingGringo{};
     bool trackedShot{},aimDirectionOverride{},launchOverride{},driveLaunchOverride{};
     bool animationFirePending{};
     // Preserve raw references alongside their generation-checked native validity.
@@ -98,7 +100,7 @@ class WeaponContextReader {
                !r.get(contexts,0x18,aim)||!r.get(aim,0xbc,aimFlags)||
                !r.get(contexts,0x50,linked)||!r.get(linked,0x18,result.linkedActorGuid)||
                !r.get(owner.actor,0x88,motion)||!r.get(owner.actor,0xb0,component)||!r.get(component,0x8d0,result.gringoGuid))return false;
-            result.duel=duelState!=0;result.mountedWeapon=mountedState!=0;
+            result.duelRaw=duelState!=0;result.duel=result.duelRaw&&!::rdrvr::vr::duelctl::live();result.mountedWeapon=mountedState!=0;
             result.mountingHorse=mountState==1||mountState==5||mountState==6;result.blindFiring=(aimFlags&4)!=0;
             if(motion&&!r.get(motion,0xaca,cover))return false;
             result.cover=cover!=0;

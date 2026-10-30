@@ -27,7 +27,7 @@ public:
     public:
         Ticket()=default;
         // Issued identity, not freshness: an expired issued ticket remains
-        // truthy so optional legacy checks cannot turn expiry into "absent".
+        // truthy so optional checks cannot turn expiry into "absent".
         explicit operator bool()const noexcept{return owner_&&registry_&&revision_&&!(revision_&1);}
         bool current()const noexcept;
     };

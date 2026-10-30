@@ -50,7 +50,7 @@ public:
                 // ControlVector state 1 is ordinary directional hysteresis and
                 // can turn on during walking. Do not toggle mapping on that
                 // transition; the original engine keeps its normal base lock.
-                result.ordinaryFoot=!restriction.knownLock()&&!before.moveLocks&&before.scripted<0&&
+                result.ordinaryFoot=!restriction.knownLock()&&!restriction.duelRaw&&!before.moveLocks&&before.scripted<0&&
                     before.controlMode<=1&&!before.overrideVector&&!before.forceLock&&!before.footMode&&
                     !(before.footDisabled&1)&&!before.moverMode&&!before.moverSpecial;
             }

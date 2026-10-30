@@ -345,7 +345,7 @@ const NativeStaticTriangles::Snapshot& NativeStaticTriangles::captureInto(std::u
         ++stats_.meshMisses;
         // A failed query can mean an active index writer, invalidation or a
         // busy ownership lock. Raw IB fallback would bypass that lifetime
-        // proof. Legacy mapping fallback is only used without the mesh feature.
+        // proof. The mapping fallback is only used without the mesh feature.
         return result_;
     }
     OwnedStaticVertices::Lease lease;

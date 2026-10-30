@@ -3,7 +3,7 @@
 #include <atomic>
 #include "contracts/Contracts.h"
 #include "diagnostics/ProfilerControl.h"
-#include "diagnostics/SaveTransfer.h" // save01
+#include "diagnostics/SaveTransfer.h"
 #ifdef RDRVR_BENCH_CONTROL
 #include "runtime/BenchMenuInput.h"
 #include "diagnostics/FrameTimings.h"
@@ -126,7 +126,7 @@ Java_org_rdrvr_bootstrap_RdrVrApplication_nativeTakePlannerCapture(JNIEnv* env,j
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
     __android_log_print(ANDROID_LOG_INFO, "RdrVr", "build=%s contracts=%u mode=%s gameplay_hooks=disabled",
                        RDRVR_BUILD_ID, rdrvr::kContractVersion, mode);
-    rdrvr::diagnostics::savexfer::run(); // save01: export the private saves, apply <rdrvr>/save-import before the game opens them
+    rdrvr::diagnostics::savexfer::run(); // Export the private saves, apply <rdrvr>/save-import before the game opens them
     return JNI_VERSION_1_6;
 }
 #ifdef RDRVR_TRACE

@@ -29,7 +29,7 @@
 //   * booleans (stick clicks, A B X Y menu, trigger touch, recenter action) through an edge queue: every recorded edge becomes exactly one
 //     replayed edge, in order, at most one per channel per XR frame (a 1-frame press survives a slower replay; nothing doubles);
 //   * triggers / grips: the latest value, except that a crossing of 0.5 is never skipped (the crossing record's value is delivered first);
-//   * a recorded runtime recenter (reference-space change) is re-applied (resetSpace) when the replay passes it; user recenters (stick
+//   * a recorded runtime recenter (reference-space change) is re-applied (resetSpace) when the replay passes it; player recenters (stick
 //     chord, VR page RECENTER) regenerate from the replayed buttons.
 // Haptics (outputs) are not recorded. Recording during a replay records what the frames used (a copy, flag::replayed) -> fidelity diff.
 // Threads: XR thread = hooks, commit, property poll; writer thread (detached, one per recording: fopen / fwrite / fflush per chunk, the XR

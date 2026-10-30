@@ -13,7 +13,7 @@ class ControllerActions {
     std::array<XrPath,2> hands_{};
     std::array<XrSpace,2> gripSpaces_{};
     HoldChord theaterChord_;
-    ::rdrvr::vr::controls::StickClickArbiter stickClicks_; // Controls: replaces the 1 s both-clicks HoldChord
+    ::rdrvr::vr::controls::StickClickArbiter stickClicks_; // Controls: single stick clicks + recenter chord
     std::array<bool,2> theaterGrips_{};bool manualTheater_{};
     bool(*gripsBusy_)() noexcept{}; // VR holsters own a grip -> theater chord disarmed, grips untouched
     XrAction haptic_{};XrSession hapticSession_{};HapticOutput hapticOutput_;

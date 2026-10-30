@@ -6,7 +6,7 @@
 #include "diagnostics/FrameTimings.h"
 #include "diagnostics/ProcessLoad.h"
 #include "KgslClock.h" // kgsl GPU clock reader + the measurement pack switch (measurementPack)
-#include "HeatWarning.h" // heat01: runtime THERMAL notifications feed the OVERHEAT WARNING
+#include "HeatWarning.h" // Runtime THERMAL notifications feed the CLOCK NOTICE
 #include <openxr/openxr.h>
 #include <algorithm>
 #include <array>
@@ -182,7 +182,7 @@ public:
 #endif
         if(event.subDomain==XR_PERF_SETTINGS_SUB_DOMAIN_THERMAL_EXT){
             (event.domain==XR_PERF_SETTINGS_DOMAIN_CPU_EXT?thermalCpu_:thermalGpu_)=event.toLevel;
-            heatWarning.noteXrThermal(event.domain==XR_PERF_SETTINGS_DOMAIN_CPU_EXT?0u:1u,int(event.toLevel)); // heat01
+            heatWarning.noteXrThermal(event.domain==XR_PERF_SETTINGS_DOMAIN_CPU_EXT?0u:1u,int(event.toLevel));
             if(event.toLevel>=XR_PERF_SETTINGS_NOTIF_LEVEL_WARNING_EXT){policy_.warning();nextRetry_=0;}
         }
     }

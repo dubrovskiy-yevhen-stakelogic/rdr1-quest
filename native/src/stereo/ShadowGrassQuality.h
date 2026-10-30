@@ -207,7 +207,7 @@ inline void shadowMapCreateHook(void* shadowMap) noexcept {
     *sizeX=requested;*sizeY=requested;
     if(tablePath)*quality=4; // >3: the m_PCShadowmapSizeX/Y path (scale 1.0, same as the 800/1600 table entries)
     originalShadowMapCreate(shadowMap);
-    if(tablePath&&*quality==4)*quality=q; // the device/user ShadowQuality stays as loaded
+    if(tablePath&&*quality==4)*quality=q; // the ShadowQuality from the device settings stays as loaded
     s.createdExtent.store(*sizeX,std::memory_order_relaxed);s.mapIntercepted.fetch_add(1,std::memory_order_relaxed);
 }
 

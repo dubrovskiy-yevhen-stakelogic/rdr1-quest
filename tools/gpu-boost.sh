@@ -177,8 +177,8 @@ print_guidance() {
   echo "  - In the VR menu, GRAPHICS > GPU BOOST chooses the level: OFF, 640 or 690 MHz (default 690)."
   echo "    It shows NO HELPER when the helper is not running."
   echo "  - The boost applies only while the game runs. Home and other apps keep their normal clocks."
-  echo "  - Higher clocks drain the battery faster and warm the headset. When the headset gets hot,"
-  echo "    the game shows a red overheat warning and lowers 690 to 640 MHz."
+  echo "  - Higher clocks drain the battery faster and warm the headset, as with any boost tool. When the"
+  echo "    system lowers the clocks, which is normal, the game shows a short note and lowers 690 to 640 MHz."
   echo "  - GPU_BOOST --off stops the helper; GPU_BOOST --status shows its state."
 }
 

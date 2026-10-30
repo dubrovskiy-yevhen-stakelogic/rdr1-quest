@@ -68,6 +68,8 @@ struct Geometry {
     float radius{.0137f};    // chamber circle radius
     float half{.019f};       // half the cylinder length (|rear|)
     float swingSign{-1.f};   // the sign actually applied by the swing (side auto mirrors it for the left hand)
+    V3 barrel{0,0,-1};       // the closed barrel forward (unit): muzzle elevation + the flick roll (= axis unless TOP-BREAK)
+    bool pitch{};            // BREAK-ACTION shotgun: FLICK = a flip UP (pitch about the weapon's lateral axis), not a wrist roll
 };
 // ---- configuration (debug.rdrvr.vr.reload.* - parsed by VrReload.h startup) ----
 struct Config {
@@ -77,6 +79,9 @@ struct Config {
     float pushCm{2.f},pushZoneCm{6.f},pushRCm{-1.f},pushHeelCm{4.f},pushTipsCm{11.f};std::uint64_t pushRefractoryNs{400'000'000};
     std::uint64_t closeDwellNs{250'000'000},slamNs{60'000'000};bool follow{true};float followMax{.6f};bool velocityPose{},shadow{};
     float ejectUpDeg{30.f}; // SHAKE eject angle (deg)
+    // BREAK-ACTION flip-up (.flickPitch "thr net"): the pitch-rate jump (rad/s within flickWindow, muzzle-UP motion only) and the largest
+    // net pitch of the flip (deg; a flip-up of a long gun turns more than a wrist flick)
+    float flickPitch{7.f},flickPitchNetDeg{75.f};
 };
 enum class Source : std::uint8_t {None,B,Flick,Wave,Push,AutoLoad,Snap,Count};
 inline constexpr std::array<const char*,unsigned(Source::Count)> sourceNames{"NONE","B","FLICK","WAVE","PUSH","AUTOLOAD","SNAP"};
@@ -139,7 +144,8 @@ public:
         if(dtNs)++stats.intervalHist[histBucket(dtNs/1000u,false)];
         const Q q=t.q[hold];const V3 p=t.p[hold];
         const V3 f=unit(rot(q,g.axis)),upW=unit(rot(q,g.up)),tW=unit(rot(q,g.tangent));
-        const float muzzle=f[1]; // sin(elevation): LOCAL +Y up
+        const V3 fb=unit(rot(q,g.barrel)); // the barrel (a TOP-BREAK's tipped chamber axis is not the muzzle)
+        const float muzzle=fb[1]; // sin(elevation): LOCAL +Y up
         const bool runtimeW=!cfg.velocityPose&&(t.valid&throwing::tapeAngular(hold)),runtimeV=!cfg.velocityPose&&(t.valid&throwing::tapeLinear(hold));
         ++stats.velSamples[hold];if(t.valid&throwing::tapeAngular(hold))++stats.velValid[hold];
         const bool interval=haveHold_&&dtNs>=4'000'000ull&&dtNs<=60'000'000ull;
@@ -169,7 +175,8 @@ public:
         // ---- FLICK ----
         if(motion&&tau<quietUntil_){hist_={};n_=0;wn_=0;cand_=Cand{};motion=false;theta_+=0.f;} // the falling flank of a decided impulse
         if(motion){
-            const float wk=dot(w,f);const float wbar=n_?.5f*(wk+hist_[(n_-1)%ring].w):wk;
+            // BREAK-ACTION: the pitch rate about the lateral axis, + = muzzle up (d f / d theta = lat x f = up)
+            const float wk=g.pitch?dot(w,unit(cross(f,upW))):dot(w,fb);const float wbar=n_?.5f*(wk+hist_[(n_-1)%ring].w):wk;
             theta_+=wk*(interval?dt:0.f);
             hist_[n_%ring]={tau,wbar,theta_,wk};++n_;
             flickStep(tau,wbar,muzzle,g,gate,d);
@@ -226,17 +233,18 @@ private:
         float best=0;std::uint64_t bestTi=0;
         for(unsigned i=0;i+1<m;++i){const auto& e=hist_[(n_-m+i)%ring];if(tau-e.tau>cfg.flickWindowNs)continue;
             const float delta=wbar-e.wbar;
-            if(cfg.flickClose&&delta*g.swingSign<=0.f)continue; // sgnClose = +sign
+            if(g.pitch&&std::max(wbar,e.wbar)<.5f*cfg.flickPitch)continue; // only a flip UP (a downward snap never closes a break)
+            if(!g.pitch&&cfg.flickClose&&delta*g.swingSign<=0.f)continue; // sgnClose = +sign
             if(std::fabs(delta)>std::fabs(best)){best=delta;bestTi=e.tau;}}
         stats.rollJMax=std::max(stats.rollJMax,std::fabs(best));
-        const float thrBase=cfg.flickRoll,thr=up?cfg.flickRollUp:cfg.flickRoll;
-        if(std::fabs(best)>=cfg.flickBig){fireFlick(best,std::fabs(best),0.f,gate,g,d);n_=0;return;} // one impulse = one decision
+        const float thrBase=g.pitch?cfg.flickPitch:cfg.flickRoll,thr=g.pitch?cfg.flickPitch:up?cfg.flickRollUp:cfg.flickRoll; // a flip-up lifts the muzzle
+        if(std::fabs(best)>=(g.pitch?std::max(cfg.flickBig,1.7f*cfg.flickPitch):cfg.flickBig)){fireFlick(best,std::fabs(best),0.f,gate,g,d);n_=0;return;} // one impulse = one decision
         if(std::fabs(best)>=thrBase&&(!cand_.on||std::fabs(best)>std::fabs(cand_.delta))){cand_={true,bestTi,tau,best,thr,up};}
         else if(std::fabs(best)>=.7f*thrBase&&std::fabs(best)<thrBase)++stats.rollNear;
         if(cand_.on&&(tau>=cand_.tj+100'000'000ull||(tau>cand_.tj&&std::fabs(wbar)<=3.f))){
             const std::uint64_t to=std::min<std::uint64_t>(tau,cand_.tj+100'000'000ull),from=cand_.ti>150'000'000ull?cand_.ti-150'000'000ull:0;
             const float net=std::fabs(thetaAt(to)-thetaAt(from))*57.29578f;const Cand c=cand_;cand_=Cand{};n_=0; // decided: its falling flank is not a 2nd impulse
-            if(net>cfg.flickNetDeg){++stats.rollNetRejected;stats.rollNetLast=net;return;}
+            if(net>(g.pitch?cfg.flickPitchNetDeg:cfg.flickNetDeg)){++stats.rollNetRejected;stats.rollNetLast=net;return;}
             if(std::fabs(c.delta)<c.thr){ // muzzle up: the raised threshold is not met - a refusal tick (the gesture itself passed)
                 unsigned r=RefuseCount;if(common(gate,gate.flickRow,d,r)){d.refuseTick=true;d.refusal=RefuseMuzzleUp;}return;}
             fireFlick(c.delta,std::fabs(c.delta),net,gate,g,d);
@@ -283,6 +291,8 @@ private:
         const float Rc=cfg.pushRCm>0.f?cfg.pushRCm*.01f:g.radius+.0065f,contactR=Rc+.015f;
         const float zoneIn=cfg.pushZoneCm*.01f,zoneOut=zoneIn+.015f;
         const bool rowOk=gate.pushRow&&gate.frame&&gate.rigid;
+        // BREAK-ACTION: the barrels are pushed anywhere along the occluder (breech .. +`barrel`), not within +-1.5 cm of its middle
+        const float axArm=g.pitch?std::max(.015f,g.half):.015f,axPush=g.pitch?std::max(.025f,g.half+.01f):.025f;
         if(!rowOk){if(P.state!=PushOut){P=Push{};}return;}
         if(!(t.valid>>free&1u)){ // a tracking gap of the free hand: no reset; > 100 ms -> the push restarts (state kept)
             ++stats.pushTrackedGaps;P.prevValid=false;return;}
@@ -319,8 +329,8 @@ private:
             if(!gate.freeFree){P.state=PushBlocked;P.block=BlockHeld;++stats.pushBlocked[BlockHeld];break;}
             {const std::uint64_t ev=std::max({gate.lastSeatNs,gate.lastEjectNs,gate.lastDropNs,gate.lastGrabNs,gate.lastPluckNs});
              const bool refr=gate.now>=ev+cfg.pushRefractoryNs;
-             const bool surface=side<=-.005f&&dist>=Rc-.005f&&ax>=-.015f&&ax<=.015f;
-             const bool slap=P.prevValid&&adjacent&&sidePrev<=-.005f&&side-sidePrev>=.01f&&ax>=-.025f&&ax<=.025f;
+             const bool surface=side<=-.005f&&dist>=Rc-.005f&&ax>=-axArm&&ax<=axArm;
+             const bool slap=P.prevValid&&adjacent&&sidePrev<=-.005f&&side-sidePrev>=.01f&&ax>=-axPush&&ax<=axPush;
              if(refr&&(surface||slap)){P.state=PushArmed;P.push=0;++stats.pushArmed;
                 if(slap)P.push=std::max(0.f,std::max(side,-contactR)-std::max(sidePrev,-contactR));}}
             break;
@@ -339,7 +349,7 @@ private:
                     P=Push{};break;}
                 ++stats.pushGlitchRejected;P.push=std::max(0.f,P.push-back);P.state=PushArmed;break;}
             if(std::fabs(dot(dp,f))>std::fabs(dot(dp,dd))){++stats.pushAxialSkipped;break;} // along the barrel: the ejector rod / a poke
-            if(ax>=-.025f&&ax<=.025f)P.push=std::max(0.f,P.push+(std::max(side,-contactR)-std::max(sidePrev,-contactR)));
+            if(ax>=-axPush&&ax<=axPush)P.push=std::max(0.f,P.push+(std::max(side,-contactR)-std::max(sidePrev,-contactR)));
             stats.pushMaxCm=std::max(stats.pushMaxCm,P.push*100.f);
             if(cfg.follow&&P.push>0.f){const float prog=std::min(P.push/(cfg.pushCm*.01f),1.f);P.followV=1.f-cfg.followMax*prog;++stats.pushFollowFrames;}
             else P.followV=1.f;

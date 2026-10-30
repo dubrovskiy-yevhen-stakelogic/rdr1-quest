@@ -62,6 +62,7 @@
 namespace rdrvr::engine {
 #ifdef RDRVR_NATIVE_MENUS
 void gameConfigureUi(NativeUiApi) noexcept;
+std::string gamePresentationHistory(); // report vr.presentationHistory
 bool gameCaptureHud(VkQueue,const runtime::CompletedQuadImage&,std::uint64_t nowNs) noexcept;
 #endif
 #ifdef RDRVR_TOUCH_CONTROLS
@@ -76,6 +77,7 @@ void gameConfigureReticleUi(NativeReticleUiReader::Api,bool) noexcept;
 void gameObserveReticleUi(void*,bool,std::uint64_t) noexcept;
 void gameConfigureProjectileLaunch(ProjectileLaunchReader::Api,bool) noexcept;
 void gameObserveProjectileLaunch(const ProjectileLaunchCall&,const WeaponFireScope&,bool,std::uint64_t) noexcept;
+bool gameAdjustProjectileLaunch(const ProjectileLaunchCall&,const WeaponFireScope&,WeaponNativeMatrix&,AimNativeVector&,AimNativeVector&,std::uint64_t) noexcept;
 bool gamePrepareWeaponModel(const WeaponModelCall&,WeaponNativeMatrix&,std::uint64_t) noexcept;
 void gameWeaponModelComplete(const WeaponModelCall&,bool,bool) noexcept;
 void gameObserveReticle(void*,std::uint64_t,std::uint64_t) noexcept;
@@ -151,6 +153,7 @@ bool gameReplayCloud(void*,const void*,bool,void**);
 std::uint64_t gameBeginVisibility(std::uintptr_t renderer,std::uint32_t marker,std::uintptr_t viewport,std::uintptr_t camera,std::uint64_t ns,
                                 bool(*)(void*,std::uintptr_t,void*,std::size_t),void*);
 void gameFinishVisibility(std::uint64_t,bool) noexcept;
+const void* gameCutsceneShadowCull() noexcept; // CUTSCENE SHADOWS: the stereo cull clone of the running visibility call, or nullptr
 void gameObserveFrozenCamera(std::uintptr_t renderer,std::uint32_t marker,std::uintptr_t viewport,std::uint64_t ns,
                              bool(*)(void*,std::uintptr_t,void*,std::size_t),void*);
 void gameConfigureEngineTargets(EngineTargetApi) noexcept;

@@ -8,12 +8,12 @@ struct GameVulkanDispatch {
     PFN_vkCreateDevice createDevice{};
     PFN_vkDestroyInstance destroyInstance{};
     PFN_vkDestroyDevice destroyDevice{};
-    // QU: the game's original vkGetDeviceQueue (GameXr G9 routes the game's calls through getDeviceQueue below).
+    // The game's original vkGetDeviceQueue (GameXr routes the game's calls through getDeviceQueue below).
     // Null = the redirect is not routed: split queue layouts are refused (reason REDIRECT_UNAVAILABLE).
     PFN_vkGetDeviceQueue queue{};
 };
-// QU: queue layout selection for the game device (read once, before the first XR device create).
-//  debug.rdrvr.queueprio 0/2/3 wins (developer override; the xrQueueVerified gate is reported but not applied);
+// Queue layout selection for the game device (read once, before the first XR device create).
+//  debug.rdrvr.queueprio 0/2/3 wins (debug override; the xrQueueVerified gate is reported but not applied);
 //  otherwise graphics.cfg xrQueuePriority 0 NORMAL = Appended, 1 PRIORITY = SplitHigh; no cfg loaded = Appended.
 //  PRIORITY while the previous split start never reached 300 layer frames (startupVerified false) = Appended,
 //  reason PREV_SPLIT_UNVERIFIED.
@@ -54,14 +54,14 @@ public:
     VkResult createDevice(VkPhysicalDevice,const VkDeviceCreateInfo*,const VkAllocationCallbacks*,VkDevice*);
     void destroyInstance(VkInstance,const VkAllocationCallbacks*);
     void destroyDevice(VkDevice,const VkAllocationCallbacks*);
-    // QU: the game's vkGetDeviceQueue. Split layout: the game's own (family, index < game count) queues are the
+    // The game's vkGetDeviceQueue. Split layout: the game's own (family, index < game count) queues are the
     // protected-capable handles resolved with vkGetDeviceQueue2 at creation; every other call is forwarded unchanged.
     void getDeviceQueue(VkDevice device,std::uint32_t family,std::uint32_t index,VkQueue* output);
     bool binding(XrGraphicsBindingVulkan2KHR& out) const {return bound_ && bootstrap_->binding(out);}
     VkInstance gameInstance() const {return active_?instance_:VK_NULL_HANDLE;}
     const char* state() const {return state_;}
     BootstrapResult lastResult() const {return last_;}
-    const QueueLayoutResult& queueLayout() const {return layout_;}   // QU: the last device create's layout
+    const QueueLayoutResult& queueLayout() const {return layout_;}   // The last device create's layout
     const QueueLayoutChoice& queueLayoutChoice() const {return choice_;}
 };
 }

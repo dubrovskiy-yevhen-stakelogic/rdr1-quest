@@ -1,7 +1,7 @@
 #include "GraphicsSettings.h"
 #include "AntiAliasingStatus.h"
-#include "HeatWarning.h" // heat01
-#include "GpuBoost.h" // boost01
+#include "HeatWarning.h"
+#include "GpuBoost.h"
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
@@ -75,9 +75,9 @@ bool parse(std::string_view text,GraphicsSettings::Settings& out,ParseInfo& info
         else if(key=="xrQueueVerified"){bit=1u<<18;if(number>1)return false;result.xrQueueVerified=number!=0;}
         else if(key=="taaSharpness"){bit=1u<<29;if(number>=GraphicsSettings::taaSharpnessModes)return false;result.taaSharpness=number;}
         else if(key=="lampShadows"){bit=1u<<19;if(number>=GraphicsSettings::lampShadowsPresets)return false;result.lampShadows=number;}
-        else if(key=="heatWarning"){bit=1u<<30;if(number>1)return false;result.heatWarning=number!=0;} // heat01
-        else if(key=="gpuBoost"){bit=1u<<22;if(number>=GraphicsSettings::gpuBoostModes)return false;result.gpuBoost=number;} // boost01
-        else if(key=="water"){bit=1u<<23;if(number>1)return false;result.water=number!=0;} // w02 (bit still free: 1<<31)
+        else if(key=="heatWarning"){bit=1u<<30;if(number>1)return false;result.heatWarning=number!=0;}
+        else if(key=="gpuBoost"){bit=1u<<22;if(number>=GraphicsSettings::gpuBoostModes)return false;result.gpuBoost=number;}
+        else if(key=="water"){bit=1u<<23;if(number>1)return false;result.water=number!=0;} // Bit still free: 1<<31
         else return false;
         if(seen&bit)return false;seen|=bit;
     }
@@ -198,9 +198,9 @@ bool GraphicsSettings::loadOnce() noexcept {
     }catch(...){loadResult_=false;settings_={};legacyOcclusion_=-1;cfgVersionLoaded_=0;cfgMigrated_=cfgMigrationSaved_=s02MaskClamped_=false;}
     startupResolutionPercent_=settings_.resolutionPercent;startupXrQueuePriority_=settings_.xrQueuePriority;
     taaSharpness.store(int(settings_.taaSharpness),std::memory_order_relaxed);
-    heatWarningSetting.store(settings_.heatWarning?1:0,std::memory_order_relaxed); // heat01
-    gpuBoostSetting.store(int(settings_.gpuBoost),std::memory_order_relaxed); // boost01
-    waterSetting.store(settings_.water?1:0,std::memory_order_relaxed); // w02
+    heatWarningSetting.store(settings_.heatWarning?1:0,std::memory_order_relaxed);
+    gpuBoostSetting.store(int(settings_.gpuBoost),std::memory_order_relaxed);
+    waterSetting.store(settings_.water?1:0,std::memory_order_relaxed);
     // a migrated file that could not be written keeps the migrated values for this session (SAVE FAILED in the menu).
     persistenceOk_=loadResult_&&!migrationFailed;return loadResult_;
 }
@@ -226,15 +226,15 @@ bool GraphicsSettings::saveLocked() noexcept {
         const int pacing=std::fprintf(file,"frameRate=%u\nspaceWarp=%u\n",settings_.frameRate,settings_.spaceWarp);
         const int shadowGrass=std::fprintf(file,"shadowUpdate=%u\nshadowMap=%u\ngrassDistance=%u\n",settings_.shadowUpdate,settings_.shadowMap,settings_.grassDistance);
         // postFx 2 (OFF FAST) is session-only and saved as 0, so a misbehaving OFF FAST cannot persist.
-        const int r53=std::fprintf(file,"occlusionV2=%u\npostFx=%u\ntextureFilter=%u\nmipBias=%u\nsharpen=%u\ncascadeCull=%u\nxrQueuePriority=%u\nxrQueueVerified=%u\n",
+        const int quality=std::fprintf(file,"occlusionV2=%u\npostFx=%u\ntextureFilter=%u\nmipBias=%u\nsharpen=%u\ncascadeCull=%u\nxrQueuePriority=%u\nxrQueueVerified=%u\n",
             unsigned(settings_.occlusion),settings_.postFx==postFxOffFast?0u:settings_.postFx,settings_.textureFilter,settings_.mipBias,
             settings_.sharpen,settings_.cascadeCull,settings_.xrQueuePriority,unsigned(settings_.xrQueueVerified));
-        const int ls01=std::fprintf(file,"lampShadows=%u\ntaaSharpness=%u\n",settings_.lampShadows,settings_.taaSharpness);
-        const int ship01=std::fprintf(file,"s02Mask=0x%04x\n",settings_.s02Mask&s02MaskBits);
-        const int heat01=settings_.heatWarning?1:std::fprintf(file,"heatWarning=0\n"); // heat01: default ON is not written (pre-heat01 builds still parse the file)
-        const int boost01=settings_.gpuBoost==2?1:std::fprintf(file,"gpuBoost=%u\n",settings_.gpuBoost); // boost01: default 690 is not written (same reason)
-        const int w02=settings_.water?1:std::fprintf(file,"water=0\n"); // w02: default ON is not written (same reason)
-        const bool written=count>0&&pacing>0&&shadowGrass>0&&r53>0&&ls01>0&&ship01>0&&heat01>0&&boost01>0&&w02>0&&durableFlush(file);
+        const int lamps=std::fprintf(file,"lampShadows=%u\ntaaSharpness=%u\n",settings_.lampShadows,settings_.taaSharpness);
+        const int levers=std::fprintf(file,"s02Mask=0x%04x\n",settings_.s02Mask&s02MaskBits);
+        const int heat=settings_.heatWarning?1:std::fprintf(file,"heatWarning=0\n"); // Default ON is not written (older builds still parse the file)
+        const int boost=settings_.gpuBoost==2?1:std::fprintf(file,"gpuBoost=%u\n",settings_.gpuBoost); // Default 690 is not written (same reason)
+        const int waterLine=settings_.water?1:std::fprintf(file,"water=0\n"); // Default ON is not written (same reason)
+        const bool written=count>0&&pacing>0&&shadowGrass>0&&quality>0&&lamps>0&&levers>0&&heat>0&&boost>0&&waterLine>0&&durableFlush(file);
         const bool closed=std::fclose(file)==0;file=nullptr;
         if(written&&closed&&replaceFile(temporary,target)){persistenceOk_=true;return true;}
     }catch(...){}
@@ -346,17 +346,17 @@ bool GraphicsSettings::setCascadeCull(unsigned v) noexcept {return setLevel(&Set
 bool GraphicsSettings::setXrQueuePriority(unsigned v) noexcept {return setLevel(&Settings::xrQueuePriority,v,xrQueuePriorities);}
 bool GraphicsSettings::setXrQueueVerified(bool v) noexcept {return setFlag(&Settings::xrQueueVerified,v);}
 bool GraphicsSettings::setLampShadows(unsigned v) noexcept {return setLevel(&Settings::lampShadows,v,lampShadowsPresets);}
-bool GraphicsSettings::setHeatWarning(bool v) noexcept { // heat01: live (HeatWarning reads the published value every frame)
+bool GraphicsSettings::setHeatWarning(bool v) noexcept { // Live (HeatWarning reads the published value every frame)
     PreserveErrno preserve;std::lock_guard lock(mutex_);
     if(!loaded_)return false;
     settings_.heatWarning=v;heatWarningSetting.store(v?1:0,std::memory_order_relaxed);return saveLocked();
 }
-bool GraphicsSettings::setGpuBoost(unsigned v) noexcept { // boost01: live (the GpuBoost worker reads the published value at 4 Hz)
+bool GraphicsSettings::setGpuBoost(unsigned v) noexcept { // Live (the GpuBoost worker reads the published value at 4 Hz)
     PreserveErrno preserve;std::lock_guard lock(mutex_);
     if(!loaded_||v>=gpuBoostModes)return false;
     settings_.gpuBoost=v;gpuBoostSetting.store(int(v),std::memory_order_relaxed);return saveLocked();
 }
-bool GraphicsSettings::setWater(bool v) noexcept { // w02: live (GameXr reads the published value every stereo frame)
+bool GraphicsSettings::setWater(bool v) noexcept { // Live (GameXr reads the published value every stereo frame)
     PreserveErrno preserve;std::lock_guard lock(mutex_);
     if(!loaded_)return false;
     settings_.water=v;waterSetting.store(v?1:0,std::memory_order_relaxed);return saveLocked();
@@ -374,9 +374,9 @@ bool GraphicsSettings::setGrassRow(bool on,unsigned distance) noexcept {
 bool GraphicsSettings::restoreDefaults() noexcept {
     PreserveErrno preserve;std::lock_guard lock(mutex_);
     if(!loaded_)return false;
-    settings_=Settings{};heatWarningSetting.store(settings_.heatWarning?1:0,std::memory_order_relaxed); // heat01
-    gpuBoostSetting.store(int(settings_.gpuBoost),std::memory_order_relaxed); // boost01
-    waterSetting.store(settings_.water?1:0,std::memory_order_relaxed);return saveLocked(); // w02
+    settings_=Settings{};heatWarningSetting.store(settings_.heatWarning?1:0,std::memory_order_relaxed);
+    gpuBoostSetting.store(int(settings_.gpuBoost),std::memory_order_relaxed);
+    waterSetting.store(settings_.water?1:0,std::memory_order_relaxed);return saveLocked();
 }
 unsigned GraphicsSettings::postFx() const noexcept {return snapshot().requested.postFx;}
 unsigned GraphicsSettings::textureFilter() const noexcept {return snapshot().requested.textureFilter;}
@@ -387,9 +387,9 @@ unsigned GraphicsSettings::xrQueuePriority() const noexcept {return snapshot().r
 bool GraphicsSettings::xrQueueVerified() const noexcept {return snapshot().requested.xrQueueVerified;}
 unsigned GraphicsSettings::lampShadows() const noexcept {return snapshot().requested.lampShadows;}
 unsigned GraphicsSettings::s02Mask() const noexcept {return snapshot().requested.s02Mask;}
-bool GraphicsSettings::heatWarning() const noexcept {return snapshot().requested.heatWarning;}        // heat01
-unsigned GraphicsSettings::gpuBoost() const noexcept {return snapshot().requested.gpuBoost;}         // boost01
-bool GraphicsSettings::water() const noexcept {return snapshot().requested.water;}                  // w02
+bool GraphicsSettings::heatWarning() const noexcept {return snapshot().requested.heatWarning;}
+unsigned GraphicsSettings::gpuBoost() const noexcept {return snapshot().requested.gpuBoost;}
+bool GraphicsSettings::water() const noexcept {return snapshot().requested.water;}
 int GraphicsSettings::legacyOcclusion() const noexcept {return snapshot().legacyOcclusion;}
 unsigned GraphicsSettings::shadowUpdate() const noexcept {return snapshot().requested.shadowUpdate;}
 unsigned GraphicsSettings::shadowMap() const noexcept {return snapshot().requested.shadowMap;}

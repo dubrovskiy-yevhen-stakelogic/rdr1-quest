@@ -27,7 +27,7 @@
 // OBJECTS or debug.rdrvr.smallobjects=<px>) or the histogram is explicitly requested with
 // debug.rdrvr.smallobjects.histogram=1 (bucket counts only, no clock calls) or =2 (counts
 // plus the CPU bracket on every 4th object). The DETAIL profiler alone does not enable it.
-// cpu02: the CPU bracket runs only with histogram=2 (max of the caller's request and the property); a threshold alone no longer times.
+// The CPU bracket runs only with histogram=2 (max of the caller's request and the property); a threshold alone does not time.
 // Projected size = bounding-sphere DIAMETER in eye pixels = 2r/d * |P11| * 1760/2.
 #include <array>
 #include <atomic>
@@ -53,7 +53,7 @@ public:
     static constexpr float eyeHeightPx=1760.f;
     enum Exclusion : unsigned {NotMain,Unpinned,Nested,NoCamera,Kind,NoDrawable,BadSphere,ExclusionCount};
     using Read=bool(*)(void*,std::uintptr_t,void*,std::size_t);
-    struct Token {unsigned stage{},cls{},bucket{UINT32_MAX};bool entered{},skip{},timed{},counted{};std::uint64_t t0{};unsigned* nest{};}; // cpu02: nest = this thread's counter (end() without TLS)
+    struct Token {unsigned stage{},cls{},bucket{UINT32_MAX};bool entered{},skip{},timed{},counted{};std::uint64_t t0{};unsigned* nest{};}; // nest = this thread's counter (end() without TLS)
     class Stage {
         unsigned previous_{};
     public:
@@ -65,10 +65,10 @@ private:
     using Grid=std::array<std::array<std::array<std::uint32_t,bucketCount>,ClassCount>,2>;
     using AtomicGrid=std::array<std::array<std::array<std::atomic<std::uint32_t>,bucketCount>,ClassCount>,2>;
     using AtomicGrid64=std::array<std::array<std::array<std::atomic<std::uint64_t>,bucketCount>,ClassCount>,2>;
-    struct Tls {unsigned stage,nest;};constinit inline static thread_local Tls tls_{}; // cpu02: one TLS lookup for stage and nest
+    struct Tls {unsigned stage,nest;};constinit inline static thread_local Tls tls_{}; // one TLS lookup for stage and nest
     Read read_{};
     std::atomic<bool> active_{};       // threshold>0 || histogram requested; false => begin() is one branch
-    std::atomic<bool> timing_{};       // cpu02: histogram==2 only: CPU bracket on every 4th measured object
+    std::atomic<bool> timing_{};       // histogram==2 only: CPU bracket on every 4th measured object
     std::atomic<unsigned> histogram_{}; int histogramProperty_{0};
     // Published once per MAIN frame by frame() (visibility task).
     std::atomic<std::uint64_t> cameraSeq_{};
@@ -89,10 +89,10 @@ private:
     std::array<Row,ringFrames> ring_{};std::atomic<std::uint64_t> ringCount_{};
     AtomicGrid64 lifeNs_{},lifeTimed_{};
     std::atomic<std::uint64_t> skippedTotal_{},midFrameCameraChanges_{},endFramesWithoutCamera_{};
-    // hat01 (user: NPC hats and held newspapers vanished a few metres away): worn/held props are separate draws without a
-    // creature pointer, so the size test dropped them (0.3 m hat < 16 px beyond ~10.7 m, 0.1 m prop beyond ~3.6 m). Small objects whose
+    // Worn/held props (NPC hats, held newspapers) are separate draws without a
+    // creature pointer, so the size test alone drops them (0.3 m hat < 16 px beyond ~10.7 m, 0.1 m prop beyond ~3.6 m). Small objects whose
     // sphere touches a creature sphere of the PREVIOUS frame (depth stage list; same decision in depth and colour) are never skipped.
-    // debug.rdrvr.smallobjects.attach 0 = old behaviour (A/B). Render thread only (measure/endFrame), except attach_ (frame()).
+    // debug.rdrvr.smallobjects.attach 0 = size test only (A/B). Render thread only (measure/endFrame), except attach_ (frame()).
     static constexpr unsigned maxCreatures=64;static constexpr float attachSlackM=0.6f; // ped motion per frame + hand reach
     struct Ball{float c[3]{},r{};};std::array<Ball,maxCreatures> creatureNext_{},creatureNow_{};unsigned creatureNextN_{},creatureNowN_{};
     std::atomic<bool> attach_{true};std::atomic<std::uint64_t> attachedKept_{};std::atomic<unsigned> creaturesLast_{}; // report copy
@@ -115,7 +115,7 @@ private:
         return -1;
 #endif
     }
-    static bool readAttachProperty()noexcept{ // hat01: unset/anything but "0" = keep props near creatures
+    static bool readAttachProperty()noexcept{ // unset/anything but "0" = keep props near creatures
 #ifdef __ANDROID__
         char v[PROP_VALUE_MAX]{};return !(__system_property_get("debug.rdrvr.smallobjects.attach",v)>0&&v[0]=='0'&&!v[1]);
 #else
@@ -159,9 +159,9 @@ public:
         const auto f=frames_.fetch_add(1,std::memory_order_relaxed);
         if((f&63)==0){property_=readProperty();histogramProperty_=readHistogramProperty();attach_.store(readAttachProperty(),std::memory_order_relaxed);propertyReads_.fetch_add(1,std::memory_order_relaxed);}
         const bool property=property_>=0;const unsigned threshold=property?unsigned(property_):menuPx;
-        const unsigned wanted=unsigned(histogram>histogramProperty_?histogram:histogramProperty_); // cpu02: max(request, property), so the property can add timing
+        const unsigned wanted=unsigned(histogram>histogramProperty_?histogram:histogramProperty_); // max(request, property), so the property can add timing
         threshold_.store(threshold,std::memory_order_relaxed);source_.store(property?1u:0u,std::memory_order_relaxed);
-        histogram_.store(wanted,std::memory_order_relaxed);timing_.store(wanted>=2,std::memory_order_relaxed); // cpu02: no clock pair per 4th object for the menu threshold
+        histogram_.store(wanted,std::memory_order_relaxed);timing_.store(wanted>=2,std::memory_order_relaxed); // no clock pair per 4th object for the menu threshold
         active_.store(threshold>0||wanted>0,std::memory_order_relaxed);
         if(!threshold&&!wanted)return; // nothing measured: no per-frame reads either
         float rows[16]{},p11{};std::uintptr_t container{};
@@ -207,9 +207,9 @@ public:
         const float px=projectedPx(centre,radius,frameCamera_,frameFocal_);
         t.bucket=bucketOf(px);t.counted=true;++frame_.count[s][t.cls][t.bucket];
         const unsigned threshold=threshold_.load(std::memory_order_relaxed);
-        if(t.cls==Creature&&s==0&&creatureNextN_<maxCreatures)creatureNext_[creatureNextN_++]=Ball{{centre[0],centre[1],centre[2]},radius}; // hat01
+        if(t.cls==Creature&&s==0&&creatureNextN_<maxCreatures)creatureNext_[creatureNextN_++]=Ball{{centre[0],centre[1],centre[2]},radius};
         if(threshold&&t.cls!=Creature&&px<float(threshold)){
-            if(attach_.load(std::memory_order_relaxed)&&nearCreature(centre,radius))attachedKept_.fetch_add(1,std::memory_order_relaxed); // hat01: worn/held props stay
+            if(attach_.load(std::memory_order_relaxed)&&nearCreature(centre,radius))attachedKept_.fetch_add(1,std::memory_order_relaxed); // worn/held props stay
             else{t.skip=true;++frame_.skipped[s][t.cls][t.bucket];skippedTotal_.fetch_add(1,std::memory_order_relaxed);return t;}}
         if(timing_.load(std::memory_order_relaxed)&&(objectCounter_++%timingStride)==0){t.timed=true;t.t0=now();}
         return t;
@@ -217,7 +217,7 @@ public:
     // Must be called for every begin() (also for skipped objects).
     void end(const Token& t)noexcept{
         if(!t.entered)return;
-        if(t.nest&&*t.nest)--*t.nest; // cpu02: entered => nest points at this thread's counter (set in measure)
+        if(t.nest&&*t.nest)--*t.nest; // entered => nest points at this thread's counter (set in measure)
         if(!t.timed)return;
         const auto ns=now()-t.t0;const unsigned s=t.stage-1;
         frame_.ns[s][t.cls][t.bucket]+=ns;++frame_.timed[s][t.cls][t.bucket];
@@ -228,7 +228,7 @@ public:
         if(!active_.load(std::memory_order_relaxed)&&!frameSeqSet_)return; // gated off: nothing to publish
         if(!frameSeqSet_)endFramesWithoutCamera_.fetch_add(1,std::memory_order_relaxed);
         consumedSeq_=frameSeqSet_?frameSeq_:cameraSeq_.load(std::memory_order_acquire);frameSeqSet_=false;
-        if(creatureNextN_){creatureNow_=creatureNext_;creatureNowN_=creatureNextN_;creaturesLast_.store(creatureNowN_,std::memory_order_relaxed);}creatureNextN_=0; // hat01: a frame without a depth stage keeps the last list
+        if(creatureNextN_){creatureNow_=creatureNext_;creatureNowN_=creatureNextN_;creaturesLast_.store(creatureNowN_,std::memory_order_relaxed);}creatureNextN_=0; // a frame without a depth stage keeps the last list
         const auto n=ringCount_.load(std::memory_order_relaxed);auto& row=ring_[n%ringFrames];
         for(unsigned s=0;s<2;++s){
             for(unsigned c=0;c<ClassCount;++c)for(unsigned b=0;b<bucketCount;++b){
@@ -259,7 +259,7 @@ public:
         o+=",\"mainFrames\":"+u(frames_.load(std::memory_order_relaxed))+",\"framesMeasured\":"+u(total)+",\"window\":"+u(n);
         o+=",\"skippedTotal\":"+u(skippedTotal_.load(std::memory_order_relaxed))+",\"midFrameCameraChanges\":"+u(midFrameCameraChanges_.load(std::memory_order_relaxed))+
             ",\"framesWithoutCamera\":"+u(endFramesWithoutCamera_.load(std::memory_order_relaxed))+",\"timingStride\":"+u(timingStride);
-        o+=",\"attach\":";o+=attach_.load(std::memory_order_relaxed)?"true":"false";o+=",\"attachedKept\":"+u(attachedKept_.load(std::memory_order_relaxed))+",\"creaturesLast\":"+u(creaturesLast_.load(std::memory_order_relaxed)); // hat01
+        o+=",\"attach\":";o+=attach_.load(std::memory_order_relaxed)?"true":"false";o+=",\"attachedKept\":"+u(attachedKept_.load(std::memory_order_relaxed))+",\"creaturesLast\":"+u(creaturesLast_.load(std::memory_order_relaxed));
         double savedNsPerFrame=0;
         for(unsigned s=0;s<2;++s){
             o+=",\"";o+=stageNames[s];o+="\":{";

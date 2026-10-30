@@ -1,5 +1,5 @@
 #pragma once
-// User-selectable VISIBLE trims for heavy night scenes. Glue between
+// Menu-selectable VISIBLE trims for heavy night scenes. Glue between
 // the GRAPHICS rows (runtime GraphicsSettings) and the engine levers, called once per RenderScene from TraceEntry observeScene:
 //  * SUN SHADOWS 7 STAGGER / NIGHT OFF (SunNight.h, via ShadowUpdate.h): returns the governed SUN SHADOWS flag that
 //    GraphicsDrawPolicy::Scene gets instead of settings.shadows, publishes runtime::sunNightMenu. Kill switch

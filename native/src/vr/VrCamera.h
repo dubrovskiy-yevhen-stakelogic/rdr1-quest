@@ -87,6 +87,11 @@ struct Tuning {
     float stillSeconds=0.5f;         // stillness before samples count
     float firstCalibrationSeconds=1.f; // first calibration = mean over this window (then the slow filter)
     float minSample=1.0f,maxSample=2.4f; // plausible headBone - capsule base
+    // CROUCH (R3, the mover's IsCrouching): the eye drops by (standing reference - live head sample) of the same source, smoothed
+    // with crouchTau; no live sample -> crouchNominal (the SA mod's 0.38 m). After the release the drop only shrinks for at most
+    // crouchReleaseSeconds (the stand-up animation); the standing calibration takes no samples while crouched nor that long after.
+    float crouchTau=0.12f,crouchNominal=0.38f,crouchMaxDrop=0.85f,crouchMinEye=0.6f,crouchReleaseSeconds=1.5f;
+    float standRefTau=1.f,standRefMaxSpeed=1.6f; // standing reference: slow mean of the live sample while upright, walking pace or slower
     float ragdollTau=0.25f,recoverySeconds=0.5f,snapDistance=3.f;
     float maxLeanOn=0.30f,maxLeanOff=0.60f;
     // ---- roomscale ----
@@ -124,6 +129,16 @@ struct Input {
     bool viewsValid{};runtime::TrackedViews views{}; // TrackedViewsMailbox::snapshot(now) on the main thread
     bool psiValid{};float psi{};std::uint64_t psiOrigin{}; // VisibilityCameraBridge::worldYaw(now, psi, psiOrigin)
     bool recordValid{};body::FrameRecord record{};     // body::latestRecord(record) (LOCO)
+    bool crouching{};                // controls::crouching (mover+0xb30 posture, IsCrouching) - only counts on foot
+    // MOUNT RECENTER (GameXr riding): HEAD mode re-latches the origin XZ (eyeLatch_) to the current HMD eye this apply, so the
+    // view starts exactly at the riding eye (the room walk since the last recenter does not offset the camera from the saddle).
+    // No serial bump: like a B move, consumers see the origin position change inside the same serial (VrWeapon anchorShift dOrigin).
+    bool relatchEye{};
+    // a Loss / Actor re-latch keeps the origin yaw (inverseYaw) while
+    // riding - latching the HMD yaw at resume would make wherever the player looks then the native camera heading, and
+    // the horse would sit that far off the view for the rest of the ride. Position, B and the serial re-latch normally. A recenter
+    // (reference-space change) always re-latches the yaw. GameXr: riding frames that are not a mount edge.
+    bool keepYaw{};
 };
 
 class Rig {
@@ -136,12 +151,16 @@ private:
     mutable std::mutex mutex_; // main thread (apply) vs report writer only; never taken on the render thread
     // tracking origin
     TrackingOrigin origin_{};std::array<float,2> b_{};std::array<float,2> eyeLatch_{};std::uint64_t serialCounter_{};
+    std::uint64_t eyeRelatches_{};float eyeRelatchCm_{-1.f},hmdMinusOriginCm_{-1.f}; // mount re-latches, its jump, |hmd - origin| XZ
+    std::uint64_t yawKept_{};float yawKeptDeg_{}; // riding Loss / Actor re-latches that kept the yaw, the yaw they did not take
     bool relatchPending_{};Relatch relatchReason_{Relatch::Initial};
     std::array<std::uint64_t,unsigned(Relatch::Count)> relatches_{};
     std::uint32_t actorGuid_{};std::uint64_t lossNs_{},lastNs_{},lastApplyNs_{};
     // eye height
     bool calibrated_{},bodySource_{},recalibrating_{};std::uint64_t sourceChanges_{};float calibration_{};float stillFor_{},firstSum_{},firstTime_{};unsigned firstCount_{};
     std::uint64_t calibrationSamples_{};bool hasPrevC_{};Vec3 prevC_{};
+    // crouch: standing reference (same source as the sample), the smoothed drop, its target, time since the release
+    bool standRefValid_{},crouched_{};float standRef_{},crouchDrop_{},crouchTarget_{},sinceRelease_{1e9f};std::uint64_t crouchFrames_{},crouchNominalFrames_{};
     // ragdoll filter
     bool filterInit_{},recovering_{};float recoverT_{};Vec3 filtered_{};std::uint64_t ragdollFiltered_{};
     // roomscale
@@ -192,10 +211,12 @@ private:
         for(float f:h.neck)if(!std::isfinite(f))return false;
         return true;
     }
-    void latch(const Head& h,Relatch why){
+    void latch(const Head& h,Relatch why,bool keepYaw=false){
         b_={h.neck[0],h.neck[2]};eyeLatch_={h.eye[0],h.eye[2]};
         origin_.position={h.neck[0],h.eye[1],h.neck[2]};
-        origin_.inverseYaw={0,-std::sin(h.latchYaw/2),0,std::cos(h.latchYaw/2)};
+        if(keepYaw&&origin_.valid&&origin_.referenceSpace==h.epochs.referenceSpace&&(why==Relatch::Loss||why==Relatch::Actor)){
+            ++yawKept_;yawKeptDeg_=wrapPi(h.latchYaw-2.f*std::atan2(-origin_.inverseYaw[1],origin_.inverseYaw[3]))*57.2957795f;}
+        else origin_.inverseYaw={0,-std::sin(h.latchYaw/2),0,std::cos(h.latchYaw/2)};
         origin_.referenceSpace=h.epochs.referenceSpace;origin_.serial=++serialCounter_;origin_.valid=true;
         pending_={};lean_={};request_={};relatchPending_=false;++relatches_[unsigned(why)];
         // A new LOCAL frame starts idle; nothing measured in the old one is credited into the new one.
@@ -252,7 +273,7 @@ private:
             const float la=std::hypot(h.neck[0]-b_[0],h.neck[2]-b_[1]);
             const bool snap=hasPrevPsi_&&std::fabs(wrapPi(in.psi-prevPsi_))>0.1f; // snap turn this frame: direction unreliable
             if(!snap&&m>=t_.faultMinMotion&&lb>=t_.stopLean){
-                // Correct motion toward the target shrinks the lean by ~m (wall slides by m*cos(angle)); the device fault
+                // Correct motion toward the target shrinks the lean by ~m (wall slides by m*cos(angle)); the fault
                 // (credit with the wrong sign) grows it by m. Only "no shrink at all" counts; tiny slides (< 3 mm) never do.
                 if(la>=lb-0.02f*m){++badFrames_;badMetres_+=m;
                     if(++badStreak_>=t_.faultFrames||badMetres_>=t_.faultMetres)setFault("NO CONVERGENCE",in.now);}
@@ -277,8 +298,10 @@ private:
             const int mm=status::bodyHeadMm.load(std::memory_order_relaxed);
             if(mm>0){sample=float(mm)*.001f+in.settings.bodyEyeUp;headOk=true;bodySource=true;}else headOk=false;
         }
-        if(bodySource!=bodySource_){bodySource_=bodySource;recalibrating_=true;stillFor_=0;firstSum_=0;firstTime_=0;firstCount_=0;++sourceChanges_;}
-        const bool still=f.onFoot()&&headOk&&std::isfinite(speed)&&speed<t_.stillSpeed&&
+        if(bodySource!=bodySource_){bodySource_=bodySource;recalibrating_=true;stillFor_=0;firstSum_=0;firstTime_=0;firstCount_=0;++sourceChanges_;
+            standRefValid_=false;}
+        crouch(in,sample,headOk,speed,dt);
+        const bool still=f.onFoot()&&headOk&&std::isfinite(speed)&&speed<t_.stillSpeed&&!crouched_&&sinceRelease_>=t_.crouchReleaseSeconds&&
             std::isfinite(sample)&&sample>=t_.minSample&&sample<=t_.maxSample;
         if(!still){stillFor_=0;firstSum_=0;firstTime_=0;firstCount_=0;}
         else{
@@ -295,6 +318,29 @@ private:
         if(in.settings.eyeHeight>0){eyeSource_="FIXED";return clampf(in.settings.eyeHeight,t_.minEyeHeight,t_.maxEyeHeight);}
         eyeSource_=calibrated_?(bodySource_?"AUTO_BODY":"AUTO"):"AUTO_DEFAULT";
         return calibrated_?clampf(calibration_,t_.minEyeHeight,t_.maxEyeHeight):t_.defaultEyeHeight;
+    }
+    // the BODY eye follows the crouch: without it the eye is capsule
+    // base + the standing eye height whatever the posture. crouchDrop_ = how far the animated head is below its standing height.
+    void crouch(const Input& in,float sample,bool headOk,float speed,float dt){
+        const bool crouched=in.crouching&&in.facts.onFoot()&&mode_==Mode::Body;
+        const bool live=headOk&&std::isfinite(sample)&&sample>0.3f&&sample<t_.maxSample;
+        if(crouched&&!crouched_)crouchTarget_=crouchDrop_;
+        if(!crouched&&crouched_)sinceRelease_=0;else if(!crouched)sinceRelease_+=dt;
+        crouched_=crouched;
+        // standing reference: upright, on foot, no crouch for crouchReleaseSeconds, plausible sample, walking pace or slower
+        if(!crouched&&sinceRelease_>=t_.crouchReleaseSeconds&&in.facts.onFoot()&&live&&sample>=t_.minSample&&std::isfinite(speed)&&speed<=t_.standRefMaxSpeed){
+            if(!standRefValid_){standRef_=sample;standRefValid_=true;}
+            else if(dt>0)standRef_+=(sample-standRef_)*(1-std::exp(-dt/t_.standRefTau));
+        }
+        const float ref=standRefValid_?standRef_:calibrated_&&!recalibrating_?calibration_:-1.f;
+        const float liveDrop=live&&ref>0?clampf(ref-sample,0.f,t_.crouchMaxDrop):-1.f;
+        if(crouched){++crouchFrames_;if(liveDrop>=0)crouchTarget_=liveDrop;else{crouchTarget_=t_.crouchNominal;++crouchNominalFrames_;}}
+        else if(sinceRelease_<t_.crouchReleaseSeconds&&in.facts.onFoot())crouchTarget_=liveDrop>=0?std::min(crouchTarget_,liveDrop):crouchTarget_*.9f;
+        else crouchTarget_=0;
+        if(!std::isfinite(crouchDrop_))crouchDrop_=0;
+        crouchDrop_+=(crouchTarget_-crouchDrop_)*(dt>0?1-std::exp(-dt/t_.crouchTau):0.f);
+        if(crouchDrop_<1e-3f&&crouchTarget_<=0)crouchDrop_=0;
+        status::crouchDropMm.store(int(std::lround(crouchDrop_*1000.f)),std::memory_order_relaxed);
     }
     Vec3 filter(const Vec3& target,bool ragdoll,float dt){
         float d2{};for(unsigned i=0;i<3;++i)d2+=(target[i]-filtered_[i])*(target[i]-filtered_[i]);
@@ -386,7 +432,7 @@ public:
             }
             lastApplyNs_=in.now;if(psiValid_){prevPsi_=in.psi;hasPrevPsi_=true;}
             publishStatus();return result;};
-        if(!enabled_){anchor_="DISABLED";roomState_="OFF";anchor.origin={};anchor.kind=HeadCameraAnchor::Kind::LegacyHead;
+        if(!enabled_){anchor_="DISABLED";roomState_="OFF";crouchDrop_=crouchTarget_=0;status::crouchDropMm.store(0,std::memory_order_relaxed);anchor.origin={};anchor.kind=HeadCameraAnchor::Kind::LegacyHead;
             active_=false;ownedUntilNs_=0;hasLastC_=false;
             cancelRequest(in.now);if(in.sampled)++samples_;else ++lost_;return finish(in.sampled);}
         if(!in.sampled||!in.facts.valid){
@@ -398,12 +444,15 @@ public:
         }
         if(lossNs_&&in.now-lossNs_>t_.holdNs)markRelatch(Relatch::Loss);
         lossNs_=0;++samples_;
-        if(actorGuid_&&anchor.actorGuid!=actorGuid_){markRelatch(Relatch::Actor);calibrated_=false;filterInit_=false;hasPrevC_=false;hasLastC_=false;}
+        if(actorGuid_&&anchor.actorGuid!=actorGuid_){markRelatch(Relatch::Actor);calibrated_=false;standRefValid_=false;filterInit_=false;hasPrevC_=false;hasLastC_=false;}
         actorGuid_=anchor.actorGuid;
         if(hmd){
             if(!origin_.valid)latch(h,Relatch::Initial);
             else if(origin_.referenceSpace!=h.epochs.referenceSpace)latch(h,Relatch::Recenter);
-            else if(relatchPending_)latch(h,relatchReason_);
+            else if(relatchPending_)latch(h,relatchReason_,in.keepYaw);
+            // MOUNT RECENTER: HEAD origin XZ = this HMD eye (position only; yaw / Y / serial / B unchanged)
+            if(in.relatchEye&&mode_==Mode::Head&&origin_.valid){
+                eyeRelatchCm_=std::hypot(h.eye[0]-eyeLatch_[0],h.eye[2]-eyeLatch_[1])*100.f;eyeLatch_={h.eye[0],h.eye[2]};++eyeRelatches_;}
         }
         const auto& f=in.facts;ragdoll_=f.ragdoll;onFoot_=f.onFoot();sim_=f.simKnown;c_=f.capsule;
         noteWarp(in,h,hmd,anchor);                     // TELEPORT: before credit (a warp is never credited to B)
@@ -413,7 +462,8 @@ public:
             if(!f.headValid){++headRejects_;anchor_="NONE";reason_="NO_HEAD_BONE";active_=false;cancelRequest(in.now);return finish(false);}
             anchor.position=f.head;anchor.up=f.up;anchor.kind=HeadCameraAnchor::Kind::Head;anchor_="HEAD";filterInit_=false;
         }else{
-            const Vec3 target{f.capsule[0],f.capsule[1]+eyeHeight_,f.capsule[2]};
+            const float eye=std::max(eyeHeight_-crouchDrop_,std::min(eyeHeight_,t_.crouchMinEye)); // CROUCH: the eye follows the head down
+            const Vec3 target{f.capsule[0],f.capsule[1]+eye,f.capsule[2]};
             const bool filtering=f.ragdoll||recovering_;
             anchor.position=filter(target,f.ragdoll,dt);anchor.up={0,1,0};
             anchor.kind=filtering?HeadCameraAnchor::Kind::BodyFiltered:HeadCameraAnchor::Kind::Body;
@@ -478,6 +528,7 @@ public:
         if(origin_.valid){
             if(mode_==Mode::Body)origin_.position={b_[0],origin_.position[1],b_[1]};
             else origin_.position={eyeLatch_[0],origin_.position[1],eyeLatch_[1]};
+            if(hmd)hmdMinusOriginCm_=std::hypot(h.eye[0]-origin_.position[0],h.eye[2]-origin_.position[2])*100.f;
             anchor.origin=origin_;
         }else{anchor.origin={};if(!hmd)reason_="NO_TRACKING_ORIGIN";}
         return finish(true);
@@ -491,10 +542,14 @@ public:
         o<<",\"eyeHeightSource\":\""<<eyeSource_<<"\",\"calibrated\":"<<(calibrated_?"true":"false")<<",\"calibration\":";num(calibration_);
         o<<",\"calibrationSamples\":"<<calibrationSamples_<<",\"bodySource\":{\"active\":"<<(bodySource_?"true":"false")<<",\"recalibrating\":"
          <<(recalibrating_?"true":"false")<<",\"changes\":"<<sourceChanges_<<",\"headMm\":"<<status::bodyHeadMm.load(std::memory_order_relaxed)<<'}';
+        o<<",\"crouch\":{\"active\":"<<(crouched_?"true":"false")<<",\"drop\":";num(crouchDrop_);o<<",\"target\":";num(crouchTarget_);
+        o<<",\"standRef\":";num(standRefValid_?standRef_:-1.f);o<<",\"frames\":"<<crouchFrames_<<",\"nominalFrames\":"<<crouchNominalFrames_<<'}';
         o<<",\"C\":";vec({c_[0],c_[1],c_[2]});
         o<<",\"lean\":";vec({lean_[0],lean_[1]});o<<",\"B\":";vec({b_[0],origin_.position[1],b_[1]});
         o<<",\"origin\":{\"valid\":"<<(origin_.valid?"true":"false")<<",\"serial\":"<<origin_.serial<<",\"referenceSpace\":"<<origin_.referenceSpace
-         <<",\"relatch\":{\"initial\":"<<relatches_[0]<<",\"recenter\":"<<relatches_[1]<<",\"actor\":"<<relatches_[2]<<",\"loss\":"<<relatches_[3]<<"}}";
+         <<",\"relatch\":{\"initial\":"<<relatches_[0]<<",\"recenter\":"<<relatches_[1]<<",\"actor\":"<<relatches_[2]<<",\"loss\":"<<relatches_[3]
+         <<",\"eye\":"<<eyeRelatches_<<",\"eyeJumpCm\":";num(eyeRelatchCm_);o<<",\"yawKept\":"<<yawKept_<<",\"yawKeptDeg\":";num(yawKeptDeg_);
+        o<<"},\"hmdMinusOriginCm\":";num(hmdMinusOriginCm_);o<<'}';
         o<<",\"pushBack\":{\"total\":"<<pushBacks_<<",\"thisFrame\":"<<(pushBackFrame_?1:0)<<"},\"roomscale\":\""<<roomState_<<'"';
         o<<",\"leanCap\":";num(leanCap_);o<<",\"locoIdleFrames\":"<<locoIdleFrames_;
         o<<",\"requestHead\":{\"id\":"<<requestId_<<",\"xz\":";vec({request_[0],request_[1]});o<<",\"count\":"<<requests_

@@ -63,7 +63,7 @@ bool EngineGlobalState::inspect(Entry& e,const Signature& signature,bool capture
 }
 // Every captured value in one vectored guarded read (all ranges were validated by
 // inspect()). On failure, the per-entry reads run again in order, and the report state
-// (failing entry, numeric/sampler counts before it) is exactly that of the former
+// (failing entry, numeric/sampler counts before it) is the same as with a
 // one-read-per-entry capture.
 bool EngineGlobalState::readValues(){
     if(entries_.empty())return true;

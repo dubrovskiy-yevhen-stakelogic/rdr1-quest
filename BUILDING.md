@@ -94,6 +94,8 @@ Variant 2 uses the checked source profile in `tools/engine-profiles/variant-2.js
 It is applied to a private copy under the build directory; source and result
 hashes prevent silently applying stale edits after a shared source change.
 Maintainers must revalidate and regenerate the profile when those sources change.
+The profile has not been regenerated for 0.2.0, so a variant 2 build stops with
+the source profile error and `tools/test-engine-profiles.py` reports it.
 
 Keep the signing key at `%LOCALAPPDATA%\RDRVRBuilder\signing` on Windows, or
 `$XDG_DATA_HOME/rdrvr-builder/signing` (`~/.local/share/rdrvr-builder/signing`

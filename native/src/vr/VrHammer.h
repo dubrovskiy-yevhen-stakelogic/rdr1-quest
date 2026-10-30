@@ -190,7 +190,7 @@ struct Config {
     float capR{.12f},capFront{-.01f},capBack{.08f},capUp{.03f};// .capsule "r front back up" (cm): axis 3 cm above the spur, 1..8 cm behind it, r 12 cm
     float dominance{.55f};std::uint64_t refractoryNs{90'000'000}; // .dominance (backward share of the relative speed) / .refractory <ms>
     int retry{0};unsigned pulseFrames{1};                    // .retry (diagnostic only) / .pulse <frames>
-    bool drawCocked{},thumbCock{};                           // .drawcocked 1 / .thumbcock 1 (SA)
+    bool drawCocked{},thumbCock{true};                           // .drawcocked 1 / .thumbcock 1 (SA)
     int visual{1};float visualForceDeg{};                    // .visual 0 | force <deg> (H2; 1 = auto, self-gated)
     bool ring{false};                                        // .ring 1 = the yellow hint ring while cocking (default off)
     int boneIndex{-1};std::array<char,32> boneName{};        // .bone <i|name> (default: the first bone whose name contains "hammer")
@@ -220,7 +220,10 @@ inline bool containsUpper(const char* s,const char* upperNeedle) noexcept {
 inline int classifyAction(const char* name) noexcept {
     if(!name||!*name||!std::strcmp(name,"?"))return ActionUnknown;
     if(containsUpper(name,"DOUBLE"))return ActionDouble;
-    // REALISTIC (cock, then fire) only for the calibrated Cattleman; every other revolver fires on the trigger like CASUAL
+    // REALISTIC (cock, then fire) for every TRUSTED single-action revolver (Cattleman, Schofield, LeMat, any other revolver - the
+    // reload .models trust list); an untrusted one fires on the trigger like CASUAL
+    if(const int m=L::classifyModel(name);m>L::ModelUnknown&&m<L::ModelCount){const auto& sp=L::models[std::size_t(m)];
+        if(sp.revolver)return sp.manual&&!sp.doubleAction?ActionSingle:ActionDouble;}
     if(containsUpper(name,"CATTLEMAN"))return ActionSingle;
     if(containsUpper(name,"REVOLVER")||containsUpper(name,"SCHOFIELD")||containsUpper(name,"LEMAT")||containsUpper(name,"COLT"))return ActionDouble;
     if(containsUpper(name,"SEMIAUTO")||containsUpper(name,"MAUSER")||containsUpper(name,"VOLCANIC")||containsUpper(name,"HIGHPOWER")||containsUpper(name,"AUTOMATIC"))
@@ -380,10 +383,17 @@ inline V3 toFrame(const Q& q,V3 v) noexcept {return rotate(conjugate(q),v);} // 
 // =====================================================================================================================
 // Detector (pure, XR thread only): a backward SWIPE of any part of the free controller (grip origin, palm,
 // front ring, top) through the capsule along the gun's rear top. Speed >= 0.55 m/s relative to the gun, the
-// backward component dominant (>= 55 % of the relative speed), open-ish grip (<= .85). One stroke per swipe:
+// backward component dominant (>= 55 % of the relative speed; a REALISTIC cock 35 %), open-ish grip (<= .85). One stroke per swipe:
 // re-armed once the hand slows below 0.15 m/s or leaves the capsule (+3 cm) AND 90 ms passed. `touch` = a
 // swipe started (light contact haptic).
 struct DetHand {V3 p{};Q q{0,0,0,1};bool valid{};};
+// The free controller's contact probes (its grip frame, metres; +X = right for both hands): grip origin, palm, front ring, top, and the
+// thumb over the face buttons (rest / reaching forward to the spur) - mirrored per hand: the left thumb lies toward +X (the inner side),
+// the right one toward -X. Without the thumb a hand cocking from the side keeps its body under the floor (player: left-hand cocking failed).
+inline constexpr unsigned probeCount=6;
+inline std::array<V3,probeCount> probesOf(unsigned hand,const V3& palm) noexcept {
+    const float s=hand==0?1.f:-1.f;
+    return {V3{0.f,0.f,0.f},palm,V3{0.f,0.f,-.06f},V3{0.f,.04f,0.f},V3{s*.015f,.035f,-.03f},V3{s*.03f,.04f,-.06f}};}
 struct DetIn {std::uint64_t ns{},space{};std::array<DetHand,2> grip{};std::array<float,2> grips{},triggers{};};
 struct DetArm {bool armed{};int hold{-1};unsigned mode{ModeOff};bool needTrigger{},torsoOk{true};std::uint64_t readyAtNs{},graceNs{};};
 struct DetZone {V3 hammer{},fwd{0,0,-1},up{0,1,0};bool valid{};};
@@ -412,6 +422,7 @@ struct DetCfg {
     float capR{.12f},capFront{-.01f},capBack{.08f},capUp{.03f},capBelow{.04f},dominance{.55f};std::uint64_t refractoryNs{90'000'000};
     float fwdScale{2.5f},swipeR{.09f},downShare{.6f}; // Forward reach divided by fwdScale (clear of the cylinder); the fast swipe / force-aim near radius; the thumb arc's down weight
     float dragTravel{.025f},dragReturnS{.06f},dragRearm{.010f},dragAbsShare{.15f},dragTickM{.004f}; // DRAG (travel 0 = off)
+    float saTravelShare{.8f},cockDominance{.35f}; // REALISTIC: full cock at this share of .dragTravel; the slow cock swipe's backward share
     // The drag starts in the capsule (any grip) or up to enterMargin outside it while the hand moves back >= enterVmin relative to the
     // gun; ends beyond capR + leaveMargin; survives tracking gaps up to dragGapNs (progress re-seeded, never a jump); floor below the spur
     float enterMargin{.04f},enterVmin{.05f},leaveMargin{.05f},arcFloor{-.03f};std::uint64_t dragGapNs{300'000'000};
@@ -422,7 +433,7 @@ class Detector {
 public:
     DetCfg cfg{};
     void reset() noexcept {have_=false;havePrev_=false;swipe_=false;swipeStroked_=false;lastHold_=-1;dropDrag();cockedWait_=false;}
-    void dropDrag() noexcept {drag_=false;latched_=false;dragK_=0.f;dragTicks_=0;progress_=0.f;probeNs_=0;}
+    void dropDrag() noexcept {drag_=false;latched_=false;dragK_=0.f;dragTicks_=0;progress_=0.f;progressP_={};probeNs_=0;}
     const ContactRec& contact() const noexcept {return contact_;}
     float dragK() const noexcept {return dragK_;}
     bool cockedWait() const noexcept {return cockedWait_;}
@@ -449,8 +460,8 @@ public:
         const auto toQ=[&](V3 w){const V3 d=m::sub(w,c);return V3{m::dot(d,r),m::dot(d,u),m::dot(d,f)};};
         const V3 p=F.p;const V3 q0=toQ(p); // the free grip origin = the velocity reference
         float dist=1e9f;V3 qn=q0;unsigned ni=0;
-        const std::array<V3,4> probes{V3{0.f,0.f,0.f},cfg.palm,V3{0.f,0.f,-.06f},V3{0.f,.04f,0.f}};
-        std::array<V3,4> qs{},pw{};
+        const auto probes=probesOf(off,cfg.palm);
+        std::array<V3,probeCount> qs{},pw{};
         for(unsigned i=0;i<probes.size();++i){pw[i]=m::add(F.p,m::rotate(F.q,probes[i]));qs[i]=toQ(pw[i]);const float dd=capsuleDist(qs[i]);if(dd<dist){dist=dd;qn=qs[i];ni=i;}
             const float dn=capsuleDist(qs[i],false);if(dn<o.distNF){o.distNF=dn;o.qNF=qs[i];}}
         o.q=qn;o.computed=true;o.dist=dist;
@@ -481,7 +492,7 @@ public:
                 else if(vBack>8.f)why=RejectTracking;
                 else if(fan&&!(f[1]>=cfg.minElev&&a.torsoOk))why=RejectPose; // LOCAL +Y is up
                 else if(vBack<(fan?cfg.vmin:cfg.cockVmin))why=RejectSlow;
-                else if(vBack<cfg.dominance*vLen)why=RejectLateral;          // the backward component is not dominant
+                else if(vBack<(fan?cfg.dominance:cfg.cockDominance)*vLen)why=RejectLateral; // the backward component is not dominant (a cock from the side / top: looser)
                 else if(vAbsI<(fan?cfg.vabs:cfg.cockVabs))why=RejectGunThrust; // the gun thrust forward under a still hand
                 else if(!open)why=RejectGrip;
                 else if(fan&&a.needTrigger&&s.triggers[hold]<=.55f)why=RejectNoTrigger;
@@ -502,13 +513,15 @@ public:
         // point, or leaves. Leaving early: the hammer springs back over .dragReturn. The drag follows
         // the probe that touched first (a thumb-like wrist arc moves the front ring / top, not the grip origin), progress = its travel BACK along
         // the barrel relative to the gun + .downShare x its travel DOWN while on top of the gun (y > -1 cm, not moving forward) - the cocking arc.
-        // Forward travel takes progress back; full cock at .dragTravel (2.5 cm); no speed limit; the gun-thrust guard keeps a .dragAbsShare share.
+        // Forward travel takes progress back; full cock at .dragTravel (2.5 cm; REALISTIC x .saTravelShare = 2 cm, any probe in the region
+        // leads); no speed limit; the gun-thrust guard keeps a .dragAbsShare share.
         if(cfg.dragTravel>0.f){
             const bool trig=s.triggers[hold]>.55f;
             if(cockedWait_&&(trig&&!trigWas_)){cockedWait_=false;o.dragWaitFired=true;}
             if(cockedWait_&&!(fan&&a.needTrigger))cockedWait_=false;
             trigWas_=trig;
             const float dtD=have_&&dt>0.f?dt:1.f/72.f;
+            const float travel=fan?cfg.dragTravel:cfg.dragTravel*cfg.saTravelShare; // full cock
             // ANY contact of the free controller starts the drag - any grip value, on the first sample in the capsule,
             // or up to .enterMargin outside while moving back.
             const bool leave=dist>cfg.capR+cfg.leaveMargin;
@@ -521,32 +534,41 @@ public:
                 contact_=ContactRec{};contact_.ns=s.ns;contact_.dragNs=s.ns;contact_.q=qn;contact_.q0=q0;contact_.probe=std::uint8_t(ni);contact_.dist=dist;
                 contact_.why=o.startWhy;contact_.grip=s.grips[off];}
             if(drag_){
-                const V3 qp=qs[probe_],wp=pw[probe_];
-                // progress needs the previous sample of the same probe (within .dragGapNs, no 15 cm world jump): a gap / glitch only re-seeds
-                const bool cont=!started&&probeNs_&&s.ns>probeNs_&&s.ns-probeNs_<=cfg.dragGapNs&&m::length(m::sub(wp,probeW_))<=.15f;
+                if(started)progressP_={};
+                // progress needs the previous sample of the probes (within .dragGapNs, no 15 cm world jump): a gap / glitch only re-seeds
+                const bool cont=!started&&probeNs_&&s.ns>probeNs_&&s.ns-probeNs_<=cfg.dragGapNs&&m::length(m::sub(pw[probe_],probeW_[probe_]))<=.15f;
                 if(cont){
-                    const V3 dq=m::sub(qp,probeQ_),dw=m::sub(wp,probeW_);
-                    const float back=-dq[2],down=-dq[1];
-                    const bool arc=qp[1]>cfg.arcFloor&&back>-.002f; // the down-back cocking arc over the top-rear
-                    float step=back+(arc?cfg.downShare*std::max(0.f,down):0.f);
-                    const float absStep=-m::dot(dw,f)+(arc?cfg.downShare*std::max(0.f,-m::dot(dw,u)):0.f);
-                    // the gun thrust forward under a still hand: no progress - FAN only (a full drag there is a SHOT); REALISTIC cocks on any
-                    // relative backward travel (the hammer still needs the trigger)
-                    if(fan&&step>0.f&&absStep<cfg.dragAbsShare*step)step=0.f;
-                    if(std::fabs(step)>.05f)step=0.f;                     // > 5 cm in one sample: a glitch
-                    if(latched_){latchZ_=std::min(latchZ_,qp[2]);if(qp[2]>=latchZ_+cfg.dragRearm){latched_=false;progress_=0.f;}}
-                    else progress_=std::clamp(progress_+step,0.f,cfg.dragTravel);
-                    if(!latched_&&step>0.f)contact_.travel+=step;
+                    // FAN: the probe that touched first (a full drag is a SHOT). REALISTIC: every probe in the region drives the hammer and the
+                    // one furthest along leads - a thumb arc, a palm slap or the whole hand pulled back, from the top or either side.
+                    float lead=0.f,leadStep=0.f;unsigned leadI=probe_;
+                    for(unsigned i=0;i<probeCount;++i){
+                        if(fan?i!=probe_:i!=probe_&&capsuleDist(qs[i])>cfg.capR+cfg.enterMargin)continue;
+                        const V3 dq=m::sub(qs[i],probeQ_[i]),dw=m::sub(pw[i],probeW_[i]);
+                        const float back=-dq[2],down=-dq[1];
+                        const bool arc=qs[i][1]>cfg.arcFloor&&back>-.002f; // the down-back cocking arc over the top-rear
+                        float step=back+(arc?cfg.downShare*std::max(0.f,down):0.f);
+                        const float absStep=-m::dot(dw,f)+(arc?cfg.downShare*std::max(0.f,-m::dot(dw,u)):0.f);
+                        // the gun thrust forward under a still hand: no progress - FAN only (a full drag there is a SHOT); REALISTIC cocks on any
+                        // relative backward travel (the hammer still needs the trigger)
+                        if(fan&&step>0.f&&absStep<cfg.dragAbsShare*step)step=0.f;
+                        if(std::fabs(step)>.05f)step=0.f;                     // > 5 cm in one sample: a glitch
+                        if(latched_)continue;
+                        progressP_[i]=std::clamp(progressP_[i]+step,0.f,travel);
+                        if(progressP_[i]>lead){lead=progressP_[i];leadI=i;leadStep=step;}
+                    }
+                    if(latched_){const float z=qs[probe_][2];latchZ_=std::min(latchZ_,z);if(z>=latchZ_+cfg.dragRearm){latched_=false;progress_=0.f;progressP_={};}}
+                    else{progress_=lead;probe_=leadI;if(leadStep>0.f)contact_.travel+=leadStep;}
                 }
-                probeQ_=qp;probeW_=wp;probeNs_=s.ns;
-                const float k=latched_||o.stroke?0.f:std::clamp(progress_/cfg.dragTravel,0.f,1.f);
-                const int tick=int(k*cfg.dragTravel/std::max(cfg.dragTickM,.001f));
+                probeQ_=qs;probeW_=pw;probeNs_=s.ns;
+                const V3 qp=qs[probe_];
+                const float k=latched_||o.stroke?0.f:std::clamp(progress_/travel,0.f,1.f);
+                const int tick=int(k*travel/std::max(cfg.dragTickM,.001f));
                 if(tick>dragTicks_&&k<1.f)o.dragTick=true;dragTicks_=tick;
                 dragK_=k;contact_.maxK=std::max(contact_.maxK,k);contact_.grip=std::max(contact_.grip,s.grips[off]);
                 if(!latched_&&!o.stroke&&k>=1.f){ // full cock
                     unsigned why=RejectNone;
                     if(fan&&!(f[1]>=cfg.minElev&&a.torsoOk))why=RejectPose;
-                    latched_=true;latchZ_=qp[2];progress_=0.f;rearmed_=false;strokeNs_=s.ns;dragK_=0.f;dragTicks_=0;if(swipe_)swipeStroked_=true;contact_.cocked=1;
+                    latched_=true;latchZ_=qp[2];progress_=0.f;progressP_={};rearmed_=false;strokeNs_=s.ns;dragK_=0.f;dragTicks_=0;if(swipe_)swipeStroked_=true;contact_.cocked=1;
                     o.crossing=true;o.nearBox=true;o.x=qn;o.vRel=vRelI;o.vAbs=vAbsI;o.dragCock=true;
                     if(why!=RejectNone)o.reason=why;
                     else if(fan&&a.needTrigger&&!trig){cockedWait_=true;o.dragWait=true;o.reason=RejectNone;}
@@ -571,7 +593,7 @@ public:
     bool rearmed() const noexcept {return rearmed_;}
 private:
     bool drag_{},latched_{},cockedWait_{},trigWas_{};float latchZ_{},dragK_{},progress_{};int dragTicks_{};
-    unsigned probe_{};V3 probeQ_{},probeW_{};std::uint64_t probeNs_{};ContactRec contact_{}; // The tracked probe (hammer frame / world), the contact report
+    unsigned probe_{};std::array<V3,probeCount> probeQ_{},probeW_{};std::array<float,probeCount> progressP_{};std::uint64_t probeNs_{};ContactRec contact_{}; // The leading probe, every probe's last sample (hammer frame / world) and progress, the contact report
     bool have_{},havePrev_{},rearmed_{true},swipe_{},swipeStroked_{};std::uint64_t lastNs_{},space_{},strokeNs_{};int lastHold_{-1};
     V3 lastQ_{},prevQ_{},lastPalm_{},lastHoldP_{},swipeX_{};float prevDt_{},swipeV_{},swipeAbs_{};unsigned swipeReason_{RejectSlow};
     std::array<Sample16,16> hist_{};unsigned histNext_{},histN_{};
@@ -632,7 +654,7 @@ inline bool attemptQ(const runtime::ControllerSample& s,const Zone& z,V3& q,floa
     if(z.hand!=0&&z.hand!=1)return false;const auto G=handOf(s.grip[unsigned(z.hand)]),F=handOf(s.grip[unsigned(1-z.hand)]);if(!G.valid||!F.valid)return false;
     const V3 c=m::add(G.p,m::rotate(G.q,z.hammer)),f=m::normalize(m::rotate(G.q,z.fwd)),u0=m::normalize(m::rotate(G.q,z.up));
     const V3 r=m::normalize(m::cross(f,u0)),u=m::cross(r,f);
-    const std::array<V3,4> probes{V3{0.f,0.f,0.f},detector.cfg.palm,V3{0.f,0.f,-.06f},V3{0.f,.04f,0.f}};
+    const auto probes=probesOf(unsigned(1-z.hand),detector.cfg.palm);
     distNF=1e9f;
     for(const auto& pr:probes){const V3 d=m::sub(m::add(F.p,m::rotate(F.q,pr)),c);const V3 qq{m::dot(d,r),m::dot(d,u),m::dot(d,f)};
         const float dd=detector.capsuleDist(qq,false);if(dd<distNF){distNF=dd;q=qq;}}
@@ -905,9 +927,11 @@ inline Spread spreadFor(std::uint64_t now) noexcept {
 struct VisualType {int typeId{-1};bool learned{};L::Mat down{},cocked{};float cockedDeg{};};
 struct PoseRecord {
     std::uintptr_t weapon{},skeleton{};unsigned count{};int hammer{-1},cylinder{-1};bool children{};std::array<int,L::maxBones> parents{};
+    unsigned modelWait{}; // frames the bone choice waited for the model
     std::array<std::array<char,32>,L::maxBones> names{};std::uint32_t generation{},restGeneration{};bool restValid{},written{},havePrev{};L::Mat rest{},last{},prevLocal{};
     float maxDeg{};V3 maxAxisModel{},restAxisModel{};std::uint64_t moving{};std::uint64_t lastNs{};V3 lastHammerGrip{};bool haveZone{};
     float clipExtremeDeg{};L::Mat clipExtreme{};std::uint64_t clipFireNs{};bool clipOpen{};
+    int spurRule{-1}; // BONE / CYLINDER decided once per held instance (our DRAG write about the CYLINDER pivot moves the bone origin)
     // zone filter: the raw spur / barrel / up in the grip frame of the last zoneRing still samples; the published zone = their
     // component-wise median (the gun is rigid in the hand: the raw value only moves when the bone pose and the placement disagree in motion)
     std::array<V3,31> zh{},zf{},zu{};unsigned zn{},zNext{},zOut{};int zHand{-1};V3 rawLast{};bool haveRaw{};
@@ -938,13 +962,59 @@ inline std::atomic<int> zoneState{ZoneUnknown};
 // the DRAG fallback axis (parent space): the hammer bone's own rest axis closest to the model's lateral axis (-1 = the lateral itself),
 // sign-checked so +k swings the spur BACK (d spur / d angle = axis x spur, its share along -barrel must be > 0)
 inline std::atomic<int> visualAxisCol{-2};inline std::atomic<bool> visualAxisFlipped{};inline V3 visualAxisParent{}; // poseMutex // the VR-held revolver's last pose: which bone the spur comes from (status NO HAMMER / FALLBACK)
-inline int chooseHammer(const PoseRecord& r) noexcept {
+// PER-MODEL SPUR (pure, host-testable). World / engine units (s = units per metre); the bore line from the muzzle locator.
+//   TUNED    the Cattleman (or a model with .reload.geom.<KEY>): the hammer bone + the spur offset, as tuned.
+//   BONE     another revolver whose hammer bone origin can be its pivot (5..75 mm behind the cylinder's rear face, 70 mm below .. 15 mm
+//            above the bore): the bone moved onto the bore's vertical plane (the pivot pin runs across: any point on it turns the same),
+//            + the Cattleman's spur offset.
+//   CYLINDER the hammer bone cannot be the pivot (the Schofield's sits ahead of the cylinder's rear face): pivot / spur placed behind the
+//            cylinder's rear face with the Cattleman's proportions (pivot 33 mm behind / 36.6 mm below the bore, spur ref 43 mm / 21.6 mm).
+//   FALLBACK no hammer bone: the cylinder bone + .fallback.
+//   a model whose roles (VrReload BoneRoles) name its hammer bone is always BONE - the Schofield's hammer is the bone NAMED
+//            "cylinder" (the CYLINDER rule would take its hinge bone, NAMED "hammer", and put the spur 6 cm behind the real one).
+// The REVOLVER FIT spur (mm, right / up / forward) is added last.
+enum SpurRule : int {RuleTuned=0,RuleBone=1,RuleCylinder=2,RuleFallback=3};
+inline const char* spurRuleName(int r) noexcept {return r==RuleBone?"BONE":r==RuleCylinder?"CYLINDER":r==RuleFallback?"FALLBACK":"TUNED";}
+struct SpurIn {V3 bone{},cylinder{},muzzle{},barrel{},up{},right{},so{},fitMm{};float s{1.f},rearM{-.019f},fallbackUp{.020f},fallbackBack{.035f};
+    bool haveHammer{},haveCylinder{},tuned{true};int forceRule{-1};}; // forceRule: RuleBone / RuleCylinder kept from the first decision
+struct SpurOut {V3 spur{},pivot{};int rule{RuleTuned};float latM{},alongM{},heightM{},rearAlongM{};};
+inline constexpr float cylPivotBackM=.033f,cylPivotDownM=.0366f,cylSpurBackM=.043f,cylSpurDownM=.0216f;
+inline SpurOut spurGeom(const SpurIn& in) noexcept {
+    SpurOut o{};const float s=in.s>1e-6f&&std::isfinite(in.s)?in.s:1.f;
+    const auto at=[&](V3 base,float right,float up,float fwd){
+        return L::add(base,L::mul(L::add(L::add(L::mul(in.right,right),L::mul(in.up,up)),L::mul(in.barrel,fwd)),s));};
+    const V3 d=L::sub(in.bone,in.muzzle);
+    o.latM=L::dot(d,in.right)/s;o.alongM=L::dot(d,in.barrel)/s;o.heightM=L::dot(d,in.up)/s;
+    o.rearAlongM=in.haveCylinder?L::dot(L::sub(in.cylinder,in.muzzle),in.barrel)/s+in.rearM:0.f;
+    if(!in.haveHammer){o.rule=RuleFallback;o.pivot=in.bone;o.spur=at(in.bone,0.f,in.fallbackUp,-in.fallbackBack);}
+    else if(in.tuned){o.rule=RuleTuned;o.pivot=in.bone;o.spur=at(in.bone,in.so[0],in.so[1],in.so[2]);}
+    else{
+        const bool behind=!in.haveCylinder||(o.alongM<=o.rearAlongM-.005f&&o.alongM>=o.rearAlongM-.075f);
+        const bool level=o.heightM<=.015f&&o.heightM>=-.070f;
+        const bool bone=in.forceRule==RuleBone||(in.forceRule!=RuleCylinder&&((behind&&level)||!in.haveCylinder));
+        if(bone||!in.haveCylinder){o.rule=RuleBone;o.pivot=at(in.bone,-o.latM,0.f,0.f);o.spur=at(o.pivot,in.so[0],in.so[1],in.so[2]);}
+        else{o.rule=RuleCylinder;
+            o.pivot=at(in.muzzle,0.f,-cylPivotDownM,o.rearAlongM-cylPivotBackM);o.spur=at(in.muzzle,in.so[0],-cylSpurDownM,o.rearAlongM-cylSpurBackM);}
+    }
+    o.spur=at(o.spur,in.fitMm[0]*.001f,in.fitMm[1]*.001f,in.fitMm[2]*.001f);
+    return o;}
+// per model (report vr.weapon.hammer.modelGeom; poseMutex): the last spur decision in model space (cm)
+struct ModelGeomRec {int model{-1};int rule{};float latCm{},alongCm{},heightCm{},rearAlongCm{};V3 boneCm{},cylinderCm{},muzzleCm{},spurCm{},pivotCm{};V3 fitMm{};
+    std::uint64_t poses{};std::array<char,40> hammerBone{},cylinderBone{};}; // the bones used (name#index, "-" = none)
+inline std::array<ModelGeomRec,6> modelGeomRecs{};
+// the held model's bone roles (VrReload BoneRoles: the Schofield's hammer is the bone NAMED "cylinder", it has no cylinder bone)
+// after the global .hammer.bone lever; -2 from roleBone = no spec = the name rule
+inline int chooseHammer(const PoseRecord& r,int model=L::ModelUnknown) noexcept {
     if(config.boneIndex>=0)return unsigned(config.boneIndex)<r.count?config.boneIndex:-1;
     if(config.boneName[0]){for(unsigned i=0;i<r.count;++i)if(!std::strcmp(r.names[i].data(),config.boneName.data()))return int(i);return -1;}
+    if(const auto& ro=L::rolesOf(model);ro.set){const int b=L::roleBone(r.names,r.count,ro.hammer);if(b!=-2)return b;}
     for(unsigned i=0;i<r.count;++i)if(L::containsCi(r.names[i].data(),"hammer"))return int(i);
     return -1;
 }
-inline int chooseCylinder(const PoseRecord& r) noexcept {
+inline int chooseCylinder(const PoseRecord& r,int model=L::ModelUnknown) noexcept {
+    if(const auto& ro=L::rolesOf(model);ro.set){
+        const int h=L::roleBone(r.names,r.count,ro.hinge);if(h>=0)return -1; // a TOP-BREAK: no cylinder bone (the ring is virtual)
+        const int b=L::roleBone(r.names,r.count,ro.cylinder);if(b!=-2)return b;}
     for(unsigned i=0;i<r.count;++i)if(L::containsCi(r.names[i].data(),"cyl"))return int(i);
     for(unsigned i=0;i<r.count;++i)if(L::containsCi(r.names[i].data(),"drum"))return int(i);
     return -1;
@@ -993,10 +1063,11 @@ inline constexpr std::uintptr_t managerGot=0x2deabe0,slotsGot=0x2deabe8,getFragI
 inline std::string text;inline std::array<int,6> types{-1,-1,-1,-1,-1,-1};inline std::atomic<std::uint64_t> runs{},failures{};
 inline std::atomic<const char*> lastFailure{"NONE"};
 }
-inline void probeDrawable(const PoseRecord& r,std::uintptr_t weapon,int typeId) noexcept { // poseMutex held
+inline void probeDrawable(const PoseRecord& r,std::uintptr_t weapon,int typeId,int model=0) noexcept { // poseMutex held
     try{
-        for(int t:probe::types)if(t==typeId)return;
-        for(auto& t:probe::types)if(t<0){t=typeId;break;}
+        const int key=typeId*100+std::clamp(model,0,99); // once per type AND model (every revolver is hand type 4)
+        for(int t:probe::types)if(t==key)return;
+        bool slot=false;for(auto& t:probe::types)if(t<0){t=key;slot=true;break;}if(!slot)return;
         probe::runs.fetch_add(1,std::memory_order_relaxed);
         const auto fail=[](const char* why){probe::failures.fetch_add(1,std::memory_order_relaxed);probe::lastFailure.store(why,std::memory_order_relaxed);};
         const auto& E=env;if(!E.read||!E.base){fail("NO_ENV");return;}
@@ -1019,7 +1090,7 @@ inline void probeDrawable(const PoseRecord& r,std::uintptr_t weapon,int typeId) 
             std::string t(o.data());for(char& c:t)if(c=='"'||c=='\\'||static_cast<unsigned char>(c)<0x20||static_cast<unsigned char>(c)>0x7e)c='?';return t;};
         const auto fx=[&](unsigned i){std::uintptr_t S{},ef{},nm{};if(!shaders||i>=nSh||!P(shaders,i*8u,S)||!P(S,0x10,ef)||!E.get(ef,0x138,nm))return std::string("?");return str(nm);};
         char b[512];std::string o;
-        std::snprintf(b,sizeof b,"{\"typeId\":%d,\"vptrOk\":%s,\"nodeFlags\":%u,\"nodeBackOk\":%s,\"breakables\":%u,\"alts\":%s,\"altSel\":%d,\"shaders\":[",typeId,
+        std::snprintf(b,sizeof b,"{\"typeId\":%d,\"model\":\"%s\",\"vptrOk\":%s,\"nodeFlags\":%u,\"nodeBackOk\":%s,\"breakables\":%u,\"alts\":%s,\"altSel\":%d,\"shaders\":[",typeId,model>L::ModelUnknown&&model<L::ModelCount?L::models[std::size_t(model)].key:"UNKNOWN",
             Dv==E.base+probe::fragDrawableVptr?"true":"false",nodeFlags,back==F?"true":"false",unsigned(breakables),alts?"true":"false",altSel);o+=b;
         for(unsigned i=0;i<nSh&&i<48;++i){std::uintptr_t S{};std::uint8_t bucket{};if(shaders&&P(shaders,i*8u,S))E.get(S,0x19,bucket);
             std::snprintf(b,sizeof b,"%s[\"%s\",%u]",i?",":"",fx(i).c_str(),unsigned(bucket));o+=b;}
@@ -1037,8 +1108,8 @@ inline void probeDrawable(const PoseRecord& r,std::uintptr_t weapon,int typeId) 
                     if(sidx)E.get(sidx,g*2u,sh);if(P(G,0x18,vb))E.get(vb,8,vc);E.get(G,0x5c,prims);E.get(G,0x62,pt);E.get(G,0x68,pal);E.get(G,0x72,nPal);
                     const bool box=aabbs&&E.read(nullptr,aabbs+0x20u*(nG>1?1u+g:0u),bb.data(),sizeof bb);
                     std::array<std::uint16_t,8> ids{};if(pal&&nPal)E.read(nullptr,pal,ids.data(),2u*std::min<unsigned>(nPal,8u));
-                    std::snprintf(b,sizeof b,"%s{\"sh\":%u,\"fx\":\"%s\",\"verts\":%u,\"prims\":%u,\"ptype\":%u,\"pal\":%u,\"palIds\":[%u,%u,%u,%u],\"aabbCm\":[%.1f,%.1f,%.1f,%.1f,%.1f,%.1f]}",
-                        g?",":"",unsigned(sh),fx(sh).c_str(),unsigned(vc),prims,unsigned(pt),unsigned(nPal),unsigned(ids[0]),unsigned(ids[1]),unsigned(ids[2]),unsigned(ids[3]),
+                    std::snprintf(b,sizeof b,"%s{\"sh\":%u,\"fx\":\"%s\",\"verts\":%u,\"prims\":%u,\"ptype\":%u,\"pal\":%u,\"palIds\":[%u,%u,%u,%u,%u,%u,%u,%u],\"aabbCm\":[%.1f,%.1f,%.1f,%.1f,%.1f,%.1f]}",
+                        g?",":"",unsigned(sh),fx(sh).c_str(),unsigned(vc),prims,unsigned(pt),unsigned(nPal),unsigned(ids[0]),unsigned(ids[1]),unsigned(ids[2]),unsigned(ids[3]),unsigned(ids[4]),unsigned(ids[5]),unsigned(ids[6]),unsigned(ids[7]),
                         box?double(bb[0]*100.f):0.0,box?double(bb[1]*100.f):0.0,box?double(bb[2]*100.f):0.0,box?double(bb[4]*100.f):0.0,box?double(bb[5]*100.f):0.0,box?double(bb[6]*100.f):0.0);o+=b;}
                 o+="]}";}
             o+="]";}
@@ -1108,8 +1179,9 @@ inline void pose(const L::Engine& e,const PoseIn& in) noexcept {
             r=PoseRecord{};r.weapon=in.weapon;r.skeleton=in.skeleton;}
         L::Skeleton k{};if(!in.skeleton||!e.skeleton(in.skeleton,k)){bump(ctr.zoneFailures);lastZoneFailure.store("NO_SKELETON",std::memory_order_relaxed);return;}
         if(!r.count){
+            if(L::modelOf(in.weapon)<=L::ModelUnknown&&++r.modelWait<180u)return; // the roles need the model (LeMat swapped names)
             for(unsigned i=0;i<k.count;++i){e.name(k,i,r.names[i]);if(!e.parent(k,i,r.parents[i])){lastZoneFailure.store("PARENTS",std::memory_order_relaxed);bump(ctr.zoneFailures);return;}}
-            r.count=k.count;r.hammer=chooseHammer(r);r.cylinder=chooseCylinder(r);
+            const int pm=L::modelOf(in.weapon);r.count=k.count;r.hammer=chooseHammer(r,pm);r.cylinder=chooseCylinder(r,pm); // per-model roles
             if(r.hammer>=0)for(unsigned i=0;i<r.count;++i)if(int(i)!=r.hammer&&r.parents[i]==r.hammer)r.children=true;
             zoneBone.store(r.hammer>=0?r.hammer:r.cylinder,std::memory_order_relaxed);
             {const auto& nm=r.hammer>=0?r.names[unsigned(r.hammer)]:r.cylinder>=0?r.names[unsigned(r.cylinder)]:std::array<char,32>{};zoneBoneName=nm;}
@@ -1118,7 +1190,7 @@ inline void pose(const L::Engine& e,const PoseIn& in) noexcept {
             if(!known)for(auto& b:bonesByType)if(b.typeId<0){b.typeId=in.typeId;std::size_t at=0;
                 for(unsigned i=0;i<r.count&&at+2<sizeof b.names;++i){for(std::size_t j=0;r.names[i][j]&&at+2<sizeof b.names;++j)b.names[at++]=r.names[i][j];if(at+2<sizeof b.names)b.names[at++]=' ';}
                 if(at)b.names[at-1]=0;break;}
-            probeDrawable(r,in.weapon,in.typeId); // Once per type
+            probeDrawable(r,in.weapon,in.typeId,pm); // Once per type + model
         }else if(r.count!=k.count){r=PoseRecord{};lastZoneFailure.store("BONE_COUNT",std::memory_order_relaxed);bump(ctr.zoneFailures);return;}
         const int bone=r.hammer>=0?r.hammer:r.cylinder;
         zoneState.store(r.hammer>=0?ZoneBone:r.cylinder>=0?ZoneFallback:ZoneNoBone,std::memory_order_relaxed);
@@ -1131,12 +1203,33 @@ inline void pose(const L::Engine& e,const PoseIn& in) noexcept {
         const V3 barrelW=L::normalized(L::mul(L::col(mw,2),-1.f)),upW0=L::normalized(L::col(mw,1));
         const V3 rightW=L::normalized(L::cross(barrelW,upW0)),upW=L::cross(rightW,barrelW);
         const float s=L::length(L::col(root,0));if(!(s>1e-6f)||!std::isfinite(s)){bump(ctr.zoneFailures);return;}
-        V3 spur=L::col(global,3);
-        const V3 so=spurOffset(in.weapon); // The held model's spur
-        if(r.hammer>=0)spur=L::add(spur,L::mul(L::add(L::add(L::mul(rightW,so[0]),L::mul(upW,so[1])),L::mul(barrelW,so[2])),s));
-        else spur=L::add(spur,L::mul(L::sub(L::mul(upW,config.fallbackUp),L::mul(barrelW,config.fallbackBack)),s));
+        // the held model's spur (spurGeom): the tuned Cattleman, the other revolvers from their own skeleton + REVOLVER FIT
+        const int heldModel=L::modelOf(in.weapon);const L::ModelFit fit=L::shotgunModel(heldModel)?L::ModelFit{}:L::fitOf(heldModel); // a shotgun's FIT moves its shells, never a spur
+        SpurIn si{};si.bone=L::col(global,3);si.muzzle=L::col(mw,3);si.barrel=barrelW;si.up=upW;si.right=rightW;si.s=s;si.so=spurOffset(in.weapon);
+        si.fitMm=fit.spurMm;si.haveHammer=r.hammer>=0;si.tuned=!L::autoGeometry(heldModel);si.fallbackUp=config.fallbackUp;si.fallbackBack=config.fallbackBack;
+        {const auto& ms=L::specOf(in.weapon);si.rearM=(ms.geom?ms.rearMm:L::config.rearMm)*.001f;} // the FIT rounds offset moves the rounds only (1 mm = 1 mm)
+        if(r.hammer<0){si.cylinder=si.bone;si.haveCylinder=true;}
+        else if(r.cylinder>=0){L::Mat cg{};if(e.matrix(k.globals+unsigned(r.cylinder)*L::globalStride,cg)){si.cylinder=L::col(cg,3);si.haveCylinder=true;}}
+        si.forceRule=r.spurRule;
+        // a model whose roles name its hammer bone = that bone IS the hammer (pivot = its origin on the bore plane, the Cattleman spur)
+        if(const auto& ro=L::rolesOf(heldModel);ro.set&&ro.hammer[0]&&r.hammer>=0&&si.tuned==false)si.forceRule=RuleBone;
+        const SpurOut sgo=spurGeom(si);
+        if(r.spurRule<0&&si.haveCylinder&&(sgo.rule==RuleBone||sgo.rule==RuleCylinder))r.spurRule=sgo.rule;
+        V3 spur=sgo.spur;
+        L::Mat rootInvM{};const bool haveRootInv=L::affineInverse(root,rootInvM);
+        { // report: this model's decision in model space (cm)
+            if(heldModel>0&&haveRootInv){
+                ModelGeomRec* g=nullptr;for(auto& x:modelGeomRecs)if(x.model==heldModel){g=&x;break;}
+                if(!g)for(auto& x:modelGeomRecs)if(x.model<0){g=&x;break;}
+                if(g){const auto cm=[&](V3 w){const V3 p=L::point(rootInvM,w);return V3{p[0]*100.f,p[1]*100.f,p[2]*100.f};};
+                    g->model=heldModel;g->rule=sgo.rule;g->latCm=sgo.latM*100.f;g->alongCm=sgo.alongM*100.f;g->heightCm=sgo.heightM*100.f;
+                    g->rearAlongCm=si.haveCylinder?sgo.rearAlongM*100.f:0.f;g->boneCm=cm(si.bone);g->cylinderCm=si.haveCylinder?cm(si.cylinder):V3{};
+                    g->muzzleCm=cm(si.muzzle);g->spurCm=cm(sgo.spur);g->pivotCm=cm(sgo.pivot);g->fitMm=fit.spurMm;++g->poses;
+                    const auto bn=[&](int i,std::array<char,40>& o){if(i>=0&&unsigned(i)<r.count)std::snprintf(o.data(),o.size(),"%s#%d",r.names[unsigned(i)].data(),i);
+                        else std::snprintf(o.data(),o.size(),"-");for(char& ch:o)if(ch=='"'||ch=='\\'||(ch&&static_cast<unsigned char>(ch)<0x20))ch='?';};
+                    bn(r.hammer,g->hammerBone);bn(r.cylinder,g->cylinderBone);}}}
         // model-space position of the bone (report)
-        {L::Mat rootInv{};if(L::affineInverse(root,rootInv)){const V3 bm=L::point(rootInv,L::col(global,3));zoneBoneModel={bm[0]*100.f,bm[1]*100.f,bm[2]*100.f};}}
+        if(haveRootInv){const V3 bm=L::point(rootInvM,L::col(global,3));zoneBoneModel={bm[0]*100.f,bm[1]*100.f,bm[2]*100.f};}
         if(in.grip&&in.grip->valid){
             const L::Mat gripToWorld=L::multiply(in.grip->map,L::poseMat(in.grip->grip));L::Mat inv{};
             if(L::affineInverse(gripToWorld,inv)){
@@ -1176,6 +1269,9 @@ inline void pose(const L::Engine& e,const PoseIn& in) noexcept {
             }
         }
         // ---- the native trace of the hammer bone + the self-gated visual ----
+        // the learned DOWN / COCKED locals belong to one model's hammer bone (every revolver is hand type 4). Only a model
+        // with bone roles (the Schofield: its hammer is another bone) gets its own key - the other revolvers keep a per-type key
+        const int visualKey=L::rolesOf(heldModel).set?in.typeId*100+std::clamp(heldModel,0,99):in.typeId;
         if(r.hammer>=0){
             const unsigned hb=unsigned(r.hammer);L::Mat local{};std::uintptr_t clip{},phasePtr{};
             if(e.matrix(k.locals+hb*L::localStride,local)){
@@ -1210,7 +1306,7 @@ inline void pose(const L::Engine& e,const PoseIn& in) noexcept {
                                                                    m::normalize(V3{in.modelMuzzle[4],in.modelMuzzle[5],in.modelMuzzle[6]})));
                             const float along=m::dot(eaModel,rModel);
                             if(std::fabs(along)>=.9f&&ed>=10.f&&ed<=70.f){
-                                for(auto& t:visualTypes)if(t.typeId==in.typeId||t.typeId<0){t.typeId=in.typeId;t.learned=true;
+                                for(auto& t:visualTypes)if(t.typeId==visualKey||t.typeId<0){t.typeId=visualKey;t.learned=true;
                                     t.cocked=along>0.f?r.clipExtreme:r.rest;t.down=along>0.f?r.rest:r.clipExtreme;t.cockedDeg=ed;break;}
                                 visualState.store("LEARNED",std::memory_order_relaxed);visualCockedDeg.store(ed,std::memory_order_relaxed);
                             }
@@ -1219,7 +1315,7 @@ inline void pose(const L::Engine& e,const PoseIn& in) noexcept {
                     r.restAxisModel=axModel;
                 }
                 // H2 write: learned + no native movement without a clip this session + no children + the property
-                const VisualType* vt=nullptr;for(const auto& t:visualTypes)if(t.learned&&t.typeId==in.typeId)vt=&t;
+                const VisualType* vt=nullptr;for(const auto& t:visualTypes)if(t.learned&&t.typeId==visualKey)vt=&t;
                 const char* decline=nullptr;float kf=0.f;L::Mat target{};
                 if(config.visual==0)decline="OFF";
                 else if(!vOk())decline="ENGINE";
@@ -1262,8 +1358,13 @@ inline void pose(const L::Engine& e,const PoseIn& in) noexcept {
                         const V3 spurP=L::direction(modelToParent,spurM);
                         const bool flip=m::dot(m::cross(axP,spurP),backP)<0.f;if(flip)axP=m::mul(axP,-1.f);
                         visualAxisCol.store(col,std::memory_order_relaxed);visualAxisFlipped.store(flip,std::memory_order_relaxed);visualAxisParent=axP;
-                        target=L::multiply(axisAngleMat(axP,config.dragSign*config.dragDeg*kf*3.14159265f/180.f),r.rest);
+                        const L::Mat rot=axisAngleMat(axP,config.dragSign*config.dragDeg*kf*3.14159265f/180.f);
+                        target=L::multiply(rot,r.rest);
                         for(unsigned i=0;i<3;++i)target[12+i]=r.rest[12+i];bump(ctr.visualFallbackAxis);bump(ctr.visualDragFrames);
+                        // CYLINDER rule: the bone origin is not the pivot - turn about the estimated pivot (parent space)
+                        if(sgo.rule==RuleCylinder){L::Mat pgInv{};if(L::affineInverse(pg,pgInv)){
+                            const V3 pp=L::point(pgInv,sgo.pivot);const V3 t{r.rest[12],r.rest[13],r.rest[14]};
+                            const V3 tr=L::add(pp,L::direction(rot,L::sub(t,pp)));if(std::isfinite(tr[0]+tr[1]+tr[2]))for(unsigned i=0;i<3;++i)target[12+i]=tr[i];}}
                     }else decline="FORCE_AXES";
                 }
                 if(!decline&&L::finiteMat(target)){
@@ -1403,7 +1504,8 @@ public:
                     else{sa_=SaDown;bump(ctr.fanDry);if(v==Verdict::Dry)bump(ctr.saDry);else{bump(ctr.dryEmpty);pulse(hold,.20f,30'000,now,haptics::SourceRefuse);blink(now);}}
                     continue;}
                 if(sa_==SaDown){sa_=SaCocked;bump(ctr.saCocks);pulse(hold,.30f,25'000,now);L::cockAdvance(hold,now);}}
-            if(config.thumbCock&&hold==1){const bool back=in.sticks[3]<=-.7f;
+            // RIGHT STICK DOWN cocks the hammer too, whichever hand holds the revolver (the raw sample: sticks[3] = right stick Y)
+            if(config.thumbCock&&hold>=0){const bool back=in.sticks[3]<=-.7f;
                 if(back&&!thumbWas_&&sa_==SaDown){sa_=SaCocked;bump(ctr.saCocks);bump(ctr.saThumbCocks);pulse(hold,.30f,25'000,now);L::cockAdvance(hold,now);}thumbWas_=back;}
         }
         // R1: the physical trigger edge
@@ -1456,7 +1558,8 @@ public:
         const bool nearRing=rn&&now>=rn&&now-rn<=100'000'000ull,approach=nn&&now>=nn&&now-nn<=100'000'000ull;
         const bool saShow=md==ModeSingle&&sa_==SaDown&&in.triggers[unsigned(hold)]>.55f;
         const bool blinking=blinkNs_&&now>=blinkNs_&&now-blinkNs_<300'000'000ull;
-        if(!nearRing&&!saShow&&!blinking)return;
+        const bool fitShow=::rdrvr::vr::calib::fitPreview(now); // REVOLVER FIT page open: the ring always shown
+        if(!nearRing&&!saShow&&!blinking&&!fitShow)return;
         const auto& g=in.grip[unsigned(hold)];
         const V3 p=m::add(V3{g.position[0],g.position[1],g.position[2]},m::rotate(g.orientation,z.hammer));
         auto& mk=set.markers[set.count++];mk.position={p[0],p[1],p[2]};mk.radius=.012f;mk.slot=-1;mk.kind=3;
@@ -1642,7 +1745,7 @@ inline Config readConfig() noexcept {
             c.capR=v[0]*.01f;c.capFront=v[1]*.01f;c.capBack=v[2]*.01f;c.capUp=v[3]*.01f;}}
     num(".dominance",0.f,1.f,c.dominance);ms(".refractory",0.f,1000.f,c.refractoryNs);
     c.retry=on(prop(".retry"))?1:0;{float v=-1.f;num(".pulse",1.f,4.f,v);if(v>=1.f)c.pulseFrames=unsigned(v);}
-    c.drawCocked=on(prop(".drawcocked"));c.thumbCock=on(prop(".thumbcock"));
+    c.drawCocked=on(prop(".drawcocked"));c.thumbCock=!off(prop(".thumbcock")); // default ON (.thumbcock 0 = off)
     {const auto v=prop(".visual");if(off(v))c.visual=0;else if(v.rfind("force",0)==0){float d=0.f;int n=0;
         if(L::parseFloats(v.substr(5),&d,1,n)&&n==1&&std::fabs(d)<=80.f){c.visual=2;c.visualForceDeg=d;}}}
     c.ring=prop(".ring")=="1";
@@ -1672,7 +1775,7 @@ inline void resetForTests() noexcept {
     zoneBox.store(Zone{});armBox.store(Arm{});factsBox.store(Facts{});
     {std::lock_guard lock(flightMutex);flights={};lostLast=Lost{};}
     for(auto& e:mergedEdges)e.store(0);mergedEdgeNext.store(0);
-    {std::lock_guard lock(poseMutex);probe::text.clear();probe::types={-1,-1,-1,-1,-1,-1};poseRecord=PoseRecord{};pendingRestores={};hammerInsts={};hammerTypes={};visualTypes={};trace={};traceN=0;traceFireNs=0;bonesByType={};}
+    {std::lock_guard lock(poseMutex);probe::text.clear();probe::types={-1,-1,-1,-1,-1,-1};poseRecord=PoseRecord{};pendingRestores={};hammerInsts={};hammerTypes={};visualTypes={};trace={};traceN=0;traceFireNs=0;bonesByType={};modelGeomRecs={};}
     {std::lock_guard lock(nearMissMutex);nearMiss={};nearMissNext=0;}
     {std::lock_guard lock(contactMutex);contacts={};contactNext=0;}attemptState=AttemptState{};
     ptrs=Ptrs{};oursWeapon=0;oursValue=0.f;oursGuid=0;prevT=0.f;dtFrame=1.f/36.f;barrelPrev={};barrelPrevNs=0;
@@ -1807,6 +1910,15 @@ inline std::string report() {
             config.visual==0?"OFF":config.visual==2?"FORCE":"AUTO",double(config.visualForceDeg),visualState.load(),
             double(visualCockedDeg.load()),u(ctr.visualApplied),u(ctr.visualRestored),u(ctr.visualDeclined),lastVisualDecline.load(),r.written?"true":"false",
             u(ctr.visualPending),u(ctr.visualRestoredPending),u(ctr.visualPendingDropped),unsigned((pendingRestores[0].weapon?1:0)+(pendingRestores[1].weapon?1:0)));out+=b;}
+    { // per-model spur geometry (model space cm; along = from the muzzle along the barrel, negative = behind it)
+        std::lock_guard lock(poseMutex);out+="\"modelGeom\":[";bool first=true;
+        for(const auto& g:modelGeomRecs){if(g.model<=L::ModelUnknown||g.model>=L::ModelCount)continue;
+            std::snprintf(b,sizeof b,"%s{\"model\":\"%s\",\"rule\":\"%s\",\"hammerBone\":\"%s\",\"cylinderBone\":\"%s\",\"poses\":%llu,\"latCm\":%.2f,\"alongCm\":%.2f,\"heightCm\":%.2f,\"rearAlongCm\":%.2f,"
+                "\"boneCm\":%s,\"cylinderCm\":%s,\"muzzleCm\":%s,\"spurCm\":%s,\"pivotCm\":%s,\"fitMm\":%s}",first?"":",",
+                L::models[std::size_t(g.model)].key,spurRuleName(g.rule),g.hammerBone[0]?g.hammerBone.data():"-",g.cylinderBone[0]?g.cylinderBone.data():"-",(unsigned long long)g.poses,double(g.latCm),double(g.alongCm),double(g.heightCm),double(g.rearAlongCm),
+                v3(g.boneCm,1.f).c_str(),v3(g.cylinderCm,1.f).c_str(),v3(g.muzzleCm,1.f).c_str(),v3(g.spurCm,1.f).c_str(),v3(g.pivotCm,1.f).c_str(),
+                v3(g.fitMm,1.f).c_str());out+=b;first=false;}
+        out+="],";}
     {std::lock_guard lock(poseMutex);
         std::snprintf(b,sizeof b,"\"drawableProbe\":{\"runs\":%llu,\"failures\":%llu,\"lastFailure\":\"%s\",\"types\":[",u(probe::runs),u(probe::failures),probe::lastFailure.load());
         out+=b;out+=probe::text;out+="]},";}

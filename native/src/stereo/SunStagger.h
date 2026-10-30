@@ -565,7 +565,9 @@ inline Kind route(void* map,const Request& req,const Pose& now) noexcept {
     add(c.reasons[p.reason<ReasonCount?p.reason:NoSnapshot]);
     if(p.kind==Idle){add(c.idleFrames);add(c.gateIdle);}
     else if(p.kind==Partial){add(c.partialFrames);r.drawMask=p.mask;}
-    else add(c.fullFrames);
+    else{add(c.fullFrames);
+        if(p.reason==Coverage)shadowtimeline::bump(shadowtimeline::FullCoverage);
+        else if(p.reason==Cut)shadowtimeline::bump(shadowtimeline::FullJump);}
     return p.kind;
 }
 // Idle frame (indoor gate): the native call is skipped; the composite is uploaded.

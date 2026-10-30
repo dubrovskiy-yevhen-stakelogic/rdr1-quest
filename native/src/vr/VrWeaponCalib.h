@@ -1,5 +1,5 @@
 #pragma once
-// WEAPON CALIBRATION: user offsets / rotations of the VR-held weapon, per weapon CLASS
+// WEAPON CALIBRATION: player offsets / rotations of the VR-held weapon, per weapon CLASS
 // (pistol, melee, ...) or per weapon TYPE (engine type id, e.g. one knife), stored in rdrvr/weapons.cfg next to vr.cfg with the
 // same persistence contract as VrSettings (missing = first run, malformed = defaults + SAVE FAILED, atomic tmp+rename+fsync save,
 // edits apply in memory even when the save fails). Applied LIVE by VrWeapon.h on top of the automatic placement:
@@ -33,6 +33,37 @@ inline constexpr int fieldStep(unsigned f) noexcept {return f<Pitch?offsetStepMm
 // the WEAPON scope is per MODEL. The engine type id is an index inside its class enum (pistol 4 = Cattleman, rifle 4 = another gun):
 // the stored "type.<key>" = class*1000 + id; -1 = no own entry (class only). Old "type.<id>" lines (< 1000) stay in the file, unused.
 inline constexpr int typeKey(int kind,int id) noexcept {return kind>=0&&unsigned(kind)<classCount&&id>=0&&id<1000?kind*1000+id:-1;}
+// SCOPE LENS of a sniper model (ScopePass): its own "type.<20000 + typeKey>" entry, fields x = right mm, y = up mm, z = forward mm,
+// pitch = radius +mm (added to the lens defaults); starts at zero, never copied from the class entry
+inline constexpr int lensKey(int key) noexcept {return key>=0&&key<12000?20000+key:-1;}
+// REVOLVER FIT of a revolver MODEL (VrReload Model index: 1 CATTLEMAN, 2 SCHOFIELD, 3 DOUBLEACTION, 4 LEMAT, 9 any other
+// revolver; VrReload static_asserts the same order): its own "type.<30000 + model>" entry, fields x / y / z = the hammer spur
+// right / up / forward (mm), pitch = the rounds (chamber mouth plane) forward (mm), yaw = the chamber ring radius (+mm). Added live to
+// the automatic per-model geometry (VrHammer spur, VrReload ChamberFrame); starts at zero, never copied from the class entry.
+inline constexpr bool fitContainsCi(const char* hay,const char* needle) noexcept {
+    if(!hay||!needle||!*needle)return false;
+    for(std::size_t i=0;hay[i];++i){std::size_t j=0;
+        while(needle[j]&&hay[i+j]){char a=hay[i+j],b=needle[j];if(a>='a'&&a<='z')a=char(a-'a'+'A');if(b>='a'&&b<='z')b=char(b-'a'+'A');if(a!=b)break;++j;}
+        if(!needle[j])return true;}
+    return false;}
+inline constexpr int revolverModel(const char* name) noexcept { // the hand item's type name -> the revolver model index (-1 = not a revolver)
+    if(!name||!*name)return -1;
+    if(fitContainsCi(name,"CATTLEMAN"))return 1;if(fitContainsCi(name,"SCHOFIELD"))return 2;if(fitContainsCi(name,"DOUBLE"))return 3;
+    if(fitContainsCi(name,"LEMAT"))return 4;
+    if(fitContainsCi(name,"VOLCANIC")||fitContainsCi(name,"SEMIAUTO")||fitContainsCi(name,"HIGHPOWER")||fitContainsCi(name,"MAUSER"))return -1;
+    return fitContainsCi(name,"_REVOLVER_")?9:-1;}
+// the same FIT for the BREAK-ACTION shotguns (VrReload Model index
+// 11 DOUBLEBARREL, 12 SAWEDOFF; VrReload static_asserts it, and this is its classifyModel rule): x / y / z = the shells right / up / forward (mm),
+// pitch = the spacing between the two shells (mm). A "DOUBLE" shotgun is never the DOUBLE-ACTION revolver.
+inline constexpr int breakGunModel(const char* name) noexcept { // the hand item's type name -> the break-action model index (-1 = none)
+    if(!name||!fitContainsCi(name,"SHOTGUN"))return -1;
+    if(fitContainsCi(name,"SHOTGUN_DOUBLE"))return 11;if(fitContainsCi(name,"SHOTGUN_SAWED"))return 12;
+    return fitContainsCi(name,"DOUBLE")?11:-1;}
+inline constexpr int fitKey(int model) noexcept {return (model>0&&model<10)||model==11||model==12?30000+model:-1;}
+inline std::atomic<bool> fitMode{false};             // the WEAPON CALIBRATION page edits the REVOLVER FIT (SAVE FOR row cycles to it)
+inline std::atomic<std::uint64_t> fitPreviewNs{0};   // steady ns: the page was drawn in FIT mode (hammer ring + chamber markers shown)
+// either way: the XR thread stamps while another thread's `now` was taken a moment earlier (now < t = the shotgun snapped shut for a frame at the 2 Hz redraw)
+inline bool fitPreview(std::uint64_t now) noexcept {const auto t=fitPreviewNs.load(std::memory_order_relaxed);return t&&(now>=t?now-t:t-now)<1'500'000'000ull;} // the open menu redraws at 2 Hz
 
 struct Entry {
     std::array<std::int16_t,FieldCount> v{}; // mm, mm, mm, deg, deg, deg
@@ -41,6 +72,9 @@ struct Entry {
     float metres(unsigned f) const noexcept {return float(v[f])/1000.f;}
     float degrees(unsigned f) const noexcept {return float(v[f]);}
 };
+// The SCOPE LENS a new install starts from for the two rifles that need it (lensKey entries). A player's own entry in weapons.cfg wins; RESET returns to these.
+struct LensDefault {std::int16_t key;Entry entry;};
+inline constexpr std::array<LensDefault,2> lensDefaults{{{25019,Entry{{22,10,-38,-1,0,0}}},{25020,Entry{{22,8,-9,0,0,0}}}}};
 enum Source : unsigned {SourceNone,SourceClass,SourceType};
 struct Effective {Entry entry{};Source source{SourceNone};};
 
@@ -127,6 +161,7 @@ public:
                 }
             }
         }catch(...){loadResult_=false;classes_={};types_={};typeIds_={};typeCount_=0;}
+        seedLensDefaultsLocked();
         persistenceOk_.store(loadResult_,std::memory_order_release);
         publishLocked();
         loadedFlag_.store(true,std::memory_order_release);
@@ -147,6 +182,8 @@ public:
         return e;
     }
     bool hasType(int typeId) const noexcept {std::lock_guard lock(pubMutex_);return typeId>=0&&findPub(typeId)>=0;}
+    // the type entry alone (zero when none) - the scope lens
+    Entry typeEntry(int typeId) const noexcept {std::lock_guard lock(pubMutex_);const int t=typeId>=0?findPub(typeId):-1;return t>=0?pub_.types[unsigned(t)]:Entry{};}
     // Menu: the entry an edit in this scope changes (WEAPON scope without its own entry yet: the class entry it will copy).
     Entry entryFor(int kind,int typeId,bool scopeType) const noexcept {
         std::lock_guard lock(pubMutex_);
@@ -155,16 +192,16 @@ public:
     }
     // Menu (XR thread). scopeType: edit the weapon's own entry (created from the class entry on the first edit).
     // delta = steps (+1/-1); zero=true sets the field to 0. Returns false when nothing changed or the save failed.
-    bool edit(int kind,int typeId,bool scopeType,unsigned field,int delta,bool zero=false) noexcept {
+    bool edit(int kind,int typeId,bool scopeType,unsigned field,int delta,bool zero=false,bool fresh=false,int step=0) noexcept {
         ::rdrvr::vr::detail::PreserveErrno preserve;std::lock_guard lock(mutex_);
         if(!loaded_||field>=FieldCount||kind<0||unsigned(kind)>=classCount||(scopeType&&typeId<0))return false; // No model key
         Entry* e=nullptr;
         if(scopeType){int t=findTypeLocked(typeId);
-            if(t<0){if(typeCount_>=maxTypes)return false;t=int(typeCount_++);typeIds_[unsigned(t)]=std::int16_t(typeId);types_[unsigned(t)]=classes_[unsigned(kind)];}
+            if(t<0){if(typeCount_>=maxTypes)return false;t=int(typeCount_++);typeIds_[unsigned(t)]=std::int16_t(typeId);types_[unsigned(t)]=fresh?Entry{}:classes_[unsigned(kind)];}
             e=&types_[unsigned(t)];}
         else e=&classes_[unsigned(kind)];
         const int lim=fieldLimit(field);int v=e->v[field];
-        const int next=zero?0:std::clamp(v+delta*fieldStep(field),-lim,lim);
+        const int next=zero?0:std::clamp(v+delta*(step>0?step:fieldStep(field)),-lim,lim); // step override (SCOPE LENS 1 mm)
         if(next==v)return false;
         e->v[field]=std::int16_t(next);edits_.fetch_add(1,std::memory_order_relaxed);
         publishLocked(); // live: the next pose uses it, before the file is written
@@ -176,7 +213,7 @@ public:
         if(!loaded_||kind<0||unsigned(kind)>=classCount)return false;
         if(scopeType){const int t=findTypeLocked(typeId);if(t<0)return false;
             for(unsigned i=unsigned(t);i+1<typeCount_;++i){types_[i]=types_[i+1];typeIds_[i]=typeIds_[i+1];}
-            --typeCount_;types_[typeCount_]={};typeIds_[typeCount_]=0;}
+            --typeCount_;types_[typeCount_]={};typeIds_[typeCount_]=0;seedLensDefaultsLocked();}
         else{if(classes_[unsigned(kind)].zero())return false;classes_[unsigned(kind)]={};}
         resets_.fetch_add(1,std::memory_order_relaxed);publishLocked();
         return saveLocked();
@@ -204,6 +241,8 @@ private:
     std::atomic<bool> loadedFlag_{false},persistenceOk_{true};
     std::atomic<std::uint32_t> saves_{0},saveFailures_{0},edits_{0},resets_{0},generation_{0};
     int findTypeLocked(int typeId) const noexcept {for(unsigned t=0;t<typeCount_;++t)if(typeIds_[t]==typeId)return int(t);return -1;}
+    void seedLensDefaultsLocked() noexcept {for(const auto& d:lensDefaults)if(findTypeLocked(d.key)<0&&typeCount_<maxTypes){
+        typeIds_[typeCount_]=d.key;types_[typeCount_]=d.entry;++typeCount_;}}
     struct Published {std::array<Entry,classCount> classes{};std::array<Entry,maxTypes> types{};std::array<std::int16_t,maxTypes> ids{};unsigned count{};};
     mutable std::mutex pubMutex_;Published pub_{};
     int findPub(int typeId) const noexcept {for(unsigned t=0;t<pub_.count;++t)if(pub_.ids[t]==typeId)return int(t);return -1;}
@@ -261,5 +300,6 @@ inline Store store;
 // Menu scope (XR thread): false = edits go to the weapon's CLASS, true = to this weapon TYPE only.
 // default THIS WEAPON ONLY (a CLASS edit made with any handgun moves every pistol-class gun, the Cattleman too).
 inline std::atomic<bool> scopeType{true};
+inline std::atomic<bool> lensMode{false}; // the page edits the SCOPE LENS of the held sniper (SAVE FOR row cycles to it)
 
 } // namespace rdrvr::vr::calib

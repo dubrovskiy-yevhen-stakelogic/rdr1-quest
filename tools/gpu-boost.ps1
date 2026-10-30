@@ -237,8 +237,8 @@ function Write-BoostGuidance {
     Write-Host '  - In the VR menu, GRAPHICS > GPU BOOST chooses the level: OFF, 640 or 690 MHz (default 690).'
     Write-Host '    It shows NO HELPER when the helper is not running.'
     Write-Host '  - The boost applies only while the game runs. Home and other apps keep their normal clocks.'
-    Write-Host '  - Higher clocks drain the battery faster and warm the headset. When the headset gets hot,'
-    Write-Host '    the game shows a red overheat warning and lowers 690 to 640 MHz.'
+    Write-Host '  - Higher clocks drain the battery faster and warm the headset, as with any boost tool. When the'
+    Write-Host '    system lowers the clocks, which is normal, the game shows a short note and lowers 690 to 640 MHz.'
     Write-Host '  - GPU_BOOST.bat -Off stops the helper; GPU_BOOST.bat -Status shows its state.'
 }
 

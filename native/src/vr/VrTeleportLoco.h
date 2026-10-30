@@ -848,7 +848,7 @@ inline void Module::commit(const mainthread::Frame& fr,arc::Context& c) noexcept
     buildFrame(c,picked_,frozen_);publish(frozen_,c);                   // markShown(the picked trace): validateShown judges what was SHOWN
     ++serial_;bump(stats.commitRequests);
     accepted_=false;committed_={};commitV_={};commitStartNs_=now;commitTicks_=0;blackNs_=0;fadeStartNs_=0;warped_=false;
-    userTurns0_=warp::userTurns.load(std::memory_order_relaxed);         // user snap turns from here on are not psi drift (holdTick)
+    userTurns0_=warp::userTurns.load(std::memory_order_relaxed);         // the player's snap turns from here on are not psi drift (holdTick)
     fromValid_=picked_.shown==Shown::Valid;
     if(fromValid_)bump(stats.releasesValid);
     if(fromValid_&&blink_&&blinkAvailable()){                            // A Valid entry fades at once, validateShown meanwhile

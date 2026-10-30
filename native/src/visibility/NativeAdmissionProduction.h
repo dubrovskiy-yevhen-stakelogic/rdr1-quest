@@ -53,7 +53,7 @@ private:
  static const ColdMaterialVariants::Receipt* technique(void*u,Address m,unsigned t)noexcept{return static_cast<NativeAdmissionProduction*>(u)->techniques_.lookup(m,t);}
  static bool matrixSetCurrent(void*u,Address p)noexcept{const auto&s=*static_cast<const NativeAdmissionProduction*>(u);return s.ready_&&s.deps_.matrixSetCurrent&&s.deps_.matrixSetCurrent(s.deps_.context,p);}
  // Production uses geometry-only prepare + exact late technique, never an
- // invented all-material certificate. The legacy strict capture stays closed.
+ // invented all-material certificate. The strict all-material capture stays closed.
  static const ColdMaterialVariants::Receipt* allMaterial(void*,Address)noexcept{return nullptr;}
  Dependencies deps_{};rdr95::Api memory_{};ColdMaterialVariants::Api materials_{};NativeTechniqueSelection::Api selection_{};NativeSelectedLodGeometry::Api geometry_{};NativeCurrentFixedState::Api state_{};ColdSelectedTechniqueCache techniques_;bool ready_{};
 };

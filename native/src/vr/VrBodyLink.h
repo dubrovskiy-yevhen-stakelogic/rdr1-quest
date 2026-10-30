@@ -19,8 +19,8 @@
 //           apply to the body point B (B += R^-1 * dC) while roomscale owns the capsule (record applied, no stick).
 // split() below (per-substep attribution) is diagnostic only: it assumes a substep's command moves the capsule within that
 // substep, which is false on this engine:
-// mvrMoverInst::Update's impulse shows in the capsule position only one substep later, so split() credited the head part
-// with the WRONG SIGN -> B walked away from the neck -> lean pinned at the 0.30 cap -> endless requests (34 m run-away).
+// mvrMoverInst::Update's impulse shows in the capsule position only one substep later, so split() credits the head part
+// with the WRONG SIGN -> B walks away from the neck -> lean pins at the 0.30 cap -> endless requests (a run-away).
 #include <array>
 #include <atomic>
 #include <cmath>

@@ -6,6 +6,26 @@
  },
  "ranges": [
   {
+   "id": "CutsceneShadowCam_188c85c_16_8d",
+   "vaddr": "0x188c85c",
+   "length": 16,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "9c9d9972a2589907e4a20aef762062cf2a63bc0e883185fe00391fa65043e285"
+  },
+  {
+   "id": "CutsceneShadowCam_1be9fcc_16_8d",
+   "vaddr": "0x1be9fcc",
+   "length": 16,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "228647ff4eadd17d2c52d3b3639c141228edc791458bc1a00eb1da3d425c5feb"
+  },
+  {
    "id": "EngineColorRestart_18adf78_20_8d",
    "vaddr": "0x18adf78",
    "length": 20,
@@ -2454,6 +2474,16 @@
    "suffix": "",
    "upper": false,
    "sha256": "0bfdc3e29cfcf874ddc5fe38917c82727fb31447fded9606f49874d7d8c877c2"
+  },
+  {
+   "id": "TraceEntry_2a6e7a8_16_8d",
+   "vaddr": "0x2a6e7a8",
+   "length": 16,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "aece86811c7dcc7b0a82c1e36bb3694fce03c53f17aaa7949851beae6ab9e938"
   },
   {
    "id": "TraceSymbols_11fb31d_23_8d",
@@ -6156,6 +6186,86 @@
    "sha256": "4e31ba2f2ac1ce56449cb7cf5cf81641ea65cf29e5955ff05cb0f7faa6ee7a4f"
   },
   {
+   "id": "VrCheats_1be0b04_36_8d",
+   "vaddr": "0x1be0b04",
+   "length": 36,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "2911def41d8d5e9a2c3d5dac995f82988757dfdff908071da3bba1ab849981d2"
+  },
+  {
+   "id": "VrCheats_1be1390_16_8d",
+   "vaddr": "0x1be1390",
+   "length": 16,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "c0e6c019312b108cef9339bf7e2e6d79556ac75aa3e274443475156088ef8bc8"
+  },
+  {
+   "id": "VrCheats_1be1420_44_8d",
+   "vaddr": "0x1be1420",
+   "length": 44,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "428ceb590b8dd1bf0fbeabd246059aa450f9701c57e6feb94cb1a20c1381ef0d"
+  },
+  {
+   "id": "VrCheats_1be1764_44_8d",
+   "vaddr": "0x1be1764",
+   "length": 44,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "0361e7a9cb25296674e200f1a216df53cb5ef97738d77957130e8e87da3073f9"
+  },
+  {
+   "id": "VrCheats_1bec19c_244_8d",
+   "vaddr": "0x1bec19c",
+   "length": 244,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "9223ac96017224150383ccb71baaa0d1a1ab3d985117efc8cc5b2707acc323bc"
+  },
+  {
+   "id": "VrCheats_1bee2ac_80_8d",
+   "vaddr": "0x1bee2ac",
+   "length": 80,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "8da4c08ad1016195ef09e3dbc84ac6e4b6bb924dd8cf0e81d85e2920f71337e3"
+  },
+  {
+   "id": "VrCheats_1bee408_128_8d",
+   "vaddr": "0x1bee408",
+   "length": 128,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "a8f6eda58747c0bd2f84979abb642e42c7380077fe9f67628c1afc11570d41e0"
+  },
+  {
+   "id": "VrCheats_1c04f48_428_8d",
+   "vaddr": "0x1c04f48",
+   "length": 428,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "05ca1069d25f93df3d5d2fe747d61e489364e04ea455b0aa633e73a3ec914453"
+  },
+  {
    "id": "VrCheats_1cab2a4_92_8d",
    "vaddr": "0x1cab2a4",
    "length": 92,
@@ -6176,6 +6286,26 @@
    "sha256": "f06750ae416014477eb8b4b0a7d748bd68a7f6b0ce2b402b1cb892502152fe28"
   },
   {
+   "id": "VrCheats_1e51284_144_8d",
+   "vaddr": "0x1e51284",
+   "length": 144,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "c41c7751b62181371fb5253cbdf83d3d6d52dac2eedfb8afbc4542c2b2c20ad2"
+  },
+  {
+   "id": "VrCheats_1e51834_20_8d",
+   "vaddr": "0x1e51834",
+   "length": 20,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "431889a936dac251c3d702d0ec68d9d2bdd5382aa3f4086dd7be1f4a3872bac1"
+  },
+  {
    "id": "VrCheats_1e83500_468_8d",
    "vaddr": "0x1e83500",
    "length": 468,
@@ -6184,6 +6314,16 @@
    "suffix": "",
    "upper": false,
    "sha256": "84d8d8084b8c6464aa346cf57698665aa40b2be14b4dae241273ae6586ffc4bb"
+  },
+  {
+   "id": "VrCheats_2324c7c_140_8d",
+   "vaddr": "0x2324c7c",
+   "length": 140,
+   "width": 1,
+   "style": "dec",
+   "suffix": "",
+   "upper": false,
+   "sha256": "3a67a1390ee316fa21db645d25fa9c72cba5992e7ec1129293a904b47996aec5"
   },
   {
    "id": "VrCheats_2398b9c_116_8d",
@@ -6586,6 +6726,26 @@
    "sha256": "c1b00c9e85e5e1a893453c83ade762c9b109450502c721e19e1cc4da770e2cf6"
   },
   {
+   "id": "VrGameMsg_1aa1628_24_8h",
+   "vaddr": "0x1aa1628",
+   "length": 24,
+   "width": 1,
+   "style": "hex",
+   "suffix": "",
+   "upper": false,
+   "sha256": "416e9a37b1f7fad9580bdd93a32eb5b08952eb211995bfe0526cdfc6d3ce8a8c"
+  },
+  {
+   "id": "VrGameMsg_29fbd3c_24_8h",
+   "vaddr": "0x29fbd3c",
+   "length": 24,
+   "width": 1,
+   "style": "hex",
+   "suffix": "",
+   "upper": false,
+   "sha256": "f3ff601cba2543dca37554b5f078f0c5e0b16e06dfc0c8876b10a84dc95f44ff"
+  },
+  {
    "id": "VrHammer_1cbb684_20_8d",
    "vaddr": "0x1cbb684",
    "length": 20,
@@ -6934,6 +7094,26 @@
    "suffix": "",
    "upper": false,
    "sha256": "faf5910bdabc433e24b1a9f5e9352dcccd91f05a7254a57dd97e57d37af1dcb2"
+  },
+  {
+   "id": "VrIdleCam_18405d4_24_8h",
+   "vaddr": "0x18405d4",
+   "length": 24,
+   "width": 1,
+   "style": "hex",
+   "suffix": "",
+   "upper": false,
+   "sha256": "f8e94b02569b109ef64f3cf2aa15fbc8c56fd45c0c31271df018fc2685681191"
+  },
+  {
+   "id": "VrIdleCam_25909d8_24_8h",
+   "vaddr": "0x25909d8",
+   "length": 24,
+   "width": 1,
+   "style": "hex",
+   "suffix": "",
+   "upper": false,
+   "sha256": "63ce4b1cc7a5df727eea4e502252e3443073c853e86f45ec09b58da98542f652"
   },
   {
    "id": "VrLasso_2176f40_64_8d",
@@ -7754,6 +7934,36 @@
    "suffix": "",
    "upper": false,
    "sha256": "a3a2ed5bc8d842ded586457e60ffd995f8ba7fe10cbf2ff79eace8e986c9a512"
+  },
+  {
+   "id": "VrSatchel_1838228_24_8h",
+   "vaddr": "0x1838228",
+   "length": 24,
+   "width": 1,
+   "style": "hex",
+   "suffix": "",
+   "upper": false,
+   "sha256": "a8407c893e9c22d8ed06ff879b067a0a23a739d64ae8951771db322a7e0fedc6"
+  },
+  {
+   "id": "VrSatchel_1971ca4_24_8h",
+   "vaddr": "0x1971ca4",
+   "length": 24,
+   "width": 1,
+   "style": "hex",
+   "suffix": "",
+   "upper": false,
+   "sha256": "c65b9fb4ea52bc1ed5d2abf8987f8b608ceaec4880b57dfb412e8e2a9e1c9609"
+  },
+  {
+   "id": "VrSatchel_256d3dc_24_8h",
+   "vaddr": "0x256d3dc",
+   "length": 24,
+   "width": 1,
+   "style": "hex",
+   "suffix": "",
+   "upper": false,
+   "sha256": "92dc347cef99ce35655b2e1af5486c26b1dc08329c59013d1de80bd7d525d97b"
   },
   {
    "id": "VrTeleportLoco_1caaa8c_1028_8d",

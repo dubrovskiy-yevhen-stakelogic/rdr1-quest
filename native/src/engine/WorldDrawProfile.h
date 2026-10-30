@@ -24,12 +24,12 @@ private:
     struct State {WorldDrawProfile* owner{};bool failed{};unsigned calls{},filtered{};const void* waterRequest{};bool plain{};bool water{};};
     inline static thread_local State* active_{};
     Original original_{};Reader read_{};
-    // cpu02: request+0xcc and *buckets are synchronous arguments of the wrapped Draw (the engine dereferences request itself),
+    // request+0xcc and *buckets are synchronous arguments of the wrapped Draw (the engine dereferences request itself),
     // so they are copied directly instead of one process_vm_readv each (2 per Draw). debug.rdrvr.profile.plain 1 = plain reads; default
     // guarded (0): plain reads would fault on a bad pointer where the guarded read only marks the eye failed, for ~0.07 ms.
     // Latched per Eye scope; the property is read at Eye entry at most once per second, never per draw.
     std::atomic<bool> plain_{false};std::atomic<std::uint64_t> lastReadNs_{},propertyReads_{};
-    std::atomic<std::uint64_t> eyes_{},plainEyes_{},failedEyes_{},calls_{},filtered_{}; // cpu02: identity counters (summed at Eye exit)
+    std::atomic<std::uint64_t> eyes_{},plainEyes_{},failedEyes_{},calls_{},filtered_{}; // identity counters (summed at Eye exit)
     static bool readPlainProperty()noexcept{
 #ifdef __ANDROID__
         const int saved=errno;char v[PROP_VALUE_MAX]{};const bool on=__system_property_get("debug.rdrvr.profile.plain",v)>0&&v[0]=='1'&&!v[1];errno=saved;return on;
@@ -51,7 +51,7 @@ public:
     class Eye {
         State state_;State* previous_{};
     public:
-        // w01 WATER: water=true keeps bucket 4 (water) for any index-13 request, as waterRequest does for its one request;
+        // WATER: water=true keeps bucket 4 (water) for any index-13 request, as waterRequest does for its one request;
         // distortion (6) and 7 stay filtered.
         explicit Eye(WorldDrawProfile& owner,const void* waterRequest=nullptr,bool water=false):state_{&owner,false,0,0,waterRequest,false,water},previous_(active_){
             owner.refresh();state_.plain=owner.plain_.load(std::memory_order_relaxed);
@@ -82,7 +82,7 @@ public:
             original_(container,request,&selected,categories,pass,flags,a,b,tail);
         }catch(...){s->failed=true;throw;}
     }
-    // cpu02: plain 0/1 A/B must give the same calls and filtered per eye and failedEyes 0.
+    // plain 0/1 A/B must give the same calls and filtered per eye and failedEyes 0.
     std::string report()const{
         auto u=[](const std::atomic<std::uint64_t>& v){return std::to_string(v.load(std::memory_order_relaxed));};
         std::string o="{\"plain\":";o+=plain_.load(std::memory_order_relaxed)?"true":"false";

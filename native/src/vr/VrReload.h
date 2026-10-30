@@ -27,6 +27,7 @@
 #include "VrReloadClose.h"
 #include "VrSettings.h"
 #include "VrTouch.h"
+#include "VrWeaponCalib.h" // REVOLVER FIT (weapons.cfg type.<30000 + model>)
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -210,6 +211,14 @@ inline V3 swingPivot(const Mat& base,V3 axis,V3 up,float pivotDown,float pivotSi
     axis=normalized(axis);up=normalized(up);const V3 side=normalized(cross(axis,up));const V3 t=col(base,3);
     return add(sub(t,mul(up,pivotDown)),mul(side,pivotSide));
 }
+// rotate base (parent frame) by 'radians' about 'axis' (unit) through an explicit pivot point (parent frame). Pure.
+inline Mat swingAbout(const Mat& base,V3 axis,V3 pivot,float radians) noexcept {
+    axis=normalized(axis);Mat out=base;
+    for(unsigned c=0;c<3;++c){const auto v=axisRotate(col(base,c),axis,radians);for(unsigned i=0;i<3;++i)out[c*4+i]=v[i];}
+    const V3 t=col(base,3);V3 d{};for(unsigned i=0;i<3;++i)d[i]=t[i]-pivot[i];const auto r=axisRotate(d,axis,radians);
+    for(unsigned i=0;i<3;++i)out[12+i]=pivot[i]+r[i];
+    out[3]=out[7]=out[11]=0;out[15]=1;return out;
+}
 inline bool finiteMat(const Mat& m) noexcept {for(float x:m)if(!std::isfinite(x))return false;return true;}
 // Pose (LOCAL metres) -> 4x4.
 inline Mat poseMat(const ::rdrvr::Pose& p) noexcept {
@@ -245,6 +254,14 @@ struct Config {
     // turning at the hand's surface speed (bone rad/s, x gain), viscous decay tau + a constant (Coulomb) deceleration; below stop it clicks into the
     // detent ahead. A 0.4 m/s swipe ~ 1.5 s / 2 rev, a hard 1.5 m/s flick ~ 2.5 s / 9 rev.
     float spinTau{.8f},spinCoulomb{3.f},spinMax{80.f},spinStart{6.f},spinStop{2.5f},spinGain{1.f};
+    // BREAK-ACTION shotguns (break it open, put the shells in like the revolver, close it
+    // with a gesture or the hand): .shotgun 0 = the game's reload for every shotgun, .shotgunEject 0 = the spent shells stay in on opening
+    // (the ejectors), .shotgunLearn 0 = never learn the break from the game's own reload animation
+    bool shotgun{true},shotgunEject{true},shotgunLearn{true};
+    // the shells of an open BREAK-ACTION (Brain::breakEjectStep; the revolver's .tiltDeg / .shake rest on the barrel, these on the TIPPED barrels):
+    // .breakTiltDeg = the tipped barrels this far above level = the breech faces down: spent shells slide out (the sawed-off breaks 33 deg, so 20 = the
+    // gun held 53 deg up; the revolver's 35 would ask for 68 deg). .breakShakeLive (m/s) = the two strokes that drop LIVE shells too (spent: the revolver's .shake)
+    float breakTiltDeg{20.f},breakShakeLive{1.6f};
 };
 inline Config config{};
 inline std::atomic<bool> started{};
@@ -254,8 +271,10 @@ using ClockFn=std::uint64_t(*)() noexcept;
 inline std::atomic<ClockFn> clockFn{&::rdrvr::vr::nowNs};
 inline std::uint64_t clockNow() noexcept {return clockFn.load(std::memory_order_relaxed)();}
 // WeaponClass values (engine::WeaponClass: Unknown, Pistol, DualPistol, ...) published in holsters::heldKind.
-inline constexpr int kindPistol=1,kindDualPistol=2;
+inline constexpr int kindPistol=1,kindDualPistol=2,kindShotgun=6;
 inline bool revolverKind(int k) noexcept {return k==kindPistol||k==kindDualPistol;}
+// the classes the manual reload runs for (revolvers + the break-action shotguns; the model decides which shotgun - modelMechanics)
+inline bool reloadKind(int k) noexcept {return revolverKind(k)||(k==kindShotgun&&config.shotgun);}
 
 // ---- install (TraceEntry): any missing piece -> effective NATIVE, reason in the report / row UNAVAILABLE ----
 enum class Install : int {NotAttempted,Installed,Killed,EngineMismatch,NoHook,NoExecutor,NoHolsters};
@@ -446,6 +465,7 @@ struct Record {
     std::uintptr_t weapon{},type{};int n{};std::array<ChamberState,maxChambers> st{};int next{};
     std::uint64_t createdNs{},seenNs{};bool fallback{};std::uint32_t autoIndexedSeq{};
     bool cockAdvanced{}; // REALISTIC: a cock already turned the cylinder for the coming shot (cleared by the shot / a close)
+    bool fixedSlots{};   // BREAK-ACTION shotgun: the chambers are barrels (never turn: chamber c is always drawn in slot c)
     int live() const noexcept {int k=0;for(int i=0;i<n;++i)k+=st[std::size_t(i)]==ChamberState::Live;return k;}
     int count(ChamberState s) const noexcept {int k=0;for(int i=0;i<n;++i)k+=st[std::size_t(i)]==s;return k;}
 };
@@ -478,7 +498,7 @@ struct Counters {
         opsPosted{},opsPostFailed{},opsDone{},opsFailed{},opsExpired{},opsInserted{},opsRollbacks{},ejectReturned{},liveLostCap{},liveLost{},
         rtEdges{},rtForwarded{},rtDry{},rtBlockedOpen{},rtNative{},autoIndexed{},recordsCreated{},recordsDropped{},holsterRefillBlocked{},
         fallbackNoFrame{},longNative{},longAutoload{},presses{},pressesB{},bAfterGesture{},bSpin{},bEdgesPad{},consumeOwned{},consumeCalls{},
-        opens{},rtWhileOpen{},handBackMasked{},grabsSingle{},grabsFull{},grabNoAmmo{},grabNoEmpty{},grabBusy{},grabOutside{},inserts{},roundsSeated{},
+        opens{},rtWhileOpen{},handBackMasked{},grabsSingle{},grabsFull{},grabNoAmmo{},grabNoEmpty{},grabBusy{},grabOutside{},crouchZoneHits{},inserts{},roundsSeated{},
         insertOccupied{},insertSpent{},drops{},zoneEnters{},ejectShake{},ejectRod{},ejectTilt{},ejectAfterSeat{},ejectNoSpent{},ejectNothing{},
         ejectsAfterSeat{},ejectedSpent{},ejectedLive{},tiltAborted{},openAbandoned{},reloadMsCount{},reloadMsSum{},reloadMsMax{},
         frames{},frameStale{},framePublished{},overlayPublished{},overlayUnavailable{},refuseTicks{},closeTicks{},touchTicks{},magnetTicks{},
@@ -578,7 +598,19 @@ inline Verdict gate(GateSource source,int hold,std::uint64_t now) noexcept {
         Record* r=recordForLocked(w);if(!r||r->fallback){bump(ctr.rtNative);return Verdict::PassNative;}
         autoIndexLocked(*r,seq);++decisions;
         const std::uint32_t press=source==GateSource::Trigger?++pressCounter:pressCounter;
-        if(realisticChambers()){ // The cylinder turns one chamber BEFORE the fall (unless a cock already turned it), then the aligned
+        if(r->fixedSlots){ // BREAK-ACTION: one trigger fires the next LOADED barrel (from `next`); none loaded = a dry click
+            int c=-1;for(int i=0;i<r->n;++i){const int k=(r->next+i)%r->n;if(r->st[std::size_t(k)]==ChamberState::Live){c=k;break;}}
+            if(c>=0){
+                r->st[std::size_t(c)]=ChamberState::Firing;PendingShot* ps=nullptr;for(auto& p:pendingShots)if(!p.on){ps=&p;break;}
+                if(!ps){ps=&pendingShots[0];for(auto& p:pendingShots)if(p.ns<ps->ns)ps=&p;}
+                *ps=PendingShot{true,c,now,press,w,(c+1)%r->n,decisions};
+                r->next=(c+1)%r->n;rtCurrentPress.store(press,std::memory_order_release);bump(ctr.shotPasses);bump(ctr.rtForwarded);v=Verdict::Pass;
+            }else{
+                v=r->st[std::size_t(r->next)]==ChamberState::Spent?Verdict::BlockSpent:Verdict::BlockEmpty;
+                if(config.dry)postOpLocked(OpDry,w,0,0,0,now);
+                bump(ctr.rtDry);dry=true;
+            }
+        }else if(realisticChambers()){ // The cylinder turns one chamber BEFORE the fall (unless a cock already turned it), then the aligned
             // chamber decides: LIVE fires (engine fire as SIMPLE, the chamber becomes SPENT on the confirmed shot and STAYS aligned), SPENT / EMPTY =
             // a dry click only (no engine fire, no ammo use, the trigger edge never reaches the game: no native auto-reload either)
             if(r->cockAdvanced)r->cockAdvanced=false;
@@ -616,7 +648,7 @@ inline Verdict gate(GateSource source,int hold,std::uint64_t now) noexcept {
 inline bool cockAdvance(int hold,std::uint64_t now) noexcept {
     (void)hold;if(!realisticChambers()||!manualActive(now))return false;
     const auto w=ownerWeapon.load(std::memory_order_acquire);
-    {std::lock_guard lock(modelMutex);Record* r=recordForLocked(w);if(!r||r->fallback||r->n<2)return false;
+    {std::lock_guard lock(modelMutex);Record* r=recordForLocked(w);if(!r||r->fallback||r->n<2||r->fixedSlots)return false;
         autoIndexLocked(*r,closeSeq()); // a close since the last decision drops a stale cock first
         r->next=(r->next+1)%r->n;r->cockAdvanced=true;}
     bump(chAdvances);bump(chCockAdvances);advanceTicks.fetch_add(1,std::memory_order_relaxed);return true;
@@ -730,6 +762,12 @@ struct ChamberFrame {
     // the MEASURED effect of the roll the code writes, holding grip frame: a point P moves by cross(rollOmega, P) + rollT per +1 rad
     // of roll (finite difference of the actual bone matrices); slotDir = the sense of slot k -> k+1 about `axis` (measured from slotOpen)
     V3 rollOmega{},rollT{};
+    // the CLOSED barrel forward (holding grip frame, unit) - the muzzle elevation (TILT / SHAKE) and the flick roll. = axis on a
+    // crane revolver; on a TOP-BREAK `axis` is the tipped chamber axis (insert / overlay / roll / PUSH), the barrel stays the frame's
+    V3 barrel{};float barrelPad{};
+    // BREAK-ACTION shotgun: the barrels never turn (chamber c = slot c, no roll / rod), the shell (case radius / length, m) and the
+    // fingers-to-tip distance of a held shell (m)
+    std::uint32_t breakGun{};float caseR{},caseLen{},tipM{};
 };
 static_assert(sizeof(ChamberFrame)%8==0&&std::is_trivially_copyable_v<ChamberFrame>);
 inline H::Seqlock<ChamberFrame> chamberBox{};
@@ -744,22 +782,29 @@ struct FrameIn {
     int worldSense{1},gripSense{1};float rollUsed{};
     V3 rollOmega{},rollT{}; // holding grip frame, per +1 rad of roll
     bool modelGeom{};float chamberMm{-1.f},rearMm{-19.f}; // The held model's own chamber ring (false = config, the Cattleman's)
+    float radiusAdjMm{};                                     // REVOLVER FIT: added to the ring radius (auto or given)
+    bool haveCentre{};V3 centre{};                           // CRANE: the closed cylinder axis point (world; false = the bone origin)
+    bool hinge{};                                            // TOP-BREAK: closed / current / full = the virtual cylinder rigid with the hinge
+    bool lateral{};                                          // BREAK-ACTION: the chambers side by side (the ring starts at the weapon's side)
 };
 inline C::Geometry geometryOf(const ChamberFrame& f) noexcept {
     C::Geometry g{};g.valid=f.valid!=0;g.axis=f.axis;g.up=f.up;g.openCentre=f.openCentre;g.closedCentre=f.closedCentre;g.tangent=f.tangent;
-    g.toFrame=f.toFrame;g.radius=f.radius;g.half=std::fabs(f.rear);g.swingSign=f.swingSign;return g;}
+    g.toFrame=f.toFrame;g.radius=f.radius;g.half=std::fabs(f.rear);g.swingSign=f.swingSign;
+    g.barrel=C::finite(f.barrel)&&length(f.barrel)>.5f?f.barrel:f.axis;g.pitch=f.breakGun!=0;return g;}
 // Pure (host-tested). false = degenerate input.
 inline bool buildFrame(const FrameIn& in,ChamberFrame& out) noexcept {
     Mat inv{},closedInv{};if(!affineInverse(in.gripToWorld,inv)||!affineInverse(in.closed,closedInv))return false;
     const float s=length(col(in.gripToWorld,0));if(!(s>1e-6f)||!std::isfinite(s))return false;
     const Mat Tfull=multiply(in.full,closedInv),Tcur=multiply(in.current,closedInv);
-    const V3 b=normalized(in.barrel),c=col(in.closed,3);
+    const V3 b=normalized(in.barrel),c=in.haveCentre?in.centre:col(in.closed,3);
     const V3 off=perp(sub(in.muzzle,c),b);const float rWorld=length(off);
     float r=rWorld/s;std::uint32_t autoR=1;
     const float chamberMm=in.modelGeom?in.chamberMm:config.chamberMm,rearMm=in.modelGeom?in.rearMm:config.rearMm;
     if(chamberMm>0.f){r=chamberMm*.001f;autoR=0;}
     else if(!(r>=.008f&&r<=.030f)){r=.0137f;autoR=0;}
+    if(in.radiusAdjMm!=0.f&&std::isfinite(in.radiusAdjMm))r=std::clamp(r+in.radiusAdjMm*.001f,.006f,.035f);
     V3 u0=rWorld>1e-6f*s?mul(off,1.f/rWorld):normalized(perp(in.up,b));
+    if(in.lateral)u0=normalized(cross(b,normalized(perp(in.up,b)))); // two barrels side by side = slot 0 / 1 at -/+ the side
     if(length(u0)<.5f)return false;
     const float rear=rearMm*.001f;const int n=std::clamp(in.n,1,maxChambers);
     ChamberFrame f{};f.n=n;f.swingSign=in.swingSign;f.amount=in.amount;f.radius=r;f.rear=rear;f.radiusAuto=autoR;
@@ -778,11 +823,18 @@ inline bool buildFrame(const FrameIn& in,ChamberFrame& out) noexcept {
     f.toFrame=normalized(perp(sub(f.closedCentre,f.openCentre),f.axis));
     // closing tangent at O: the swing angle runs sign*deg -> 0, i.e. angular velocity -sign about the barrel (right-hand rule, swingLocal)
     f.tangent=normalized(mul(cross(f.axis,sub(f.openCentre,f.pivot)),-in.swingSign));
+    f.barrel=f.axis;V3 slotAxis=f.axis;
+    if(in.hinge){ // TOP-BREAK: the chamber axis of THIS frame (tipped with the hinge), the closing tangent = toward the closed centre
+        f.axis=normalized(direction(inv,direction(Tcur,b)));f.up=normalized(perp(normalized(direction(inv,direction(Tcur,in.up))),f.axis));
+        slotAxis=normalized(direction(inv,direction(Tfull,b)));
+        f.toFrame=normalized(perp(sub(f.closedCentre,f.openCentre),f.axis));
+        const V3 t=sub(f.closedCentre,f.openCentre),r0=sub(f.openCentre,f.pivot);const float rr=dot(r0,r0);
+        f.tangent=normalized(rr>1e-12f?sub(t,mul(r0,dot(t,r0)/rr)):t);}
     { // The measured slot order sense about f.axis (n = 2: the analytic rotSign x grip-map handedness)
-        const float k=n>=3?dot(cross(sub(f.slotOpen[0],f.rearOpen),sub(f.slotOpen[1],f.rearOpen)),f.axis):0.f;
+        const float k=n>=3?dot(cross(sub(f.slotOpen[0],f.rearOpen),sub(f.slotOpen[1],f.rearOpen)),slotAxis):0.f;
         const float gm=dot(col(in.gripToWorld,0),cross(col(in.gripToWorld,1),col(in.gripToWorld,2)));
         f.slotDir=std::fabs(k)>1e-8f?(k<0.f?-1:1):(config.rotSign*(gm<0.f?-1:1));}
-    for(const auto& v:{f.axis,f.up,f.openCentre,f.closedCentre,f.tangent,f.rodOpen,f.rearOpen})if(!C::finite(v))return false;
+    for(const auto& v:{f.axis,f.up,f.openCentre,f.closedCentre,f.tangent,f.rodOpen,f.rearOpen,f.barrel})if(!C::finite(v))return false;
     f.valid=1;out=f;return true;
 }
 
@@ -828,33 +880,58 @@ inline int chooseBone(const std::array<std::array<char,32>,maxBones>& names,unsi
     for(unsigned i=0;i<count;++i)if(containsCi(names[i].data(),"drum"))return int(i);
     return -1;
 }
-// PER-MODEL HANDGUNS (user, 100% save: on every handgun but the Cattleman "the hammer is offset somewhere completely wrong, the rounds
-// are not on the cylinder"). Per model the engine gives the skeleton (bone names + rest locals; dumps: Cattleman "root body cylinder hammer
+// PER-MODEL HANDGUNS.
+// Per model the engine gives the skeleton (bone names + rest locals; dumps: Cattleman "root body cylinder hammer
 // flap trigger", type 7 "root body hammer hinge cylinder trigger" = cylinder under a hinge, pistols "body slide (hammer) trigger (lever)"), the
 // muzzle locator (bore line -> chamber radius) and the clip (-> chambers). NOT given: the chamber mouth plane, the crane swing, the spur on the
 // hammer bone - Cattleman-tuned constants. The model = the hand item's type name ("base_pistol_REVOLVER_Cattleman"), bound to its weapon by
 // VrWeapon publishOwner. Only `manual` revolvers run the manual reload / chamber overlay / hammer zone + visual; the rest: the game's reload
-// (B) and a plain trigger. Device calibration: debug.rdrvr.vr.reload.models "all" | "none" | "SCHOFIELD,LEMAT" (trust)
+// (B) and a plain trigger. Device calibration: debug.rdrvr.vr.reload.models "all" | "none" | "CATTLEMAN,LEMAT" (only these trusted)
 // .geom.<KEY> "rearMm chamberMm spurX spurY spurZ" (mm; chamberMm -1 = auto from the bore; spur = hammer .offset of that model).
+// EVERY revolver is `manual`. The
+// Cattleman keeps its tuned constants; the others take their geometry from their own skeleton each Update (VrHammer spurGeom: the hammer
+// bone moved onto the bore's vertical plane - the Schofield's sits 1.6 cm off it - or, when that bone cannot be the hammer pivot (the
+// Schofield's is 8 cm ahead of the hammer, in front of the cylinder's rear face), the spur placed behind the cylinder's rear face with the
+// Cattleman's proportions; the chamber ring from their own bore / cylinder bone), plus the in-headset REVOLVER FIT
+// (WEAPON CALIBRATION > SAVE FOR > REVOLVER FIT, weapons.cfg type.<30000 + model>). Report vr.weapon.hammer.modelGeom per model.
+// + the BREAK-ACTION shotguns (appended: the REVOLVER FIT keys 1..9 keep their order; classifyModel tries them FIRST - the
+// double-barrel's "DOUBLE" would otherwise be the DOUBLE-ACTION revolver). Device names: the sawed-off
+// "base_shotgun_SHOTGUN_SawedOff" (class 6 SHOTGUN, typeId 15, clip 2), the double-barrel typeId 16 ("SHOTGUN DOUBLEBARREL").
 enum Model : int {ModelUnknown,ModelCattleman,ModelSchofield,ModelDoubleAction,ModelLeMat,ModelVolcanic,ModelSemiAuto,ModelHighPower,ModelMauser,
-    ModelOtherRevolver,ModelOtherPistol,ModelCount};
-struct ModelSpec {const char* key;const char* needle;bool revolver,doubleAction,manual,geom;float rearMm,chamberMm;V3 spur;};
+    ModelOtherRevolver,ModelOtherPistol,ModelDoubleBarrel,ModelSawedOff,ModelCount};
+static_assert(::rdrvr::vr::calib::revolverModel("base_pistol_REVOLVER_Cattleman")==ModelCattleman&&
+              ::rdrvr::vr::calib::revolverModel("base_pistol_REVOLVER_Schofield")==ModelSchofield&&
+              ::rdrvr::vr::calib::revolverModel("base_pistol_REVOLVER_DoubleActi")==ModelDoubleAction&&
+              ::rdrvr::vr::calib::revolverModel("base_pistol_REVOLVER_LeMat")==ModelLeMat&&
+              ::rdrvr::vr::calib::revolverModel("base_pistol_REVOLVER_Other")==ModelOtherRevolver&&
+              ::rdrvr::vr::calib::revolverModel("base_pistol_PISTOL_Volcanic")<0,"REVOLVER FIT keys follow the Model order");
+static_assert(::rdrvr::vr::calib::breakGunModel("base_shotgun_SHOTGUN_DoubleBarr")==ModelDoubleBarrel&&
+              ::rdrvr::vr::calib::breakGunModel("base_shotgun_SHOTGUN_SawedOff")==ModelSawedOff&&
+              ::rdrvr::vr::calib::breakGunModel("base_shotgun_SHOTGUN_Pump")<0,"SHELLS FIT keys follow the Model order");
+struct ModelSpec {const char* key;const char* needle;bool revolver,doubleAction,manual,geom;float rearMm,chamberMm;V3 spur;bool shotgun{};};
 inline std::array<ModelSpec,ModelCount> models{{ // readConfig (startup) only, read-only after; geom false = config (.chamber / hammer .offset)
     {"UNKNOWN","",false,false,false,false,-19.f,-1.f,{0.f,15.f,-10.f}},
     {"CATTLEMAN","CATTLEMAN",true,false,true,false,-19.f,-1.f,{0.f,15.f,-10.f}},
-    {"SCHOFIELD","SCHOFIELD",true,false,false,false,-19.f,-1.f,{0.f,15.f,-10.f}},     // TODO device: values = Cattleman; break-top? (hinge)
-    {"DOUBLEACTION","DOUBLE",true,true,false,false,-19.f,-1.f,{0.f,15.f,-10.f}},      // TODO device: values = Cattleman
-    {"LEMAT","LEMAT",true,false,false,false,-19.f,-1.f,{0.f,15.f,-10.f}},             // TODO device: values = Cattleman; 9 chambers
+    {"SCHOFIELD","SCHOFIELD",true,false,true,false,-19.f,-1.f,{0.f,15.f,-10.f}},      // TOP-BREAK roles (BoneRoles below: hammer = "cylinder", hinge = "hammer")
+    {"DOUBLEACTION","DOUBLE",true,true,true,false,-19.f,-1.f,{0.f,15.f,-10.f}},       // auto geometry; the trigger fires (double action)
+    {"LEMAT","LEMAT",true,false,true,false,-19.f,-1.f,{0.f,15.f,-10.f}},              // TOP-BREAK roles like the Schofield; 9 chambers (clip)
     {"VOLCANIC","VOLCANIC",false,false,false,false,-19.f,-1.f,{0.f,15.f,-10.f}},      // lever action, tube magazine: game reload
     {"SEMIAUTO","SEMIAUTO",false,false,false,false,-19.f,-1.f,{0.f,15.f,-10.f}},      // magazine pistols: game reload, trigger fires
     {"HIGHPOWER","HIGHPOWER",false,false,false,false,-19.f,-1.f,{0.f,15.f,-10.f}},
     {"MAUSER","MAUSER",false,false,false,false,-19.f,-1.f,{0.f,15.f,-10.f}},
-    {"REVOLVER","_REVOLVER_",true,false,false,false,-19.f,-1.f,{0.f,15.f,-10.f}},     // any other revolver: game reload
-    {"PISTOL","_PISTOL_",false,false,false,false,-19.f,-1.f,{0.f,15.f,-10.f}}}};      // last: every handgun name has "base_pistol_"
+    {"REVOLVER","_REVOLVER_",true,false,true,false,-19.f,-1.f,{0.f,15.f,-10.f}},      // any other revolver = auto geometry
+    {"PISTOL","_PISTOL_",false,false,false,false,-19.f,-1.f,{0.f,15.f,-10.f}},        // every handgun name has "base_pistol_"
+    {"DOUBLEBARREL","SHOTGUN_DOUBLE",false,false,true,false,-19.f,-1.f,{0.f,0.f,0.f},true}, // BREAK-ACTION (BreakGun below)
+    {"SAWEDOFF","SHOTGUN_SAWED",false,false,true,false,-19.f,-1.f,{0.f,0.f,0.f},true}}};    // the cut-down double-barrel: same rig
 inline int classifyModel(const char* name) noexcept {
     if(!name||!*name)return ModelUnknown;
-    for(int m=1;m<ModelCount;++m){const char* n=models[std::size_t(m)].needle;if(*n&&containsCi(name,n))return m;}
+    // a shotgun name ("base_shotgun_...") only ever classifies as a shotgun model - with the class-6 gate a double-barrel named
+    // without "SHOTGUN_DOUBLE" would otherwise run the DOUBLE-ACTION revolver's mechanics; any other "DOUBLE" shotgun = the double-barrel
+    const bool sg=containsCi(name,"SHOTGUN");
+    for(int m=1;m<ModelCount;++m){if(models[std::size_t(m)].shotgun!=sg)continue;const char* n=models[std::size_t(m)].needle;if(*n&&containsCi(name,n))return m;}
+    if(sg&&containsCi(name,"DOUBLE"))return ModelDoubleBarrel;
     return ModelUnknown;}
+inline bool shotgunModel(int m) noexcept {return m>ModelUnknown&&m<ModelCount&&models[std::size_t(m)].shotgun;}
 // main thread (VrWeapon publishOwner): the model of the on-hand weapon (name nullptr = its item is not the holsters' hand item yet = unknown)
 inline std::atomic<std::uintptr_t> modelWeapon{};inline std::atomic<int> modelWord{ModelUnknown};
 inline void publishModel(std::uintptr_t weapon,const char* itemTypeName) noexcept {
@@ -864,18 +941,293 @@ inline void publishModel(std::uintptr_t weapon,const char* itemTypeName) noexcep
 inline int modelOf(std::uintptr_t weapon) noexcept {return weapon&&modelWeapon.load(std::memory_order_acquire)==weapon?modelWord.load(std::memory_order_relaxed):int(ModelUnknown);}
 inline const ModelSpec& specOf(std::uintptr_t weapon) noexcept {return models[std::size_t(std::clamp(modelOf(weapon),0,ModelCount-1))];}
 // any thread: the manual reload / chamber overlay / hammer zone + visual run for this weapon (a revolver with trusted geometry)
-inline bool modelMechanics(std::uintptr_t weapon) noexcept {const auto& s=specOf(weapon);return s.revolver&&s.manual;}
+inline bool modelMechanics(std::uintptr_t weapon) noexcept {const auto& s=specOf(weapon);return (s.revolver||(s.shotgun&&config.shotgun))&&s.manual;}
+inline bool breakGunOf(std::uintptr_t weapon) noexcept {return specOf(weapon).shotgun;} // the held model is a BREAK-ACTION shotgun
+// REVOLVER FIT of a model (weapons.cfg type.<30000 + model>, mm): the spur right / up / forward, the rounds forward, the ring radius +.
+struct ModelFit {V3 spurMm{};float rearMm{},radiusMm{};bool any{};};
+inline ModelFit fitOf(int model) noexcept {
+    namespace K=::rdrvr::vr::calib;ModelFit f{};const int key=K::fitKey(model);if(key<0)return f;
+    const auto e=K::store.typeEntry(key);if(e.zero())return f;
+    f.spurMm={float(e.v[K::OffsetX]),float(e.v[K::OffsetY]),float(e.v[K::OffsetZ])};f.rearMm=float(e.v[K::Pitch]);f.radiusMm=float(e.v[K::Yaw]);f.any=true;return f;}
+// the model takes its geometry from its own skeleton (every revolver but the tuned Cattleman, unless .geom.<KEY> gives it constants)
+inline bool autoGeometry(int model) noexcept {
+    if(model<=ModelUnknown||model>=ModelCount)return false;const auto& s=models[std::size_t(model)];return s.revolver&&!s.geom&&model!=ModelCattleman;}
+// CRANE (per model; default the DOUBLE-ACTION only).
+// The Cattleman's cylinder bone origin IS the cylinder axis (1.6 cm under
+// the bore, on its vertical plane): the swing turns about origin - up*.swing pivotDown, the roll about the origin, the chamber ring is centred
+// on it. The DOUBLE-ACTION's (device dump, model cm: bone [-0.64,2.2,-4.79], muzzle [0,6.07,-22.09]) sits 3.9 cm under the bore and 0.64 cm to
+// the LEFT, off the bore's vertical plane = the CRANE hinge pin of a swing-out cylinder (its mesh turns about that pin); taken as the axis the
+// swing pivot lands another 1.8 cm under the pin (the cylinder goes 4.6 cm out / 2.8 cm down) and the ring of rounds (radius fallback 13.7 mm)
+// circles the pin. CRANE rule: the swing pivot = the bone origin itself; the cylinder axis = the bore line moved down by the chamber radius
+// (on the bore's vertical plane, at the bone's along position) = the roll pivot (the spin / cock advance turn the cylinder, not the crane) and
+// the chamber ring centre; it always opens toward the hinge side (a crane opens one way, whichever hand holds it).
+// Lever: debug.rdrvr.vr.reload.crane.<KEY> "radiusMm [swingDeg]" (on; swingDeg 0 = .swing deg) | "0" / "off" (the axis rule);
+// REVOLVER FIT ring radius + moves the axis with the ring (the top chamber stays on the bore). Report vr.weapon.reload.crane + skeletons.
+struct CraneCfg {bool on{};float radiusMm{15.f},swingDeg{0.f},rearMm{-19.f};}; // rearMm: the rounds' rear plane from the hinge-level ring centre
+// the rounds belong at the rear end of the cylinder: the ring centre is at the crane hinge
+// level z -4.77 cm (the front of the cylinder), the hammer bone at z +3.66; the Cattleman's rear face sits 3.1 cm ahead of its hammer bone
+// -> the double-action's rear face at z ~+0.56 = 53 mm behind the ring centre)
+inline std::array<CraneCfg,ModelCount> defaultCranes() noexcept {std::array<CraneCfg,ModelCount> a{};a[ModelDoubleAction].on=true;a[ModelDoubleAction].rearMm=-53.f;return a;}
+inline std::array<CraneCfg,ModelCount> cranes=defaultCranes(); // readConfig (startup) only, read-only after
+struct CraneGeo {bool on{},signFromHinge{};V3 hinge{},cylAxis{},boreOff{},up{},side{};float radiusM{},deg{},sign{-1.f};};
+// Pure (the cylinder bone's PARENT frame, metres): base = the clean closed local (its origin = the hinge pin), muzzleP = the muzzle locator in that
+// frame, axis = the barrel (unit), up = weapon up; handSign = the hand's swing sign (kept when the hinge sits on the bore plane).
+inline CraneGeo craneGeometry(const Mat& base,V3 muzzleP,V3 axis,V3 up,float radiusM,float deg,float handSign) noexcept {
+    CraneGeo g{};axis=normalized(axis);const V3 u=normalized(perp(up,axis));if(length(u)<.5f||!(radiusM>0.f))return g;
+    const V3 side=normalized(cross(axis,u)),o=col(base,3),off=perp(sub(muzzleP,o),axis);
+    g.hinge=o;g.boreOff=off;g.up=u;g.side=side;g.radiusM=radiusM;g.deg=deg;g.sign=handSign<0.f?-1.f:1.f;
+    g.cylAxis=sub(add(o,off),mul(u,radiusM));
+    const float lat=dot(sub(o,g.cylAxis),side); // the hinge's side of the cylinder axis (< 0 = left)
+    if(std::fabs(lat)>=.001f){const V3 d=sub(g.cylAxis,o);const float rad=deg*3.14159265f/180.f;
+        const float plus=dot(axisRotate(d,axis,rad),side),minus=dot(axisRotate(d,axis,-rad),side);
+        g.sign=lat<0.f?(plus<=minus?1.f:-1.f):(plus>=minus?1.f:-1.f);g.signFromHinge=true;}
+    for(const auto& v:{g.hinge,g.cylAxis})for(float x:v)if(!std::isfinite(x))return CraneGeo{};
+    g.on=true;return g;}
+struct CraneRep {int model{-1};bool on{},signFromHinge{};float sign{},deg{},radiusMm{},armCm{},boreLatCm{},boreUpCm{},openLatCm{},openUpCm{};
+    V3 hingeCm{},axisCm{};std::uint64_t poses{};};
+inline CraneRep craneRep{}; // recordMutex
+// The held model's skeleton: the one SkelDump / dumpSkeletonLocked below (report vr.weapon.reload.skeletons[]).
+// PER-MODEL BONE ROLES. The Schofield skeleton is "root body cylinder hammer flap trigger" (all
+// under body) but its names do not match its parts: the bone NAMED "cylinder" sits on the centre line 1.4 cm under the bore 25 cm behind
+// the muzzle = the hammer (turning it tilted the hammer), the bone NAMED "hammer" sits 2.8 cm under the bore 16 cm behind the muzzle,
+// 1.6 cm to the side = ahead of / below the cylinder = the top-break HINGE pin (the barrel + cylinder assembly tips down about it), and the
+// 'trigger' bone is a template bone at the same model point on every revolver (useless for the spin pivot). Per model:
+//   hammer   = the bone the hammer zone / spur / H2 visual use (VrHammer), cylinder = the bone the crane swing + roll turn (VrReload),
+//   hinge    = a TOP-BREAK: this bone tips about the weapon's lateral axis through its own origin (muzzle down, breakDeg) and the chamber
+//              ring is a VIRTUAL cylinder rigid with it: axis axisDownMm under the bore, rear face rearAheadMm ahead of the hammer bone
+//              origin (the Cattleman's 31 mm), the rounds into its chambers; the bone is never rolled (the ring rolls instead),
+//   spin     = FINGER: the spin pivot is the trigger finger point of the holding grip frame (learned from the Cattleman, else the device
+//              default) instead of the template trigger bone.
+// A spec: "" = the default rule (VrHammer: first "*hammer*", VrReload: first "*cyl*" / "*drum*"), "-" = none, "#<i>" = bone index,
+// otherwise the exact bone name (case-insensitive). Lever (startup): debug.rdrvr.vr.reload.bones.<KEY> "hammer=<spec> cylinder=<spec>
+// hinge=<spec> spin=finger|trigger break=<deg> down=<mm> ahead=<mm>" (only the given keys change) or "off" (the automatic rules for that model).
+// The global .reload.bone / .hammer.bone levers still win. Report vr.weapon.reload.roles + skeletons[], vr.weapon.hammer.modelGeom[].
+// the LEMAT has the Schofield's rig (the reload swing of the bone
+// NAMED "cylinder" tilted the hammer and laid the rounds out from it, the H2 cock of the bone NAMED "hammer" opened half of the gun).
+// Device dump (model cm, +y up, -z forward): muzzle (0.02, 5.74, -21.53); "cylinder" #2 at (-1.76, 1.18, 1.35) = 4.6 cm under the
+// bore, 22.9 cm behind the muzzle = the hammer (the Cattleman's hammer pivot: 3.65 under, 21.3 behind); "hammer" #3 at (0.63, 1.93, -5.54)
+// = 3.8 cm under the bore, 16.0 cm behind the muzzle - the Schofield's hinge spot (2.8 under, 16.05 behind) = the barrel + cylinder
+// assembly's pivot (RDR draws the LeMat as a top-break). Neither bone origin is the cylinder axis: the LeMat's 9-shot cylinder turns
+// about its lower shotgun barrel, under the main bore by the chamber circle radius. Roles = the Schofield's (hammer "cylinder", hinge
+// "hammer", spin finger) with the LeMat's virtual cylinder: axis 18 mm under the bore (= the ring radius of 9 chambers: ~12.6 mm pitch;
+// the Cattleman's 6 sit at 13.7), rear face 24 mm ahead of the hammer bone (front face ~7 mm behind the hinge pin, implied barrel
+// ~16.7 cm; the real LeMat 6.75 in). Rounds 9 from the clip. Lever .bones.LEMAT as above (e.g. "down=17 ahead=20" / "hinge=#4").
+struct BoneRoles {bool set{},spinFinger{};std::array<char,32> hammer{},cylinder{},hinge{};float breakDeg{75.f},axisDownMm{14.f},rearAheadMm{31.f};};
+inline std::array<BoneRoles,ModelCount> defaultRoles() noexcept {
+    std::array<BoneRoles,ModelCount> r{};
+    // the hammer / hinge bone NAMES per model (device skeleton dumps): SCHOFIELD "root body hammer hinge cylinder trigger" (names right),
+    // LEMAT "root body cylinder hammer flap trigger" with the names SWAPPED (bone "cylinder" at the rear = the hammer, bone "hammer" ahead =
+    // the cylinder assembly)
+    const auto topBreak=[&](int model,float downMm,float aheadMm,const char* hammerName,const char* hingeName){auto& s=r[std::size_t(model)];s.set=true;s.spinFinger=true;
+        std::snprintf(s.hammer.data(),s.hammer.size(),"%s",hammerName);std::snprintf(s.cylinder.data(),s.cylinder.size(),"%s","-");
+        std::snprintf(s.hinge.data(),s.hinge.size(),"%s",hingeName); // the device skeleton dump names them right:
+        // root body hammer(#2) hinge(#3) cylinder(#4, child of hinge) trigger
+        s.axisDownMm=downMm;s.rearAheadMm=aheadMm;};
+    topBreak(ModelSchofield,14.f,31.f,"hammer","hinge"); // (unchanged)
+    // the HELD LeMat (typeId 7) has the Schofield's
+    // skeleton with the names RIGHT - hammer #2 (0, 2.66, 1.37) at the rear, hinge #3 (0.63, 1.93, -5.54), cylinder #4 child of the hinge at
+    // (0, 4.13, -2.91) = 1.6 cm under the bore (muzzle y 5.73); another revolver's dump (typeId 4) has the names swapped.
+    // So the Schofield's names; the virtual cylinder axis 16 mm under the bore (the cylinder bone), rear face 24 mm ahead of the hammer.
+    topBreak(ModelLeMat,16.f,24.f,"hammer","hinge");
+    // BREAK-ACTION shotguns: the hinge is chosen by chooseRoleBones (the lever spec / the learned break / the name rule), no spin
+    // finger; breakDeg = the opening until the game's own break was seen (the learned angle wins). 33.2 = what the game's reload
+    // turns the sawed-off's 'sliding' bone, so the first break of a session is already the game's own
+    for(int m:{int(ModelDoubleBarrel),int(ModelSawedOff)}){auto& s=r[std::size_t(m)];s.set=true;s.spinFinger=false;s.breakDeg=33.2f;s.axisDownMm=0.f;s.rearAheadMm=0.f;}
+    return r;}
+inline std::array<BoneRoles,ModelCount> roles=defaultRoles(); // readConfig (startup) applies .bones.<KEY>; read-only after
+inline const BoneRoles& rolesOf(int model) noexcept {static const BoneRoles none{};return model>ModelUnknown&&model<ModelCount?roles[std::size_t(model)]:none;}
+inline bool spinFingerOf(int model) noexcept {const auto& r=rolesOf(model);return r.set&&r.spinFinger;}
+// BREAK-ACTION shotgun (the double-barrel + the sawed-off): the barrels hinge DOWN about a pin and the two chambers sit side by side at the breech face. The hinge bone, in order: the
+// lever spec (.bones.<KEY> "hinge=<name|#i|->"), the break LEARNED from the game's own reload animation (the bone whose local turns the
+// most - hammers / trigger / frame + the trigger's ancestors excluded, >= 15 deg - while the engine reloads; its axis, pin and angle are solved from the rest and the most
+// open pose, so the mod's break is the game's own), the name rule (first "*hinge*", "*sliding*", "*barrel*", "*break*", "*breech*"), the rig's
+// only bone left (root, body, hammers and trigger never count), else none = the game's reload (B) until one game reload was seen.
+// Without a learned pin the break turns breakDeg about the weapon's lateral axis through the bone origin + pin offset.
+// The sawed-off's hinge bone is named 'sliding'. A gun with no hinge has no record, so B goes to the game, which refuses a full clip (DoPerformWeapon: clip <
+// perClip); only a shot lets the game's reload run and teach the break (WeaponFireTask::Begin reloads by itself at clip <= 1 after the shot),
+// and the learned break is memory only = again in every session. Learned pin of the sawed-off = the bone's origin
+// (4.04,-6.29 against 4.03,-6.29), axis = the gun's side, residual 0 mm, 33.2 deg - so the rule's break is the same motion as the learned one.
+// The virtual breech: the barrel pair's axis = the bore line (muzzle locator) moved down / sideways, its
+// breech face `breech` mm along the bore from the pin (- = behind), the chambers +-half mm to the sides; the shells are drawn as
+// cartridges (radius / length), the barrels as an occluder `barrel` mm long. Lever (startup): debug.rdrvr.vr.reload.breakgun.<KEY>
+// "half=10.5 side=0 down=0 breech=-60 barrel=160 shell=65 rad=10 tip=35 pin=<alongMm>,<upMm> open=<deg> ahead=30" (only the given keys change).
+// Report vr.weapon.reload.breakGun (+ skeletons[] / bones[]).
+// The breech comes from the skeleton (pickBreech): `ahead` mm ahead of the hammer bone (the Cattleman's rear face: 31 mm ahead of its
+// hammer), else ahead of the trigger bone (a template point on every revolver dump, so second), kept 1.5 .. 12 cm behind a LEARNED pin (the
+// game's own hinge; a bone origin says nothing about where the mesh's breech is); no such bone = 60 mm behind the pin; a given `breech=` lever always wins. In-headset WEAPON CALIBRATION > SAVE FOR > SHELLS
+// FIT (weapons.cfg type.<30000 + model>) moves the shells on top of it, 1 mm steps, live; the page holds the gun open meanwhile.
+struct BreakGunCfg {float halfMm{10.5f},sideMm{0.f},downMm{0.f},breechMm{-60.f},barrelMm{160.f},shellMm{65.f},shellRMm{10.f},tipMm{35.f},
+    pinAlongMm{0.f},pinUpMm{0.f},openDeg{-1.f},aheadMm{30.f};bool breechSet{};};
+inline std::array<BreakGunCfg,ModelCount> breakGuns{}; // readConfig (startup) only, read-only after
+inline const BreakGunCfg& breakGunCfgOf(int model) noexcept {static const BreakGunCfg none{};return shotgunModel(model)?breakGuns[std::size_t(model)]:none;}
+inline void parseBreakGun(const std::string& text,BreakGunCfg& c) noexcept {
+    std::size_t i=0;
+    while(i<text.size()){
+        while(i<text.size()&&(text[i]==' '||text[i]==';'))++i;
+        std::size_t j=i;while(j<text.size()&&text[j]!=' '&&text[j]!=';')++j;
+        const std::string tok=text.substr(i,j-i);i=j;const auto eq=tok.find('=');if(eq==std::string::npos||eq==0)continue;
+        const std::string k=tok.substr(0,eq),v=tok.substr(eq+1);
+        const auto f=[&](const std::string& t,float& out,float lo,float hi){char* e{};const float x=std::strtof(t.c_str(),&e);if(e!=t.c_str()&&std::isfinite(x)&&x>=lo&&x<=hi)out=x;};
+        if(k=="half")f(v,c.halfMm,4.f,30.f);else if(k=="side")f(v,c.sideMm,-30.f,30.f);else if(k=="down")f(v,c.downMm,-40.f,40.f);
+        else if(k=="breech"){float x=1e9f;f(v,x,-200.f,100.f);if(x<1e8f){c.breechMm=x;c.breechSet=true;}}
+        else if(k=="ahead")f(v,c.aheadMm,0.f,100.f);else if(k=="barrel")f(v,c.barrelMm,40.f,400.f);else if(k=="shell")f(v,c.shellMm,30.f,90.f);
+        else if(k=="rad")f(v,c.shellRMm,5.f,13.f);else if(k=="tip")f(v,c.tipMm,0.f,90.f);else if(k=="open")f(v,c.openDeg,5.f,120.f);
+        else if(k=="pin"){const auto comma=v.find(',');f(v.substr(0,comma),c.pinAlongMm,-150.f,150.f);if(comma!=std::string::npos)f(v.substr(comma+1),c.pinUpMm,-80.f,80.f);}}}
+// the breech face along the bore from the muzzle (m, < 0), from the pin / hammer / trigger positions on the same line. Pure.
+enum BreechRule : int {BreechNone,BreechPin,BreechHammer,BreechTrigger,BreechLever};
+struct BreechPick {float along{};int rule{BreechNone};bool clamped{};};
+inline BreechPick pickBreech(const BreakGunCfg& c,float pinAlong,bool pinLearned,bool haveHammer,float hammerAlong,bool haveTrigger,float triggerAlong) noexcept {
+    BreechPick p{};const float pinRule=pinAlong+c.breechMm*.001f,ahead=c.aheadMm*.001f;
+    if(c.breechSet){p.along=pinRule;p.rule=BreechLever;return p;}
+    const auto barrels=[](float x){return x<=-.08f&&x>=-.90f;}; // 8 .. 90 cm of barrels: anything else is not this bone's real place
+    if(haveHammer&&barrels(hammerAlong+ahead)){p.along=hammerAlong+ahead;p.rule=BreechHammer;}
+    else if(haveTrigger&&barrels(triggerAlong+ahead)){p.along=triggerAlong+ahead;p.rule=BreechTrigger;}
+    else{p.along=pinRule;p.rule=BreechPin;return p;}
+    const float lo=pinAlong-.12f,hi=pinAlong-.015f; // a break action's breech face is behind its hinge pin
+    if(pinLearned&&(p.along<lo||p.along>hi)){p.along=std::clamp(p.along,lo,hi);p.clamped=true;}
+    return p;}
+// The break LEARNED from the game's own reload (recordMutex): per model, the hinge bone, its rotation axis + pin (the bone's PARENT frame,
+// metres), the angle; the solve's residual (a pure hinge = 0), the model-space pin / axis for the report, the last watch's per-bone maxima.
+struct BreakLearn {bool valid{};int bone{-1};unsigned skeletonCount{};float deg{},residualMm{};V3 axisP{},pivotP{},pivotCm{},axisM{};
+    std::array<char,32> name{};unsigned reloads{},lastFrames{};int lastBest{-1};float lastBestDeg{};std::array<float,maxBones> lastMax{};};
+inline std::array<BreakLearn,ModelCount> breakLearn{};
+// The watch of the held shotgun's skeleton (recordMutex): the rest locals (refreshed while the engine does not reload and nothing of ours is
+// on the bones), the most-turned bone while it reloads.
+struct BreakWatch {std::uintptr_t weapon{},skeleton{};unsigned count{};bool restValid{},reloading{};unsigned frames{};int bestBone{-1};float bestDeg{};
+    Mat bestLocal{};std::array<Mat,maxBones> rest{};std::array<float,maxBones> curMax{};
+    std::uint64_t excluded{};bool maskValid{};unsigned idle{}; // the never-hinge mask (once per skeleton), the idle-frame counter of the rest refresh
+};
+inline BreakWatch breakWatch{};
+inline std::atomic<std::uint64_t> breakWatchReloads{},breakLearned{},breakLearnRejected{},breakRechosen{},breakEjectsOpen{},breakEjectNothing{};
+inline std::atomic<std::uint64_t> breakShakeEjects{},breakTiltEjects{};inline std::atomic<const char*> breakLastEjectWhy{"NONE"}; // report breakGun.*
+inline std::atomic<std::uint64_t> breakLongFull{}; // a long B on a fully loaded break gun: it stays open, no game reload
+inline std::atomic<const char*> breakLearnWhy{"NONE"};
+// the turn between two locals' rotations (deg; unit columns)
+inline float turnDeg(const Mat& a,const Mat& b) noexcept {
+    float tr=0.f;for(unsigned c=0;c<3;++c)tr+=dot(normalized(col(a,c)),normalized(col(b,c)));
+    const float d=std::acos(std::clamp((tr-1.f)*.5f,-1.f,1.f))*57.29578f;return std::isfinite(d)?d:0.f;}
+// Pure: the hinge that turns `rest` into `open` (both in the same parent frame): M = open * rest^-1 = a turn by `angle` about `axis` through
+// `pivot` (the in-plane centre of the origin's chord). residual = how far that pure turn misses the open origin (m). false = < 10 deg / singular.
+inline bool hingeFromMotion(const Mat& rest,const Mat& open,V3& axis,V3& pivot,float& angle,float& residual) noexcept {
+    Mat ri{};if(!affineInverse(rest,ri))return false;const Mat M=multiply(open,ri);
+    const float tr=M[0]+M[5]+M[10];angle=std::acos(std::clamp((tr-1.f)*.5f,-1.f,1.f));
+    if(!std::isfinite(angle)||angle<10.f*3.14159265f/180.f)return false;
+    axis=normalized({M[6]-M[9],M[8]-M[2],M[1]-M[4]});if(length(axis)<.5f)return false;
+    const V3 o=col(rest,3),o2=col(open,3),chord=perp(sub(o2,o),axis);const float L=length(chord);
+    if(L<1e-5f)pivot=o;
+    else{const float h=.5f*L/std::tan(.5f*angle);pivot=add(add(o,mul(chord,.5f)),mul(normalized(cross(axis,chord)),h));}
+    const Mat t=swingAbout(rest,axis,pivot,angle);residual=length(sub(col(t,3),o2));
+    for(float x:{axis[0],axis[1],axis[2],pivot[0],pivot[1],pivot[2],residual})if(!std::isfinite(x))return false;
+    return true;}
+// never the hinge: the root, the hammers / trigger / frame parts by name, and every ANCESTOR of a trigger bone (turning it would move the
+// trigger = it is the frame the barrels hinge on, e.g. a body bone the reload animation tilts)
+inline bool breakExcluded(const std::array<std::array<char,32>,maxBones>& names,const std::array<int,maxBones>& parents,unsigned count,unsigned i) noexcept {
+    if(i==0||i>=count||i>=maxBones)return true;
+    for(const char* x:{"hammer","trigger","body","root","frame","stock","receiver"})if(containsCi(names[i].data(),x))return true;
+    for(const char* x:{"shell","cart","ammo","bullet"})if(containsCi(names[i].data(),x))return true; // a flying shell of the reload clip is no hinge
+    for(unsigned j=1;j<count&&j<maxBones;++j){if(!containsCi(names[j].data(),"trigger"))continue;
+        int p=parents[j];for(unsigned g=0;g<maxBones&&p>=0&&unsigned(p)<count;++g){if(unsigned(p)==i)return true;p=parents[unsigned(p)];}}
+    return false;}
+// the name rule
+inline int breakGunHingeRule(const std::array<std::array<char,32>,maxBones>& names,const std::array<int,maxBones>& parents,unsigned count) noexcept {
+    for(const char* want:{"hinge","sliding","barrel","break","breech"})for(unsigned i=1;i<count&&i<maxBones;++i)
+        if(containsCi(names[i].data(),want)&&!breakExcluded(names,parents,count,i))return int(i);
+    return -1;}
+// no such name (the long double-barrel's bones were never dumped): the rig's ONLY bone that is not the frame / a hammer / the trigger
+// can only be the barrels. Two or more left = a guess: none (the game's reload teaches the break).
+inline int breakGunSoleBone(const std::array<std::array<char,32>,maxBones>& names,const std::array<int,maxBones>& parents,unsigned count) noexcept {
+    int only=-1;
+    for(unsigned i=1;i<count&&i<maxBones;++i){if(breakExcluded(names,parents,count,i))continue;if(only>=0)return -1;only=int(i);}
+    return only;}
+inline bool equalCi(const char* a,const char* b) noexcept {
+    for(;*a&&*b;++a,++b)if(std::tolower((unsigned char)*a)!=std::tolower((unsigned char)*b))return false;return !*a&&!*b;}
+// -2 = no spec (the caller's default rule), -1 = none / not found, else the bone index
+inline int roleBone(const std::array<std::array<char,32>,maxBones>& names,unsigned count,const std::array<char,32>& spec) noexcept {
+    if(!spec[0])return -2;if(spec[0]=='-'&&!spec[1])return -1;
+    if(spec[0]=='#'){char* e{};const long v=std::strtol(spec.data()+1,&e,10);return e&&*e==0&&v>=0&&unsigned(v)<count?int(v):-1;}
+    for(unsigned i=0;i<count&&i<maxBones;++i)if(equalCi(names[i].data(),spec.data()))return int(i);
+    return -1;}
 // Cylinder availability of the current VR-held weapon (engine side): 0 unknown, 1 found, 2 missing (no bone named *cyl*).
 enum class Cylinder : int {Unknown,Found,Missing};
 inline std::atomic<int> cylinder{int(Cylinder::Unknown)};inline std::atomic<std::uintptr_t> cylinderWeapon{};
 // Per-weapon engine record of the swing (engine threads, behind a mutex: at most a few calls per frame).
 struct SwingRecord {
     std::uintptr_t weapon{},skeleton{};int bone{-1};unsigned count{};bool baseValid{},written{};Mat base{},last{};std::uint64_t lastNs{};
+    unsigned modelWait{}; // frames the bone choice waited for the model to be known
     std::array<std::array<char,32>,maxBones> names{};std::array<int,maxBones> parents{};
     std::uint64_t enforceNs{};std::uint32_t gen{};   // The (re)draw enforcement window end, the hold generation it was armed for
+    // roles: the model the bones were chosen for, bone = the hinge (TOP-BREAK) or the cylinder (crane swing), the hammer bone (the
+    // virtual cylinder's reference), the last virtual cylinder centre / hinge pin (model cm, report)
+    int model{-1};bool hinge{};int hammerBone{-1};V3 virtualCm{},hingeCm{};bool haveVirtual{};
+    bool shotgun{};int boneFrom{}; // BREAK-ACTION: the hinge came from 1 the lever, 2 the learned break, 3 the name rule, 4 the rig's only bone (0 none)
+    bool pinAtHinge{}; // the bone's origin IS the game's hinge pin ('sliding'): the breech rule treats it as a learned pin
+    // BREAK-ACTION: the hammer / trigger bones along the bore from the muzzle (m, the model's dump = its closed pose), what the
+    // breech rule chose (m; before the FIT), the used half spacing + the two shells' rims, the muzzle (model cm, report)
+    bool refHammerOk{},refTriggerOk{},breechClamped{};int breechRule{BreechNone};float refHammerM{},refTriggerM{},pinAlongM{},breechAlongM{},spreadMm{};
+    std::array<V3,2> shellCm{};V3 muzzleCm{};
 };
+// SKELETON DUMP per model (the first held Update of each model, before any write of ours on it): names, parents, the model-space
+// origin (cm), the local translation (cm) and the model-space axes of every bone. recordMutex. Report vr.weapon.reload.skeletons[].
+struct SkelDump {int model{-1};unsigned count{};std::array<std::array<char,32>,maxBones> names{};std::array<int,maxBones> parents{};
+    std::array<V3,maxBones> posCm{},localCm{},ax{},ay{},az{};V3 muzzleCm{},barrel{},up{};};
+inline std::array<SkelDump,8> skelDumps{}; // 8 (5 revolvers + 2 shotguns + 1)
+// the swing bone of a record by the model's roles (the global .bone lever wins: crane swing on that bone).
+inline void chooseRoleBones(SwingRecord& r,int model,const Config& c) noexcept {
+    r.model=model;r.hinge=false;r.hammerBone=-1;r.haveVirtual=false;r.shotgun=false;r.boneFrom=0;r.pinAtHinge=false;
+    const BoneRoles& ro=rolesOf(model);
+    if(shotgunModel(model)){ // BREAK-ACTION (the revolvers' global .bone lever never picks a shotgun's bone)
+        r.shotgun=true;for(unsigned i=0;i<r.count;++i)if(containsCi(r.names[i].data(),"hammer")){r.hammerBone=int(i);break;}
+        const int spec=roleBone(r.names,r.count,ro.hinge);const BreakLearn& L=breakLearn[std::size_t(model)];int h=-1;
+        if(spec!=-2){h=spec;r.boneFrom=1;}
+        else if(L.valid&&L.bone>0&&unsigned(L.bone)<r.count&&L.skeletonCount==r.count){h=L.bone;r.boneFrom=2;}
+        else{h=breakGunHingeRule(r.names,r.parents,r.count);r.boneFrom=3;
+            if(h<0){h=breakGunSoleBone(r.names,r.parents,r.count);r.boneFrom=4;}
+            r.pinAtHinge=h>0&&containsCi(r.names[unsigned(h)].data(),"sliding");}
+        if(h>0&&h!=r.hammerBone){r.bone=h;r.hinge=true;}else{r.bone=-1;r.pinAtHinge=false;if(r.boneFrom!=1)r.boneFrom=0;} // a lever "-" stays the lever's (no re-choose)
+        return;}
+    if(c.boneIndex>=0||c.boneName[0]||!ro.set){r.bone=chooseBone(r.names,r.count,c);return;}
+    const int h=roleBone(r.names,r.count,ro.hinge),cy=roleBone(r.names,r.count,ro.cylinder),ha=roleBone(r.names,r.count,ro.hammer);
+    r.hammerBone=ha>=0?ha:ha==-2?[&]{for(unsigned i=0;i<r.count;++i)if(containsCi(r.names[i].data(),"hammer"))return int(i);return -1;}():-1;
+    if(h>=0&&h!=r.hammerBone){r.bone=h;r.hinge=true;return;}
+    r.bone=cy==-2?chooseBone(r.names,r.count,c):cy;
+    if(r.bone>=0&&r.bone==r.hammerBone)r.bone=-1; // never swing the bone the hammer uses
+}
+// TOP-BREAK: the hinge local turned about the weapon's lateral axis (parent frame) through its own origin (the hinge pin). The
+// barrel moves toward cross(lat, barrel) for a positive angle about lat = barrel x up, i.e. toward +up: muzzle DOWN = a negative angle
+// (coordinates of an orthonormal frame, mirrored or not: the motion toward -up holds in any of them).
+inline Mat breakLocal(const Mat& base,V3 barrelP,V3 upP,float radiansDown) noexcept {
+    const V3 lat=normalized(cross(normalized(barrelP),normalized(upP)));
+    return swingLocal(base,lat,upP,-radiansDown,0.f,0.f);}
+// the skeleton of a model, once (recordMutex; the record's first Update = before any write of ours on this instance)
+inline void dumpSkeletonLocked(const Engine& e,const Skeleton& k,int model,const std::array<std::array<char,32>,maxBones>& names,
+                               const std::array<int,maxBones>& parents,const Mat& modelMuzzle) noexcept {
+    if(model<=ModelUnknown||model>=ModelCount)return;
+    for(const auto& d:skelDumps)if(d.model==model)return;
+    SkelDump* d=nullptr;for(auto& x:skelDumps)if(x.model<0){d=&x;break;}if(!d)return;
+    Mat root{},rootInv{};if(!e.matrix(k.root,root)||!affineInverse(root,rootInv))return;
+    SkelDump t{};t.model=model;t.count=std::min(k.count,maxBones);t.names=names;t.parents=parents;
+    for(unsigned i=0;i<t.count;++i){Mat g{},l{};
+        if(e.matrix(k.globals+i*globalStride,g)){const Mat m=multiply(rootInv,g);const V3 p=col(m,3);t.posCm[i]={p[0]*100.f,p[1]*100.f,p[2]*100.f};
+            t.ax[i]=normalized(col(m,0));t.ay[i]=normalized(col(m,1));t.az[i]=normalized(col(m,2));}
+        if(e.matrix(k.locals+i*localStride,l))t.localCm[i]={l[12]*100.f,l[13]*100.f,l[14]*100.f};}
+    t.muzzleCm={modelMuzzle[12]*100.f,modelMuzzle[13]*100.f,modelMuzzle[14]*100.f};
+    t.barrel=normalized({-modelMuzzle[8],-modelMuzzle[9],-modelMuzzle[10]});t.up=normalized(col(modelMuzzle,1));
+    *d=t;}
+// the breech rule's bones of a shotgun record, from the model's dump (recordMutex): origin only (a cocked hammer turns about it)
+inline void breechRefsLocked(SwingRecord& r) noexcept {
+    for(const auto& d:skelDumps){if(d.model!=r.model)continue;
+        const auto along=[&](unsigned i){return dot(sub(d.posCm[i],d.muzzleCm),d.barrel)*.01f;};
+        for(unsigned i=1;i<d.count&&i<maxBones;++i){if(length(d.posCm[i])<.05f)continue; // an unplaced bone sits on the model origin
+            if(!r.refHammerOk&&containsCi(d.names[i].data(),"hammer")){r.refHammerM=along(i);r.refHammerOk=std::isfinite(r.refHammerM);}
+            if(!r.refTriggerOk&&containsCi(d.names[i].data(),"trigger")){r.refTriggerM=along(i);r.refTriggerOk=std::isfinite(r.refTriggerM);}}
+        return;}}
+// the largest change of a rotation column (unit columns): ~ the angle in radians for small turns
+inline float rotationDelta(const Mat& a,const Mat& b) noexcept {
+    float d=0.f;for(unsigned c=0;c<3;++c){const V3 x=normalized(col(a,c)),y=normalized(col(b,c));d=std::max(d,length(sub(x,y)));}
+    return std::isfinite(d)?d:1e9f;}
 inline std::mutex recordMutex;inline SwingRecord record{};
 inline std::atomic<std::uint64_t> applyCalls{},applied{},restored{},baseRefreshed{},declined{},writeFailures{},frameFailures{},lastFrameNs{};
+inline std::atomic<std::uint64_t> hingeFrameFailures{}; // TOP-BREAK frames without the hammer bone / an invertible hinge
 // Clean base: the record can be reset while the bone still carries the mod's swing / roll (another
 // weapon drawn in between, a holster / throw / drop mid-reload whose Update did not restore the bone
 // within 1 s). A base re-captured from such a bone gives an offset closed pose with every later
@@ -887,10 +1239,13 @@ inline std::atomic<std::uint64_t> applyCalls{},applied{},restored{},baseRefreshe
 // Every write stays absolute: base -> roll -> swing. recordMutex.
 struct InstBase {std::uintptr_t weapon{},skeleton{};unsigned count{};int bone{-1};bool dirty{};Mat base{},last{};std::uint64_t useNs{};
     std::array<int,maxBones> parents{};};
-struct TypeBase {std::uintptr_t data{};unsigned count{};int bone{-1};Mat base{};};
+// CRANE: a crane swing turns the bone about its OWN origin (the hinge pin) -> the origin never moves and the origin guard is
+// blind; probe = the cylinder axis point in the bone's own local frame (from the type base), its offset is the guard instead.
+struct TypeBase {std::uintptr_t data{};unsigned count{};int bone{-1};Mat base{};bool probeValid{};V3 probe{};};
 inline std::array<InstBase,8> instBases{};inline std::array<TypeBase,8> typeBases{};
 inline std::atomic<std::uint64_t> baseRestores{},staleOpenFixed{},staleBaseRejected{},instEvicted{},drawEnforce{};
 inline constexpr float staleTolM=.001f;                       // 1 mm of the cylinder centre (a 10 deg swing about the crane ~3 mm)
+inline constexpr float staleTolRad=.035f;                     // TOP-BREAK hinge: 2 deg of turn about its own origin
 inline constexpr std::uint64_t enforceWindowNs=1'000'000'000ull; // after a (re)draw: a stale bone is put back on its base (written)
 inline InstBase* instForLocked(std::uintptr_t w,std::uintptr_t skel) noexcept {
     if(!w)return nullptr;for(auto& i:instBases)if(i.weapon==w&&i.skeleton==skel)return &i;return nullptr;}
@@ -941,6 +1296,54 @@ inline bool restoreInstLocked(const Engine& e,InstBase& ib,const Skeleton& k) no
     if(!e.store(k.locals+b*localStride,ib.base)||!recomposeP(e,k,ib.parents,b)){writeFailures.fetch_add(1,std::memory_order_relaxed);return false;}
     ib.dirty=false;baseRestores.fetch_add(1,std::memory_order_relaxed);return true;}
 // The placement the engine-drawn gun used this Update (VrWeapon latestPlacement of THIS weapon / hand): LOCAL metres -> world + the grip.
+// BREAK-ACTION (recordMutex): the hinge pin of the record's break (the bone's PARENT frame, metres) - the learned pin when the learned
+// bone is this one, else the bone origin + the .breakgun pin offset along the barrel / up - and the break local at the eased amount a (0..1).
+inline bool learnedFor(const SwingRecord& r) noexcept {
+    if(!shotgunModel(r.model))return false;const BreakLearn& L=breakLearn[std::size_t(r.model)];return L.valid&&L.bone==r.bone&&L.skeletonCount==r.count;}
+inline V3 breakGunPin(const SwingRecord& r,const Mat& base,V3 axisP,V3 upP) noexcept {
+    if(learnedFor(r))return breakLearn[std::size_t(r.model)].pivotP;
+    const BreakGunCfg& c=breakGunCfgOf(r.model);const V3 ax=normalized(axisP),u=normalized(perp(upP,ax));
+    return add(add(col(base,3),mul(ax,c.pinAlongMm*.001f)),mul(u,c.pinUpMm*.001f));}
+inline float breakGunDeg(const SwingRecord& r) noexcept {
+    const BreakGunCfg& c=breakGunCfgOf(r.model);if(c.openDeg>0.f)return c.openDeg;
+    return learnedFor(r)?breakLearn[std::size_t(r.model)].deg:rolesOf(r.model).breakDeg;}
+inline Mat breakGunLocal(const SwingRecord& r,const Mat& base,V3 axisP,V3 upP,float a) noexcept {
+    const float rad=breakGunDeg(r)*3.14159265f/180.f*a;
+    if(learnedFor(r))return swingAbout(base,breakLearn[std::size_t(r.model)].axisP,breakGunPin(r,base,axisP,upP),rad); // the game's own hinge
+    const V3 lat=normalized(cross(normalized(axisP),normalized(upP))); // muzzle DOWN = a negative turn about barrel x up (breakLocal)
+    return swingAbout(base,lat,breakGunPin(r,base,axisP,upP),-rad);}
+// the LEARN watch (recordMutex, every Update of the held shotgun): rest locals while idle, the most-turned bone while the ENGINE
+// reloads (weapWeapon +0x9c6), solved into the hinge when the reload ends. Hammers / trigger never count; < 15 deg or < 3 frames = rejected.
+inline void watchBreakLocked(const Engine& e,const Skeleton& k,SwingRecord& r,std::uintptr_t weapon,std::uint64_t now) noexcept {
+    BreakWatch& W=breakWatch;
+    if(W.weapon!=weapon||W.skeleton!=k.skeleton||W.count!=std::min(k.count,maxBones)){W=BreakWatch{};W.weapon=weapon;W.skeleton=k.skeleton;W.count=std::min(k.count,maxBones);}
+    // once per skeleton, the never-hinge mask (breakExcluded is O(bones^2) - not per bone per frame on the main thread)
+    if(!W.maskValid){W.excluded=0;for(unsigned i=0;i<W.count&&i<64u;++i)if(breakExcluded(r.names,r.parents,W.count,i))W.excluded|=1ull<<i;W.maskValid=true;}
+    EngineAmmo am{};if(!ammoFor(weapon,am,now))return; // ammo not read this frame = unknown (a stale box neither ends a watch nor re-takes the rest)
+    const bool reloading=am.nativeReloading!=0;
+    if(!reloading){
+        if(W.reloading){ // the engine's reload ended: the most-turned bone is the hinge
+            W.reloading=false;BreakLearn& L=breakLearn[std::size_t(r.model)];++L.reloads;L.lastFrames=W.frames;L.lastMax=W.curMax;L.lastBest=W.bestBone;L.lastBestDeg=W.bestDeg;
+            V3 ax{},pv{};float ang{},res{};
+            if(W.bestBone<=0||W.bestDeg<15.f){breakLearnRejected.fetch_add(1,std::memory_order_relaxed);breakLearnWhy.store("SMALL_TURN",std::memory_order_relaxed);}
+            else if(W.frames<3){breakLearnRejected.fetch_add(1,std::memory_order_relaxed);breakLearnWhy.store("FEW_FRAMES",std::memory_order_relaxed);}
+            else if(!hingeFromMotion(W.rest[unsigned(W.bestBone)],W.bestLocal,ax,pv,ang,res)){breakLearnRejected.fetch_add(1,std::memory_order_relaxed);breakLearnWhy.store("NO_SOLVE",std::memory_order_relaxed);}
+            else{
+                L.valid=true;L.bone=W.bestBone;L.skeletonCount=W.count;L.deg=ang*57.29578f;L.axisP=ax;L.pivotP=pv;L.residualMm=res*1000.f;L.name=r.names[unsigned(W.bestBone)];
+                Mat root{},par{},rootInv{};const int p=r.parents[unsigned(W.bestBone)];
+                if(e.matrix(k.root,root)&&affineInverse(root,rootInv)&&(p<0?e.matrix(k.root,par):e.matrix(k.globals+unsigned(p)*globalStride,par))){
+                    const Mat pm=multiply(rootInv,par);const V3 pc=point(pm,pv);L.pivotCm={pc[0]*100.f,pc[1]*100.f,pc[2]*100.f};L.axisM=normalized(direction(pm,ax));}
+                breakLearned.fetch_add(1,std::memory_order_relaxed);breakLearnWhy.store("LEARNED",std::memory_order_relaxed);}
+        }
+        // the rest locals: every 8th idle frame (one guarded read per bone; the closed pose is static), at once while there is none
+        if(!r.written&&(!W.restValid||(++W.idle&7u)==0u)){for(unsigned i=0;i<W.count;++i){if(!e.matrix(k.locals+i*localStride,W.rest[i])){W.restValid=false;return;}}W.restValid=true;}
+        return;}
+    if(!W.restValid)return;
+    if(!W.reloading){W.reloading=true;W.frames=0;W.bestBone=-1;W.bestDeg=0.f;W.curMax={};breakWatchReloads.fetch_add(1,std::memory_order_relaxed);}
+    ++W.frames;
+    for(unsigned i=1;i<W.count;++i){if(W.excluded>>i&1ull)continue;Mat l{};if(!e.matrix(k.locals+i*localStride,l))continue;
+        const float d=turnDeg(W.rest[i],l);if(d>W.curMax[i])W.curMax[i]=d;if(d>W.bestDeg){W.bestDeg=d;W.bestBone=int(i);W.bestLocal=l;}}
+}
 struct GripMap {bool valid{};Mat map{};::rdrvr::Pose grip{};int hand{-1};std::uint64_t referenceSpace{},ns{};};
 inline int chamberCountFor(std::uintptr_t w) noexcept {std::lock_guard lock(modelMutex);const Record* r=recordForLocked(w);return r?r->n:0;}
 // Called inside the VR-held weapon's Update (after the native pose of this frame): apply the eased swing, or restore the base; publish the
@@ -970,15 +1373,29 @@ inline bool apply(const Engine& e,std::uintptr_t weapon,std::uintptr_t skeletonP
         record.lastNs=now;
         Skeleton k{};if(!skeletonPtr||!e.skeleton(skeletonPtr,k)){if(held)cylinderWeapon.store(weapon);return declineWith("NO_SKELETON");}
         if(!record.count){
+            // the per-model bone roles need the model - the first held
+            // frames often run before the weapon observer published it, and the name rule (wrong for the LeMat) must not be kept for good
+            if(modelOf(weapon)<=ModelUnknown&&++record.modelWait<180u)return declineWith("MODEL_PENDING");
+            // a break gun has its hinge from the first sight, and that sight's local becomes the closed pose - never a frame of the
+            // game's reload clip (taken in hand empty, the game reloading already: the record waits for the clip to end)
+            if(EngineAmmo am{};breakGunOf(weapon)&&ammoFor(weapon,am,now)&&am.nativeReloading)return declineWith("NATIVE_RELOAD_FIRST");
             for(unsigned i=0;i<k.count;++i){e.name(k,i,record.names[i]);if(!e.parent(k,i,record.parents[i]))return declineWith("PARENTS_UNREADABLE");
                 if(i&&(record.parents[i]<0||unsigned(record.parents[i])>=i))return declineWith("PARENTS_ORDER");}
-            record.count=k.count;record.bone=chooseBone(record.names,k.count,config);
+            record.count=k.count;chooseRoleBones(record,modelOf(weapon),config);
+            dumpSkeletonLocked(e,k,record.model,record.names,record.parents,modelMuzzle);
+            if(record.shotgun)breechRefsLocked(record);
         }else if(record.count!=k.count)return declineWith("BONE_COUNT_CHANGED");
+        if(record.shotgun&&config.shotgunLearn){watchBreakLocked(e,k,record,weapon,now);
+            // the break learned after the bone choice (name rule / none) - the learned hinge, while nothing of ours is on the bones
+            const BreakLearn& L=breakLearn[std::size_t(record.model)];
+            if(record.boneFrom!=1&&!record.written&&L.valid&&L.bone!=record.bone&&L.skeletonCount==record.count){
+                chooseRoleBones(record,record.model,config);breakRechosen.fetch_add(1,std::memory_order_relaxed);}}
         if(held){cylinderWeapon.store(weapon);cylinder.store(int(record.bone>=0?Cylinder::Found:Cylinder::Missing));}
         if(record.bone<0)return declineWith("NO_CYLINDER_BONE");
         const unsigned b=unsigned(record.bone);
         Mat current{};if(!e.matrix(k.locals+b*localStride,current))return declineWith("LOCAL_UNREADABLE");
-        const float a=held?visualAmount(now):0.f;
+        // SHELLS FIT page drawn: the shotgun stays broken open so the shells can be seen moving (the phase stays closed: nothing else changes)
+        const float a=!held?0.f:record.shotgun&&::rdrvr::vr::calib::fitPreview(now)?1.f:visualAmount(now);
         // the clean closed base of this instance (never re-captured from the mod's own write).
         bool fixStale=false;
         {
@@ -986,7 +1403,12 @@ inline bool apply(const Engine& e,std::uintptr_t weapon,std::uintptr_t skeletonP
             if(ib&&(ib->count!=k.count||ib->bone!=int(b))){*ib=InstBase{};ib=nullptr;}
             const TypeBase* tb=typeForLocked(k.data,k.count,int(b));
             const bool window=held&&now<record.enforceNs;
-            const auto offType=[&](const Mat& m){return tb&&originDelta(m,tb->base)>staleTolM;};
+            // a crane swing turns the bone about its OWN origin (the hinge pin): the probe (the cylinder axis point) is the tell;
+            // a TOP-BREAK turns the hinge about its own origin: the turn is the tell; otherwise the origin moves (the Cattleman)
+            const auto offType=[&](const Mat& m){
+                if(!tb)return false;
+                if(tb->probeValid){const V3 d=sub(point(m,tb->probe),point(tb->base,tb->probe));const float l=length(d);return !std::isfinite(l)||l>staleTolM;}
+                return originDelta(m,tb->base)>staleTolM||(record.hinge&&rotationDelta(m,tb->base)>staleTolRad);};
             if(!ib){ // first sight of this instance (or its entry was evicted): its local is the clean base unless it carries a swing
                 InstBase& n=instNewLocked();n=InstBase{};n.weapon=weapon;n.skeleton=skeletonPtr;n.count=k.count;n.bone=int(b);n.parents=record.parents;
                 n.base=current;
@@ -1017,14 +1439,35 @@ inline bool apply(const Engine& e,std::uintptr_t weapon,std::uintptr_t skeletonP
             return normalized(V3{x[0]*v[0]+y[0]*v[1]+z[0]*v[2],x[1]*v[0]+y[1]*v[1]+z[1]*v[2],x[2]*v[0]+y[2]*v[1]+z[2]*v[2]});};
         const V3 axis=toLocal(parent,toWorld(mb)),up=toLocal(parent,toWorld(mu));
         if(!std::isfinite(axis[0]+axis[1]+axis[2]+up[0]+up[1]+up[2])||std::fabs(dot(axis,axis)-1.f)>.01f)return declineWith("AXES");
-        const int hold=H::holdHand.load(std::memory_order_relaxed);const float sign=swingSignFor(grip&&grip->valid?grip->hand:hold);
+        const int hold=H::holdHand.load(std::memory_order_relaxed);float sign=swingSignFor(grip&&grip->valid?grip->hand:hold);
+        // CRANE (the DOUBLE-ACTION): the bone origin is the crane hinge; the cylinder axis = the bore line - the chamber radius
+        CraneGeo crane{};
+        if(const int mo=modelOf(weapon);!record.hinge&&mo>ModelUnknown&&mo<ModelCount&&cranes[std::size_t(mo)].on){ // never on a TOP-BREAK record
+            const auto& cc=cranes[std::size_t(mo)];Mat pinv{};
+            if(affineInverse(parent,pinv)){
+                const V3 mp=point(pinv,col(multiply(root,modelMuzzle),3));const auto& ms=specOf(weapon);const ModelFit fit=fitOf(mo);
+                const float rMm=std::clamp((ms.geom&&ms.chamberMm>0.f?ms.chamberMm:cc.radiusMm)+(fit.any?fit.radiusMm:0.f),8.f,30.f);
+                crane=craneGeometry(record.base,mp,axis,up,rMm*.001f,cc.swingDeg>0.f?cc.swingDeg:config.swingDeg,sign);
+                if(crane.on)sign=crane.sign;}}
+        { // the stale-swing guard's probe of this type (the cylinder axis in the bone's own frame; next Update's offType)
+            if(TypeBase* t=typeForLocked(k.data,k.count,int(b))){
+                Mat ti{};if(crane.on&&affineInverse(t->base,ti)){const V3 q=point(ti,crane.cylAxis);
+                    if(std::isfinite(q[0]+q[1]+q[2])){t->probe=q;t->probeValid=true;}}
+                else if(!crane.on)t->probeValid=false;}}
+        const float swingDeg=crane.on?crane.deg:config.swingDeg;
+        const auto rollOf=[&](const Mat& m_,float r_){ // the cylinder turned about its own axis
+            return std::fabs(r_)>1e-5f?(crane.on?swingAbout(m_,axis,crane.cylAxis,r_):swingLocal(m_,axis,up,r_,0.f,0.f)):m_;};
+        const auto swingOf=[&](const Mat& m_,float rad){ // the swing out (Cattleman: about origin - up*pivotDown; crane: about the hinge pin)
+            return crane.on?swingAbout(m_,axis,crane.hinge,rad):swingLocal(m_,axis,up,rad,config.pivotDown,config.pivotSide);};
         Mat written=record.base;
         // ROLL: the cylinder turned about its own axis (the bone origin = the cylinder centre, frame.radiusMm auto) while it is out
         // CHAMBERS REALISTIC also turns the CLOSED cylinder (the spin, the cock / trigger advance)
         float roll=0.f;{const auto rn=rollNs.load(std::memory_order_relaxed);if(held&&(a>0.f||realisticChambers())&&rn&&now>=rn&&now-rn<=200'000'000ull)roll=rollWord.load(std::memory_order_relaxed);}
         if(!std::isfinite(roll))roll=0.f;
-        const Mat rolled=std::fabs(roll)>1e-5f?swingLocal(record.base,axis,up,roll,0.f,0.f):record.base;
-        if(a<=0.f&&std::fabs(roll)>1e-5f){ // Closed + rolled (no swing)
+        // TOP-BREAK (record.hinge): the hinge bone is never rolled (the virtual cylinder of the frame rolls) and tips muzzle down
+        const BoneRoles& ro=rolesOf(record.model);const float breakRad=std::clamp(ro.breakDeg,5.f,120.f)*3.14159265f/180.f;
+        const Mat rolled=record.hinge?record.base:rollOf(record.base,roll);
+        if(a<=0.f&&std::fabs(roll)>1e-5f&&!record.hinge){ // Closed + rolled (no swing)
             written=rolled;
             if(!finiteMat(written))return declineWith("NOT_FINITE");
             if(!e.store(k.locals+b*localStride,written)||!recompose(e,k,record,b)){writeFailures.fetch_add(1,std::memory_order_relaxed);return declineWith("WRITE_FAILED");}
@@ -1039,8 +1482,9 @@ inline bool apply(const Engine& e,std::uintptr_t weapon,std::uintptr_t skeletonP
                 lastAngleDeg.store(0.f,std::memory_order_relaxed);
                 if(InstBase* ib=instForLocked(weapon,skeletonPtr))ib->dirty=false;}
         }else{
-            const float deg=sign*config.swingDeg*a;
-            written=swingLocal(rolled,axis,up,deg*3.14159265f/180.f,config.pivotDown,config.pivotSide);
+            const float deg=record.shotgun?-breakGunDeg(record)*a:record.hinge?-ro.breakDeg*a:sign*swingDeg*a;
+            written=record.shotgun?breakGunLocal(record,record.base,axis,up,a): // BREAK-ACTION: the barrels tip down about the pin
+                record.hinge?breakLocal(record.base,axis,up,breakRad*a):swingOf(rolled,deg*3.14159265f/180.f);
             if(!finiteMat(written))return declineWith("NOT_FINITE");
             if(!e.store(k.locals+b*localStride,written)||!recompose(e,k,record,b)){writeFailures.fetch_add(1,std::memory_order_relaxed);return declineWith("WRITE_FAILED");}
             // What the engine reads back (w lanes as stored): compare against this next time.
@@ -1052,26 +1496,100 @@ inline bool apply(const Engine& e,std::uintptr_t weapon,std::uintptr_t skeletonP
         if(held&&grip&&grip->valid){ // the ChamberFrame of this Update (rigid with the drawn gun)
             const int n=chamberCountFor(weapon);
             FrameIn in{};in.closed=multiply(parent,record.base);in.current=multiply(parent,written);
-            in.full=multiply(parent,swingLocal(record.base,axis,up,sign*config.swingDeg*3.14159265f/180.f,config.pivotDown,config.pivotSide));
-            in.pivot=point(parent,swingPivot(record.base,axis,up,config.pivotDown,config.pivotSide));
+            in.full=multiply(parent,swingOf(record.base,sign*swingDeg*3.14159265f/180.f));
+            in.pivot=point(parent,crane.on?crane.hinge:swingPivot(record.base,axis,up,config.pivotDown,config.pivotSide));
             const Mat mw=multiply(root,modelMuzzle);in.muzzle=col(mw,3);in.barrel=normalized(mul(col(mw,2),-1.f));in.up=normalized(col(mw,1));
-            in.gripToWorld=multiply(grip->map,poseMat(grip->grip));in.n=n?n:6;in.swingSign=sign;in.amount=a;
+            in.gripToWorld=multiply(grip->map,poseMat(grip->grip));in.n=n?n:record.shotgun?2:6;in.swingSign=sign;in.amount=a;
             if(const auto& ms=specOf(weapon);ms.geom){in.modelGeom=true;in.chamberMm=ms.chamberMm;in.rearMm=ms.rearMm;}
+            if(const ModelFit fit=fitOf(modelOf(weapon));fit.any){ // REVOLVER FIT (live, menu)
+                if(!in.modelGeom){in.modelGeom=true;in.chamberMm=config.chamberMm;in.rearMm=config.rearMm;}
+                in.rearMm+=fit.rearMm;in.radiusAdjMm=fit.radiusMm;}
+            if(crane.on){ // the ring on the real cylinder axis: its radius = the bore offset of that axis (the FIT radius is already in it)
+                if(!specOf(weapon).geom){const int mo=modelOf(weapon); // the crane model's own rear plane (+ the REVOLVER FIT rounds offset)
+                    in.modelGeom=true;in.rearMm=cranes[std::size_t(mo>ModelUnknown&&mo<ModelCount?mo:0)].rearMm+fitOf(mo).rearMm;}
+                // the radius given exactly (the measured bore offset of this centre IS it; auto could fall to the 13.7 mm fallback
+                // at the 8 / 30 mm clamp edges by float rounding)
+                in.chamberMm=crane.radiusM*1000.f;in.radiusAdjMm=0.f;in.haveCentre=true;in.centre=point(parent,crane.cylAxis);}
+            { // report: the crane decision of this model (model space cm)
+                Mat rtInv{};const int mo=modelOf(weapon);
+                if(mo>ModelUnknown&&affineInverse(root,rtInv)){
+                    const auto cm=[&](V3 pp){const V3 w=point(rtInv,point(parent,pp));return V3{w[0]*100.f,w[1]*100.f,w[2]*100.f};};
+                    if(craneRep.model!=mo)craneRep=CraneRep{};craneRep.model=mo;craneRep.on=crane.on;++craneRep.poses;
+                    if(crane.on){
+                        craneRep.signFromHinge=crane.signFromHinge;craneRep.sign=crane.sign;craneRep.deg=crane.deg;craneRep.radiusMm=crane.radiusM*1000.f;
+                        craneRep.hingeCm=cm(crane.hinge);craneRep.axisCm=cm(crane.cylAxis);craneRep.armCm=length(sub(crane.cylAxis,crane.hinge))*100.f;
+                        craneRep.boreLatCm=dot(crane.boreOff,crane.side)*100.f;craneRep.boreUpCm=dot(crane.boreOff,crane.up)*100.f;
+                        const V3 d=sub(add(crane.hinge,axisRotate(sub(crane.cylAxis,crane.hinge),normalized(axis),crane.sign*crane.deg*3.14159265f/180.f)),crane.cylAxis);
+                        craneRep.openLatCm=dot(d,crane.side)*100.f;craneRep.openUpCm=dot(d,crane.up)*100.f;}}}
+            // TOP-BREAK: the chamber ring = a VIRTUAL cylinder rigid with the hinge bone - axis axisDownMm under the bore, rear face
+            // rearAheadMm ahead of the hammer bone origin (the FIT rounds offset still moves the rounds only); it rolls, the hinge never does
+            Mat relV{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};V3 axH{},upH{};bool hingeFrame=false;
+            if(record.shotgun){ // BREAK-ACTION: the VIRTUAL breech rigid with the hinge bone - the barrel pair's axis on the bore line
+                // (down / side levers), its breech face `breech` mm along the bore from the pin, the frame centre half the occluder ahead of
+                // it (the rounds' rear plane = the breech face), two chambers side by side; never rolled
+                // the breech face from the skeleton (pickBreech) + the in-headset SHELLS FIT (right / up / forward / spacing, mm)
+                const BreakGunCfg& bc=breakGunCfgOf(record.model);const ModelFit bf=fitOf(record.model);Mat hcInv{};const float su=length(col(root,0));const Mat hingeClosed=multiply(parent,record.base);
+                if(su>1e-6f&&std::isfinite(su)&&affineInverse(hingeClosed,hcInv)){
+                    const V3 pinW=point(parent,breakGunPin(record,record.base,axis,up));
+                    const V3 upPerp=normalized(perp(in.up,in.barrel)),sideW=normalized(cross(in.barrel,upPerp));
+                    const float pinAlong=dot(sub(pinW,in.muzzle),in.barrel)/su;
+                    const BreechPick bp=pickBreech(bc,pinAlong,learnedFor(record)||record.pinAtHinge,record.refHammerOk,record.refHammerM,record.refTriggerOk,record.refTriggerM);
+                    const float breech=bp.along+bf.spurMm[2]*.001f,spreadMm=std::clamp(bc.halfMm+.5f*bf.rearMm,4.f,30.f); // along the bore from the muzzle (m, < 0)
+                    const float half=std::clamp(bc.barrelMm*.0005f,.02f,std::max(.02f,.5f*std::fabs(breech)));
+                    const V3 cW=add(add(add(in.muzzle,mul(in.barrel,(breech+half)*su)),mul(upPerp,(bf.spurMm[1]-bc.downMm)*.001f*su)),mul(sideW,(bc.sideMm+bf.spurMm[0])*.001f*su));
+                    const V3 t=point(hcInv,cW);relV[12]=t[0];relV[13]=t[1];relV[14]=t[2];
+                    in.closed=multiply(hingeClosed,relV);in.current=multiply(multiply(parent,written),relV);
+                    in.full=multiply(multiply(parent,breakGunLocal(record,record.base,axis,up,1.f)),relV);in.pivot=pinW;in.hinge=true;in.lateral=true;
+                    in.modelGeom=true;in.chamberMm=spreadMm;in.rearMm=-half*1000.f;in.radiusAdjMm=0.f;in.haveCentre=false;
+                    hingeFrame=true;
+                    Mat rootInv{};if(affineInverse(root,rootInv)){const V3 vc=point(rootInv,add(cW,mul(in.barrel,-half*su))),hc=point(rootInv,pinW);
+                        record.virtualCm={vc[0]*100.f,vc[1]*100.f,vc[2]*100.f};record.hingeCm={hc[0]*100.f,hc[1]*100.f,hc[2]*100.f};record.haveVirtual=true;
+                        const V3 rimC=add(cW,mul(in.barrel,-half*su)),off=mul(sideW,spreadMm*.001f*su),s0=point(rootInv,add(rimC,off)),s1=point(rootInv,sub(rimC,off)),mz=point(rootInv,in.muzzle);
+                        record.shellCm[0]={s0[0]*100.f,s0[1]*100.f,s0[2]*100.f};record.shellCm[1]={s1[0]*100.f,s1[1]*100.f,s1[2]*100.f};record.muzzleCm={mz[0]*100.f,mz[1]*100.f,mz[2]*100.f};}
+                    record.breechRule=bp.rule;record.breechClamped=bp.clamped;record.pinAlongM=pinAlong;record.breechAlongM=bp.along;record.spreadMm=spreadMm;
+                }else{hingeFrameFailures.fetch_add(1,std::memory_order_relaxed);frameFailures.fetch_add(1,std::memory_order_relaxed);return true;}
+            }else if(record.hinge){
+                Mat hg{},hcInv{};const int hb2=record.hammerBone;const float su=length(col(root,0));const Mat hingeClosed=multiply(parent,record.base);
+                if(hb2>=0&&unsigned(hb2)<k.count&&e.matrix(k.globals+unsigned(hb2)*globalStride,hg)&&su>1e-6f&&std::isfinite(su)&&affineInverse(hingeClosed,hcInv)){
+                    // a hammer bone UNDER the hinge has just been tipped with it by the write
+                    // above - take its CLOSED origin (else the virtual cylinder would ride the tipped hammer). Schofield: not a descendant.
+                    {bool under=false;int p=hb2;for(unsigned st=0;st<maxBones&&p>0&&unsigned(p)<k.count;++st){p=record.parents[unsigned(p)];if(p==int(b)){under=true;break;}}
+                        Mat curInv{};if(under&&affineInverse(multiply(parent,written),curInv))hg=multiply(hingeClosed,multiply(curInv,hg));}
+                    const V3 upPerp=normalized(perp(in.up,in.barrel));
+                    const float alongH=dot(sub(col(hg,3),in.muzzle),in.barrel)/su,rearBase=(specOf(weapon).geom?specOf(weapon).rearMm:config.rearMm)*.001f;
+                    const float cAlong=alongH+ro.rearAheadMm*.001f-rearBase; // the rear face at alongH + rearAhead, the centre |rear| ahead of it
+                    const V3 cW=add(add(in.muzzle,mul(in.barrel,cAlong*su)),mul(upPerp,-ro.axisDownMm*.001f*su));
+                    const V3 t=point(hcInv,cW);relV[12]=t[0];relV[13]=t[1];relV[14]=t[2];
+                    axH=normalized(direction(hcInv,in.barrel));upH=normalized(direction(hcInv,upPerp));
+                    const auto rolledRel=[&](float r){return std::fabs(r)>1e-5f?swingLocal(relV,axH,upH,r,0.f,0.f):relV;};
+                    in.closed=multiply(hingeClosed,relV);in.current=multiply(multiply(parent,written),rolledRel(roll));
+                    in.full=multiply(multiply(parent,breakLocal(record.base,axis,up,breakRad)),relV);in.pivot=col(hingeClosed,3);in.hinge=true;
+                    hingeFrame=true;
+                    Mat rootInv{};if(affineInverse(root,rootInv)){const V3 vc=point(rootInv,cW),hc=point(rootInv,col(hingeClosed,3));
+                        record.virtualCm={vc[0]*100.f,vc[1]*100.f,vc[2]*100.f};record.hingeCm={hc[0]*100.f,hc[1]*100.f,hc[2]*100.f};record.haveVirtual=true;}
+                }else{hingeFrameFailures.fetch_add(1,std::memory_order_relaxed);frameFailures.fetch_add(1,std::memory_order_relaxed);return true;}
+            }
             { // The roll sense - swingLocal turns about the barrel in the PARENT frame; a mirrored parent (det < 0) turns the world the
               // other way, a mirrored grip map turns the holding grip frame the other way (left / right hand placements)
                 const auto det3=[](const Mat& m_){return dot(col(m_,0),cross(col(m_,1),col(m_,2)));};
-                in.worldSense=det3(parent)<0.f?-1:1;in.gripSense=det3(in.gripToWorld)<0.f?-in.worldSense:in.worldSense;in.rollUsed=roll;
+                in.worldSense=det3(hingeFrame?multiply(parent,record.base):parent)<0.f?-1:1;in.gripSense=det3(in.gripToWorld)<0.f?-in.worldSense:in.worldSense;in.rollUsed=roll;
                 rollWorldSense.store(in.worldSense,std::memory_order_relaxed);rollGripSense.store(in.gripSense,std::memory_order_relaxed);}
-            { // The measured effect of +1 rad of roll in the holding grip frame - the very composition written above (roll, then the
+            if(!record.shotgun){ // The measured effect of +1 rad of roll in the holding grip frame - the very composition written above (roll, then the
               // swing), finite difference d = .05 rad -> M = G(roll+d) * G(roll)^-1 (rigid), omega from its skew part, t its translation
-                Mat ginv{},g0inv{};const float d=.05f,swing=a>0.f?sign*config.swingDeg*a*3.14159265f/180.f:0.f;
-                const auto at=[&](float r){const Mat rl=std::fabs(r)>1e-5f?swingLocal(record.base,axis,up,r,0.f,0.f):record.base;
-                    return multiply(ginv,multiply(parent,a>0.f?swingLocal(rl,axis,up,swing,config.pivotDown,config.pivotSide):rl));};
+                Mat ginv{},g0inv{};const float d=.05f,swing=a>0.f?sign*swingDeg*a*3.14159265f/180.f:0.f;
+                const auto at=[&](float r){
+                    if(hingeFrame){const Mat rv=std::fabs(r)>1e-5f?swingLocal(relV,axH,upH,r,0.f,0.f):relV; // the virtual cylinder rolls
+                        return multiply(ginv,multiply(multiply(parent,a>0.f?breakLocal(record.base,axis,up,breakRad*a):record.base),rv));}
+                    const Mat rl=rollOf(record.base,r);
+                    return multiply(ginv,multiply(parent,a>0.f?swingOf(rl,swing):rl));};
                 if(affineInverse(in.gripToWorld,ginv)&&affineInverse(at(roll),g0inv)){const Mat M=multiply(at(roll+d),g0inv);
                     const V3 om{(M[6]-M[9])*.5f/d,(M[8]-M[2])*.5f/d,(M[1]-M[4])*.5f/d},tt{M[12]/d,M[13]/d,M[14]/d};
                     if(C::finite(om)&&C::finite(tt)){in.rollOmega=om;in.rollT=tt;}}}
             ChamberFrame f{};
-            if(buildFrame(in,f)){f.weapon=weapon;f.ns=now;f.referenceSpace=grip->referenceSpace;f.hand=grip->hand;chamberBox.store(f);
+            if(buildFrame(in,f)){f.weapon=weapon;f.ns=now;f.referenceSpace=grip->referenceSpace;f.hand=grip->hand;
+                if(record.shotgun){const BreakGunCfg& bc=breakGunCfgOf(record.model); // fixed barrels + the 12-gauge shell
+                    f.breakGun=1;f.caseR=bc.shellRMm*.001f;f.caseLen=bc.shellMm*.001f;f.tipM=bc.tipMm*.001f;}
+                chamberBox.store(f);
                 lastFrameNs.store(now,std::memory_order_relaxed);bump(ctr.framePublished);
                 ctr.radiusMm.store(f.radius*1000.f,std::memory_order_relaxed);ctr.radiusAuto.store(f.radiusAuto!=0,std::memory_order_relaxed);
                 ctr.rearMmUsed.store(f.rear*1000.f,std::memory_order_relaxed);}
@@ -1088,7 +1606,7 @@ inline bool modified(std::uintptr_t weapon) noexcept {std::lock_guard lock(recor
 // revolver and the context allows it. Any thread (atomics only).
 inline bool manualActive(std::uint64_t now) noexcept {
     if(!armedNow())return false;
-    const int hold=H::holdHand.load(std::memory_order_acquire);if(hold<0||hold>1||!revolverKind(H::heldKind.load(std::memory_order_relaxed)))return false;
+    const int hold=H::holdHand.load(std::memory_order_acquire);if(hold<0||hold>1||!reloadKind(H::heldKind.load(std::memory_order_relaxed)))return false;
     const auto w=ownerWeapon.load(std::memory_order_acquire),ns=ownerNs.load(std::memory_order_acquire);
     if(!w||!ns||(now>ns?now-ns:ns-now)>config.ownerFreshNs||!ownerPoseAllowed.load(std::memory_order_relaxed))return false;
     if(!modelMechanics(w))return false;
@@ -1102,7 +1620,7 @@ inline bool manualActive(std::uint64_t now) noexcept {
 // overlay only), to check the swing, its side and the markers.
 inline bool forceVisual(std::uint64_t now) noexcept {
     if(!config.forceOpen||!config.enabled||killed(Feature::Reload))return false;
-    const int hold=H::holdHand.load(std::memory_order_acquire);if(hold<0||!revolverKind(H::heldKind.load(std::memory_order_relaxed)))return false;
+    const int hold=H::holdHand.load(std::memory_order_acquire);if(hold<0||!reloadKind(H::heldKind.load(std::memory_order_relaxed)))return false;
     const auto w=ownerWeapon.load(std::memory_order_acquire);(void)now;
     return w&&modelMechanics(w)&&cylinder.load(std::memory_order_relaxed)==int(Cylinder::Found)&&cylinderWeapon.load(std::memory_order_relaxed)==w;
 }
@@ -1226,7 +1744,7 @@ inline void executorTick(const mainthread::Frame& fr) noexcept {
     std::lock_guard lock(modelMutex);
     processOpsLocked(now);
     // records: create for a VR-held revolver with a cylinder bone and a clip of 2..9
-    const bool candidate=ammoOk&&hold>=0&&revolverKind(H::heldKind.load(std::memory_order_relaxed))&&modelMechanics(w)&&effectiveMode()!=Mode::Native&&
+    const bool candidate=ammoOk&&hold>=0&&reloadKind(H::heldKind.load(std::memory_order_relaxed))&&modelMechanics(w)&&effectiveMode()!=Mode::Native&&
         cylinder.load(std::memory_order_relaxed)==int(Cylinder::Found)&&cylinderWeapon.load(std::memory_order_relaxed)==w;
     const int n=int(std::lround(a.perClip));
     Record* r=recordForLocked(w);
@@ -1236,6 +1754,7 @@ inline void executorTick(const mainthread::Frame& fr) noexcept {
         *r=Record{};r->weapon=w;r->n=n;r->createdNs=now;std::uintptr_t type{};env.get(w,elf::weaponType,type);r->type=type;learnType(type);
         const int clip=std::clamp(int(std::lround(a.clip)),0,n);for(int i=0;i<n;++i)r->st[std::size_t(i)]=i<clip?ChamberState::Live:ChamberState::Empty;
         r->autoIndexedSeq=closeSeq();firesApplied[std::size_t(slot)]=fireCounts[std::size_t(slot)].load(std::memory_order_acquire);
+        r->fixedSlots=breakGunOf(w); // BREAK-ACTION: barrels
         bump(ctr.recordsCreated);
     }
     if(r){r->seenNs=now;
@@ -1381,7 +1900,9 @@ public:
         if(pressActive_&&down&&!longDone_&&config.longNs&&now>=pressStartNs_+config.longNs){
             longDone_=true;
             if(pressFromClosed_){
-                if(actions_==pressMark_){ // nothing done during the press: the game's reload (one RequestReload within 1 s), B unmasked until release
+                // a fully loaded break gun has nothing to reload (the game's own B refuses a full clip: bhPacketExec::DoPerformWeapon asks clip < perClip): no snap shut for nothing, it stays open, the next B closes it
+                if(const auto bw=ownerWeapon.load(std::memory_order_acquire);[&]{std::lock_guard lock(modelMutex);const Record* r=recordForLocked(bw);return r&&r->fixedSlots&&r->n>0&&r->live()==r->n;}())bump(breakLongFull);
+                else if(actions_==pressMark_){ // nothing done during the press: the game's reload (one RequestReload within 1 s), B unmasked until release
                     snapClosed(now,"LONG_PRESS");allowanceUntilNs.store(now+1'000'000'000ull,std::memory_order_release);allowance.store(1,std::memory_order_release);
                     lastLongPressWord.store(now,std::memory_order_relaxed);H::bForce.store(true,std::memory_order_relaxed);bump(ctr.longNative);pulse(hold,.3f,40'000,now);
                     if(openRefused_)bump(ctr.longAfterRefusal);}
@@ -1396,6 +1917,7 @@ public:
     }
     // ---- per input frame (normal path only) ----
     void frame(const H::ReloadFacts& f) noexcept;
+    void menuFrame(const runtime::ControllerSample& in,int hold,std::uint64_t now) noexcept; // the VR menu is open (frame() does not run)
     bool owned(unsigned h,std::uint64_t now) const noexcept {
         if(int(h)!=freeHand_||!freeEligible_)return false;
         return (openish_&&gate_)||now<tailUntil_;
@@ -1425,11 +1947,11 @@ private:
     std::uint64_t lastEjectNs_{},lastSeatNs_{},lastGrabNs_{},lastDropNs_{},lastRefuseTickNs_{};
     HeldKind held_{HeldKind::None};int heldCount_{},heldHand_{-1};
     std::array<V3,2> aimFwd_{{{0,-.7071f,-.7071f},{0,-.7071f,-.7071f}}},aimUp_{{{0,.7071f,-.7071f},{0,.7071f,-.7071f}}};
-    std::array<std::array<float,3>,H::slotCount> sockets_{};std::array<V3,2> handPos_{};std::array<bool,2> handValid_{};bool inZone_{},zoneTicked_{};
+    std::array<std::array<float,3>,H::slotCount> sockets_{},fixedSockets_{};bool bodySockets_{};std::array<V3,2> handPos_{};std::array<bool,2> handValid_{};bool inZone_{},zoneTicked_{};
     std::uint64_t lastTapeNs_{},tapeSpace_{};bool prevTipValid_{},prevPinchValid_{};V3 prevTip_{},prevPinch_{};std::uint64_t prevTipTau_{},prevPinchTau_{};V3 tipLocal_{};bool tipLocalValid_{};
     V3 tipAxisLocal_{0.f,0.f,-1.f}; // the held round's axis (LOCAL, rim -> bullet = the free hand's measured aim)
     // falling rounds after an eject (LOCAL, simulated on the input thread for ~1 s; drawn as cartridges, nothing else)
-    struct Brass {bool on{},live{};V3 p{},v{},axis{},spinAxis{};float spin{},radius{.0057f};std::uint64_t t0{},last{};};
+    struct Brass {bool on{},live{},shell{};V3 p{},v{},axis{},spinAxis{};float spin{},radius{.0057f},len{.030f};std::uint64_t t0{},last{};}; // shell = a shotgun shell
     std::array<Brass,8> brass_{};unsigned brassNext_{};
     // the tape entry being processed (eject() spawns the falling rounds from it)
     const ChamberFrame* ejectCf_{};V3 ejectHoldP_{},ejectHoldV_{};Q ejectHoldQ_{0,0,0,1};bool ejectHoldValid_{};
@@ -1476,13 +1998,21 @@ private:
     void rollStep(const ChamberFrame& cf,const Record& snap,V3 pinch,V3 gripP,std::uint64_t tau,int hold,unsigned ff,float outerR,std::uint64_t now,bool closed=false) noexcept;
     int magnetChamber_{-1},occupiedChamber_{-1};std::uint64_t shakeArmTau_{};float shakePeak_{};std::uint64_t tiltSince_{};
     V3 prevHoldP_{};std::uint64_t prevHoldTau_{};bool prevHoldValid_{};float followShown_{1.f};std::uint64_t followStepNs_{};
-    bool trigDown_{};std::uint64_t overlayCount_{};bool overlayWasVisible_{};
+    bool trigDown_{};std::uint64_t overlayCount_{};bool overlayWasVisible_{},fitShellsShown_{};
     struct Pending {bool on{};int hand{-1};float amp{};std::uint32_t us{};std::uint64_t at{};};
     std::array<Pending,6> pulses_{};
     void schedule(int hand,float amp,std::uint32_t us,std::uint64_t at) noexcept {for(auto& p:pulses_)if(!p.on){p={true,hand,amp,us,at};return;}}
     void action(std::uint64_t now) noexcept {++actions_;anyActionThisOpen_=true;(void)now;}
     void autoLoad(int hold,std::uint64_t now) noexcept;
     void eject(int hold,const char* how,std::uint64_t now) noexcept;
+    // BREAK-ACTION: the ejectors throw the SPENT shells out as the gun opens (live ones stay); the barrels never turn (chamber c =
+    // slot c); the shell drawn / held (from the last fresh frame)
+    // why = OPEN (the ejectors, SHELL EJECT AUTO) / TILT / SHAKE / FLICK / WAVE (shaken out), kick = their speed out of the breech (m/s, < 0)
+    void ejectSpent(int hold,std::uint64_t now,const char* why,float kick) noexcept;
+    void breakEjectStep(int hold,const ChamberFrame& cf,V3 barrel,V3 v,std::uint64_t tau,std::uint64_t now,Record& snap,bool haveRec) noexcept;
+    bool breakEjectPending_{},shellOn_{};float shellR_{.010f},shellLen_{.065f},brassKick_{-1.4f};
+    int liveStrokes_{};bool strokeFromDown_{};std::uint64_t liveStrokeTau_{},breakQuietNs_{},breakQuietCapNs_{}; // the strong strokes of a live shake; no FLICK / WAVE close until the shake is over
+    static int slotIx(const ChamberFrame& cf,int c,int next,int n) noexcept {return cf.breakGun?c:((c-next)%n+n)%n;}
     bool insert(int chamberMaskOrIndex,bool full,std::uint64_t now) noexcept;
     bool inAmmoZone(V3 hand,V3 gun) noexcept;
     void tapeStep(const runtime::ControllerSample& in,int hold,const ChamberFrame& cf,const State& st,std::uint64_t now) noexcept;
@@ -1493,11 +2023,18 @@ inline Brain brain{};
 inline bool Brain::inAmmoZone(V3 hand,V3 gun) noexcept {
     const float hys=inZone_?.05f:0.f;
     if(config.zoneAny)return length(sub(hand,gun))>.25f-hys*.5f;
-    const auto sock=[&](int s){const auto& p=sockets_[std::size_t(s)];return V3{p[0],p[1],p[2]};};
-    if(length(sub(hand,sock(H::SlotThrown)))<=config.zoneChest+hys)return true;
     const auto capsule=[&](V3 a,V3 b,float r){const V3 ab=sub(b,a);const float l2=dot(ab,ab);float t=l2>1e-9f?dot(sub(hand,a),ab)/l2:0.f;t=std::clamp(t,0.f,1.f);
         return length(sub(hand,add(a,mul(ab,t))))<=r;};
-    return capsule(sock(H::SlotMelee),sock(H::SlotLasso),config.zoneBelt+hys)||capsule(sock(H::SlotMelee),sock(H::SlotSidearm),config.zoneBelt+hys);
+    const auto zones=[&](const std::array<std::array<float,3>,H::slotCount>& so){
+        const auto sock=[&](int s){const auto& p=so[std::size_t(s)];return V3{p[0],p[1],p[2]};};
+        if(length(sub(hand,sock(H::SlotThrown)))<=config.zoneChest+hys)return true;
+        return capsule(sock(H::SlotMelee),sock(H::SlotLasso),config.zoneBelt+hys)||capsule(sock(H::SlotMelee),sock(H::SlotSidearm),config.zoneBelt+hys);};
+    if(zones(sockets_))return true;
+    // the BODY sockets sit on
+    // the crouched skeleton (thighs bent, torso folded) while the player stands; crouched, the player's real chest / belt
+    // (the head-relative sockets) count as well.
+    if(bodySockets_&&status::crouchDropMm.load(std::memory_order_relaxed)>=100&&zones(fixedSockets_)){bump(ctr.crouchZoneHits);return true;}
+    return false;
 }
 inline void Brain::autoLoad(int hold,std::uint64_t now) noexcept {
     const auto w=ownerWeapon.load(std::memory_order_acquire);EngineAmmo a{};const bool ammo=ammoFor(w,a,now);
@@ -1532,17 +2069,62 @@ inline void Brain::spawnBrass(const Record& r,std::uint64_t now) noexcept {
     if(!config.brass||!ejectCf_||!ejectHoldValid_||!r.n)return;
     const ChamberFrame& cf=*ejectCf_;
     const V3 axisW=normalized(C::rot(ejectHoldQ_,cf.axis));
-    const float spacing=2.f*cf.radius*std::sin(3.14159265f/float(std::max(r.n,2)));const float caseR=std::clamp(.42f*spacing,.0052f,.0062f);
+    const float spacing=2.f*cf.radius*std::sin(3.14159265f/float(std::max(r.n,2)));const float caseR=cf.breakGun?cf.caseR:std::clamp(.42f*spacing,.0052f,.0062f);
     for(int c=0;c<r.n&&c<maxChambers;++c){const auto st=r.st[std::size_t(c)];if(st!=ChamberState::Live&&st!=ChamberState::Spent)continue;
-        const V3 mouth=slotAt(cf,(c-r.next+r.n)%r.n,false);
+        const V3 mouth=slotAt(cf,slotIx(cf,c,r.next,r.n),false);
         Brass& b=brass_[brassNext_%brass_.size()];++brassNext_;
         const float k=float(c)*2.399963f; // golden-angle scatter, deterministic
         V3 side=normalized(cross(axisW,V3{0.f,1.f,0.f}));if(length(side)<.5f)side=V3{1.f,0.f,0.f};const V3 side2=cross(axisW,side);
         const V3 lateral=add(mul(side,.10f*std::cos(k)),mul(side2,.10f*std::sin(k)));
-        b.on=true;b.live=st==ChamberState::Live;b.radius=caseR;b.t0=b.last=now;
+        b.on=true;b.live=st==ChamberState::Live;b.radius=caseR;b.t0=b.last=now;b.shell=cf.breakGun!=0;b.len=cf.breakGun?cf.caseLen:.030f;
         b.p=add(ejectHoldP_,C::rot(ejectHoldQ_,sub(mouth,mul(cf.axis,.0012f))));
-        b.v=add(add(mul(ejectHoldV_,.6f),mul(axisW,-.45f-.05f*float(c%3))),lateral); // out of the rear of the chamber
+        b.v=add(add(mul(ejectHoldV_,.6f),mul(axisW,(cf.breakGun?brassKick_:-.45f)-.05f*float(c%3))),lateral); // out of the rear of the chamber (an ejector kicks)
         b.axis=axisW;b.spinAxis=normalized(add(mul(side,std::cos(k*1.7f)),mul(side2,std::sin(k*1.7f))));b.spin=7.f+2.f*float(c%4);}
+}
+// BREAK-ACTION: the spent shells leave the breech (the clip already holds none of them: no engine op); the live
+// ones stay. Not an `action` (a long B from closed still gives the game's reload). At the opening (AUTO) or shaken / tipped out (SHAKE OUT).
+inline void Brain::ejectSpent(int hold,std::uint64_t now,const char* why,float kick) noexcept {
+    const auto w=ownerWeapon.load(std::memory_order_acquire);int spent=0;const bool atOpen=!std::strcmp(why,"OPEN"),tilt=!std::strcmp(why,"TILT");
+    {std::lock_guard lock(modelMutex);Record* r=recordForLocked(w);if(!r)return;Record falling=*r;
+        for(int i=0;i<r->n;++i){auto& c=r->st[std::size_t(i)];if(c==ChamberState::Spent){c=ChamberState::Empty;++spent;}else falling.st[std::size_t(i)]=ChamberState::Empty;}
+        if(!spent){if(atOpen)bump(breakEjectNothing);return;}
+        brassKick_=kick;spawnBrass(falling,now);}
+    if(atOpen)bump(breakEjectsOpen);else if(tilt){bump(breakTiltEjects);bump(ctr.ejectTilt);}else{bump(breakShakeEjects);bump(ctr.ejectShake);
+        breakQuietNs_=now+700'000'000ull;breakQuietCapNs_=now+2'000'000'000ull;}
+    breakLastEjectWhy.store(why,std::memory_order_relaxed);
+    bump(ctr.ejectedSpent,std::uint64_t(spent));ejectedThisOpen_=true;anyActionThisOpen_=true;lastEjectNs_=now;pulse(hold,.3f,20'000,now);
+}
+// BREAK-ACTION, gun open (both SHELL EJECT values: AUTO has just no spent shell left to drop). Opening
+// tips the barrels DOWN, so the breech faces up / back and nothing falls by itself; `barrel` = the TIPPED barrels (LOCAL, forward = muzzle), up = its elevation.
+//   TILT: the breech down (.breakTiltDeg) for .tiltMs: the SPENT shells slide out, slowly. Never a live one, whatever the time: a late flip-up to close passes here.
+//   SHAKE: a sharp stroke toward the breech (.shake, as the revolver's), then a stop (<= 200 ms): the gun stops, the shell keeps going. Works on a level gun
+//     (the tipped barrels point down: an upward or backward stroke); with the breech down the plain downward stroke counts as well.
+//   LIVE shells: two strong strokes (.breakShakeLive, <= 700 ms apart), both with the breech down, not within 500 ms of a seat. One flip-up is one stroke, so it never
+//     drops the shells it has just been given. Then every round falls, live back to the pool (Brain::eject, as the revolver's).
+inline void Brain::breakEjectStep(int hold,const ChamberFrame& cf,V3 barrel,V3 v,std::uint64_t tau,std::uint64_t now,Record& snap,bool haveRec) noexcept {
+    const auto refresh=[&]{std::lock_guard lock(modelMutex);if(const Record* r=recordForLocked(cf.weapon))snap=*r;};
+    const float up=barrel[1],speed=length(v);const bool breechDown=up>=std::sin(config.breakTiltDeg*3.14159265f/180.f);
+    const float rear=-dot(v,barrel),stroke=breechDown?std::max(rear,-v[1]):rear,thr=config.shake;
+    if(speed>20.f){shakeArmTau_=0;}
+    else if(stroke>=thr){if(!shakeArmTau_){shakeArmTau_=tau;shakePeak_=0;strokeFromDown_=breechDown;}shakePeak_=std::max(shakePeak_,stroke);}
+    else if(shakeArmTau_){
+        if(tau>shakeArmTau_+200'000'000ull)shakeArmTau_=0;
+        else if(stroke<=.3f){shakeArmTau_=0;const float peak=shakePeak_;
+            const int live=haveRec?snap.live():0,spent=haveRec?snap.count(ChamberState::Spent):0;
+            // a live stroke starts AND ends breech down: a flip-up that starts level (pull back + up, then its bounce) is not two of them.
+            // The first one holds FLICK / WAVE off for the second: a hard shake pitches the wrist too, which would close the gun before the shells drop
+            if(strokeFromDown_&&breechDown&&peak>=config.breakShakeLive){liveStrokes_=liveStrokeTau_&&tau<=liveStrokeTau_+700'000'000ull?liveStrokes_+1:1;liveStrokeTau_=tau;
+                if(live){breakQuietNs_=std::max<std::uint64_t>(breakQuietNs_,now+700'000'000ull);breakQuietCapNs_=std::max<std::uint64_t>(breakQuietCapNs_,now+900'000'000ull);}}
+            if(live&&breechDown&&liveStrokes_>=2&&now>=lastSeatNs_+500'000'000ull){liveStrokes_=0;brassKick_=-std::clamp(.8f*peak,.3f,2.f);eject(hold,"SHAKE",now);refresh();
+                if(snap.live()<live){breakLastEjectWhy.store("SHAKE_LIVE",std::memory_order_relaxed);bump(breakShakeEjects);breakQuietNs_=now+700'000'000ull;breakQuietCapNs_=now+2'000'000'000ull;}}
+            else if(spent){ejectSpent(hold,now,"SHAKE",-std::clamp(.8f*peak,.3f,2.f));refresh();}
+            else if(!live)bump(ctr.ejectNothing);}
+    }else if(stroke>=.4f*thr){const unsigned i=ctr.shakeSubN.fetch_add(1,std::memory_order_relaxed)%8u;ctr.shakeSub[i].store(stroke,std::memory_order_relaxed);}
+    if(config.tiltNs){
+        if(breechDown){if(!tiltSince_)tiltSince_=tau;
+            else if(tau>=tiltSince_+config.tiltNs){tiltSince_=0;if(haveRec&&snap.count(ChamberState::Spent)>0){ejectSpent(hold,now,"TILT",-.3f);refresh();}}}
+        else if(tiltSince_){tiltSince_=0;bump(ctr.tiltAborted);}
+    }
 }
 // SINGLE: index = the chamber; FULL: the speedloader at the rear centre fills every EMPTY chamber (up to heldCount_).
 inline bool Brain::insert(int index,bool full,std::uint64_t now) noexcept {
@@ -1554,7 +2136,7 @@ inline bool Brain::insert(int index,bool full,std::uint64_t now) noexcept {
         if(!mask)return false;
         for(int c=0;c<r->n;++c)if(mask>>c&1u){r->st[std::size_t(c)]=ChamberState::Live;++seated;}
         if(!postOpLocked(OpInsert,w,seated,0,mask,now)){for(int c=0;c<r->n;++c)if(mask>>c&1u)r->st[std::size_t(c)]=ChamberState::Empty;return false;}}
-    bump(ctr.inserts);bump(ctr.roundsSeated,std::uint64_t(seated));seatedThisOpen_=true;lastSeatNs_=now;action(now);detector.blockPush(C::BlockSeat);
+    bump(ctr.inserts);bump(ctr.roundsSeated,std::uint64_t(seated));seatedThisOpen_=true;lastSeatNs_=now;liveStrokes_=0;action(now);detector.blockPush(C::BlockSeat);
     const int hold=1-heldHand_;
     if(full){pulse(hold,.6f,35'000,now);pulse(heldHand_,.6f,35'000,now);}else{pulse(hold,.45f,18'000,now);pulse(heldHand_,.35f,12'000,now);}
     held_=HeldKind::None;heldCount_=0;prevTipValid_=false;magnetChamber_=occupiedChamber_=-1;return true;
@@ -1674,6 +2256,7 @@ inline void Brain::tapeStep(const runtime::ControllerSample& in,int hold,const C
     {std::lock_guard lock(modelMutex);if(const Record* r=recordForLocked(cf.weapon)){snap=*r;haveRec=true;}}
     const unsigned row=closeRow();
     ejectCf_=&cf;ejectHoldValid_=false; // The falling rounds of an eject in this call
+    const bool shakeOut=cf.breakGun&&(!config.shotgunEject||settings().shellShakeOut()); // SHELL EJECT SHAKE OUT (.shotgunEject 0 forces it): no ejectors
     for(unsigned e=0;e<n;++e){
         const auto& t=got[e];lastTapeNs_=std::max(lastTapeNs_,t.ns);
         if(stale)continue;
@@ -1687,11 +2270,16 @@ inline void Brain::tapeStep(const runtime::ControllerSample& in,int hold,const C
                 v=mul(sub(t.p[hh],prevHoldP_),1.f/float(double(tau-prevHoldTau_)*1e-9));vOk=true;}
             prevHoldP_=t.p[hh];prevHoldTau_=tau;prevHoldValid_=true;
             ejectHoldP_=t.p[hh];ejectHoldQ_=t.q[hh];ejectHoldV_=vOk&&length(v)<20.f?v:V3{};ejectHoldValid_=true;
+            if(breakEjectPending_&&st.phase==Phase::Open){breakEjectPending_=false; // the breech is fully open - the ejectors
+                if(cf.breakGun&&!shakeOut){ejectSpent(hold,now,"OPEN",-1.4f);std::lock_guard lock(modelMutex);if(const Record* r=recordForLocked(cf.weapon))snap=*r;}}
         }else{prevHoldValid_=false;ejectHoldValid_=false;}
         // ---- muzzle elevation / SHAKE / TILT (holding hand) ----
         if(hv&&vOk&&st.phase==Phase::Open){
-            const V3 barrel=C::rot(t.q[hh],cf.axis);const float up=barrel[1];
+            // the barrel, not a tipped chamber axis; BREAK-ACTION: the TIPPED barrels (shells slide out only when their breech faces down)
+            const V3 barrel=C::rot(t.q[hh],cf.breakGun?cf.axis:length(cf.barrel)>.5f?cf.barrel:cf.axis);const float up=barrel[1];
             const bool muzzleUp=up>=std::sin(config.close.ejectUpDeg*3.14159265f/180.f);
+            if(cf.breakGun)breakEjectStep(hold,cf,barrel,v,tau,now,snap,haveRec);
+            else{
             const float speed=length(v);
             if(speed>20.f){shakeArmTau_=0;}
             else if(muzzleUp&&v[1]<=-config.shake){if(!shakeArmTau_){shakeArmTau_=tau;shakePeak_=0;}shakePeak_=std::max(shakePeak_,-v[1]);}
@@ -1708,6 +2296,7 @@ inline void Brain::tapeStep(const runtime::ControllerSample& in,int hold,const C
                         if(haveRec&&snap.count(ChamberState::Empty)<snap.n){eject(hold,"TILT",now);std::lock_guard lock(modelMutex);if(const Record* r=recordForLocked(cf.weapon))snap=*r;}}}
                 else if(tiltSince_){tiltSince_=0;bump(ctr.tiltAborted);}
             }
+            }
         }
         // ---- the free hand: pinch / tip in the holding grip frame ----
         if(hv&&fv){
@@ -1716,7 +2305,7 @@ inline void Brain::tapeStep(const runtime::ControllerSample& in,int hold,const C
             const V3 pinchW=add(add(add(t.p[ff],mul(fwd,config.pinch[0])),mul(up,config.pinch[1])),mul(side,config.pinch[2]));
             const V3 pinch=C::toFrame(t.p[hh],t.q[hh],pinchW);
             // ROD eject: the empty free hand's pinch at the rod tip, moving back along the barrel (relative to the gun)
-            if(config.rod&&st.phase==Phase::Open&&held_==HeldKind::None&&freeEligible_&&prevPinchValid_&&tau>prevPinchTau_&&tau-prevPinchTau_<=60'000'000ull){
+            if(config.rod&&!cf.breakGun&&st.phase==Phase::Open&&held_==HeldKind::None&&freeEligible_&&prevPinchValid_&&tau>prevPinchTau_&&tau-prevPinchTau_<=60'000'000ull){
                 const float dt=float(double(tau-prevPinchTau_)*1e-9);const V3 vel=mul(sub(pinch,prevPinch_),1.f/dt);
                 if(length(sub(pinch,cf.rodOpen))<=.030f&&dot(vel,mul(cf.axis,-1.f))>=.25f&&length(vel)<20.f){
                     if(haveRec&&snap.count(ChamberState::Empty)==snap.n)bump(ctr.ejectNothing);
@@ -1727,7 +2316,7 @@ inline void Brain::tapeStep(const runtime::ControllerSample& in,int hold,const C
             // ROLL: the empty free hand touching the open cylinder and moving round it turns it (detent clicks per chamber)
             // CHAMBERS REALISTIC: also the CLOSED / CLOSING cylinder (an open free palm swiping across its side spins it)
             const bool closedRoll=realisticChambers()&&(st.phase==Phase::Closed||st.phase==Phase::Closing)&&in.grips[ff]<=.5f;
-            if(config.roll&&held_==HeldKind::None&&freeEligible_&&haveRec&&snap.n>=2&&
+            if(config.roll&&!cf.breakGun&&held_==HeldKind::None&&freeEligible_&&haveRec&&snap.n>=2&&
                ((st.phase==Phase::Open&&(rollActive_||(detector.pushState()!=C::PushArmed&&detector.pushState()!=C::PushLatch)))||closedRoll)){ // ROLLING wins over PUSH
                 const float spacing=2.f*cf.radius*std::sin(3.14159265f/float(snap.n));const float outerR=cf.radius+std::clamp(.42f*spacing,.0052f,.0062f)+.0025f;
                 const V3 gripP=C::toFrame(t.p[hh],t.q[hh],t.p[ff]);
@@ -1736,9 +2325,10 @@ inline void Brain::tapeStep(const runtime::ControllerSample& in,int hold,const C
                 {std::lock_guard lock(modelMutex);if(const Record* r=recordForLocked(cf.weapon))snap=*r;}
             }else rollRelease(now);
             if(held_!=HeldKind::None&&int(ff)==heldHand_&&st.phase==Phase::Open&&haveRec){
-                const V3 tip=add(pinch,mul(C::rot(C::conj(t.q[hh]),fwd),held_==HeldKind::Full?.020f:.016f));
+                const float tipM=cf.breakGun?cf.tipM:held_==HeldKind::Full?.020f:.016f; // the shell's front end ahead of the fingers
+                const V3 tip=add(pinch,mul(C::rot(C::conj(t.q[hh]),fwd),tipM));
                 const V3 heldAxis=C::rot(C::conj(t.q[hh]),fwd);
-                tipLocal_=add(pinchW,mul(fwd,held_==HeldKind::Full?.020f:.016f));tipLocalValid_=true;tipAxisLocal_=fwd;
+                tipLocal_=add(pinchW,mul(fwd,tipM));tipLocalValid_=true;tipAxisLocal_=fwd;
                 if(prevTipValid_&&tau>prevTipTau_&&tau-prevTipTau_<=100'000'000ull){
                     const V3 a=prevTip_,b=tip,ab=sub(b,a);const float l2=dot(ab,ab);
                     const auto closest=[&](V3 m){float u=l2>1e-12f?dot(sub(m,a),ab)/l2:1.f;u=std::clamp(u,0.f,1.f);return add(a,mul(ab,u));};
@@ -1750,7 +2340,7 @@ inline void Brain::tapeStep(const runtime::ControllerSample& in,int hold,const C
                     }else{
                         int best=-1,nearest=-1;float bestD=1e9f,nearestD=1e9f;
                         for(int c=0;c<snap.n;++c){
-                            const V3 m=slotAt(cf,(c-snap.next+snap.n)%snap.n,true);const V3 cp=closest(m);const float d=length(sub(cp,m));
+                            const V3 m=slotAt(cf,slotIx(cf,c,snap.next,snap.n),true);const V3 cp=closest(m);const float d=length(sub(cp,m));
                             if(d<nearestD){nearestD=d;nearest=c;}
                             if(snap.st[std::size_t(c)]!=ChamberState::Empty)continue;
                             if(d<=config.insertMm*.001f&&dot(sub(cp,m),cf.axis)<=config.frontMm*.001f&&ang<=config.insertDeg&&d<bestD){bestD=d;best=c;}
@@ -1774,14 +2364,21 @@ inline void Brain::tapeStep(const runtime::ControllerSample& in,int hold,const C
         }
         // ---- the close detectors (OPEN only; the CYLINDER CLOSE row) ----
         if(st.phase==Phase::Open||st.phase==Phase::Opening){
-            C::Gate gt{};gt.open=st.phase==Phase::Open;gt.pushRow=row>=1&&config.close.push;gt.flickRow=row>=2&&config.close.flick;gt.waveRow=row>=2&&config.close.wave;
+            // SHAKE OUT, spent shells in: a flip / wave is a shake first (below), whatever the CYLINDER CLOSE row
+            const bool shakeFirst=shakeOut&&haveRec&&snap.count(ChamberState::Spent)>0;
+            C::Gate gt{};gt.open=st.phase==Phase::Open;gt.pushRow=row>=1&&config.close.push;gt.flickRow=(row>=2||shakeFirst)&&config.close.flick;gt.waveRow=(row>=2||shakeFirst)&&config.close.wave;
             gt.frame=frameFresh_;gt.rigid=spin::rigid(hold);gt.freeHeld=held_!=HeldKind::None;gt.freeFree=freeEligible_&&held_==HeldKind::None;
-            gt.openedNs=st.openedNs;gt.resumeNs=resumeNs_;gt.lastEjectNs=lastEjectNs_;gt.lastSeatNs=lastSeatNs_;gt.lastGrabNs=lastGrabNs_;gt.lastDropNs=lastDropNs_;
+            // a shake keeps going after the shells are out: no FLICK / WAVE close until the gun calms down (AFTER_EVENT = lastEject + 300 ms, 2 s at most)
+            if(cf.breakGun&&now<breakQuietNs_&&hv&&(length(ejectHoldV_)>=config.shake||((t.valid&T::tapeAngular(hh))&&length(t.w[hh])>=3.5f)))
+                breakQuietNs_=std::max<std::uint64_t>(breakQuietNs_,std::min<std::uint64_t>(now+350'000'000ull,breakQuietCapNs_));
+            gt.openedNs=st.openedNs;gt.resumeNs=resumeNs_;gt.lastEjectNs=cf.breakGun&&now<breakQuietNs_?std::max<std::uint64_t>(lastEjectNs_,breakQuietNs_-300'000'000ull):lastEjectNs_;gt.lastSeatNs=lastSeatNs_;gt.lastGrabNs=lastGrabNs_;gt.lastDropNs=lastDropNs_;
             gt.now=now;gt.freeGrip=in.grips[ff];
             gt.rollBlock=rollBlocking(now);if(gt.rollBlock)bump(rollBlockSamples);
             const auto d=detector.step(t,hh,g,aimFwd_[ff],gt);
             if(d.rollBlocked)bump(rollBlockedFires);
             if(d.refusal<C::RefuseCount&&(d.refuseTick||d.refusal!=C::RefuseDwell))bump(ctr.refused[d.refusal]);
+            if(shakeFirst&&(d.fire==CloseSource::Flick||d.fire==CloseSource::Wave)){ // the shells go, the gun stays open
+                ejectSpent(hold,now,d.fire==CloseSource::Flick?"FLICK":"WAVE",-.9f);std::lock_guard lock(modelMutex);if(const Record* r=recordForLocked(cf.weapon))snap=*r;continue;}
             if(d.fire!=CloseSource::None){
                 if(requestClose(d.fire,hold,now,d.fire==CloseSource::Push?d.followV:-1.f)){
                     pulse(hold,.55f,25'000,now);if(d.fire==CloseSource::Push)pulse(int(ff),.35f,15'000,now);bump(ctr.closeTicks);}
@@ -1805,7 +2402,8 @@ inline void Brain::tapeStep(const runtime::ControllerSample& in,int hold,const C
 inline void Brain::publishOverlay(const runtime::ControllerSample& in,int hold,const ChamberFrame* cf,const State& st,std::uint64_t now) noexcept {
     Overlay o{};o.referenceSpace=in.referenceSpace;o.ns=now;o.hand=hold;
     const bool open=st.phase!=Phase::Closed;
-    const bool visible=(open||held_!=HeldKind::None||config.debug)&&(cf||held_!=HeldKind::None);
+    const bool dbg=config.debug||::rdrvr::vr::calib::fitPreview(now); // REVOLVER FIT page: the chamber slots + the rear centre shown
+    const bool visible=(open||held_!=HeldKind::None||dbg)&&(cf||held_!=HeldKind::None);
     const auto addItem=[&](V3 p,float r,std::uint32_t style,float hl,std::uint32_t frame){
         if(o.count>=o.items.size()||!C::finite(p))return;auto& it=o.items[o.count++];it.pos[0]=p[0];it.pos[1]=p[1];it.pos[2]=p[2];it.radius=r;it.style=style;it.highlight=hl;it.frame=frame;};
     const auto addCart=[&](V3 p,float r,std::uint32_t style,float len,std::uint32_t frame,V3 axis){ // A cartridge / the cylinder occluder
@@ -1813,35 +2411,44 @@ inline void Brain::publishOverlay(const runtime::ControllerSample& in,int hold,c
         addItem(p,r,style,len,frame);o.items[o.count-1].pad=packAxis(axis);};
     if(visible){
         const float pulseV=.5f+.5f*std::sin(float(double(now%1'000'000'000ull)*1e-9)*6.2831853f*2.f);
-        if(cf){
+        // SHELLS FIT page: the two shells where they sit, whatever is loaded; no calibration dots on a shotgun
+        const bool fitShells=cf&&cf->breakGun&&::rdrvr::vr::calib::fitPreview(now);
+        if(fitShells){
+            const float cylLen=std::max(.030f,2.f*std::fabs(cf->rear));
+            addCart(cf->rearCur,cf->radius+cf->caseR+.0015f,StyleCylinder,cylLen,0,cf->axis);
+            for(int c=0;c<cf->n&&c<maxChambers;++c)addCart(sub(slotAt(*cf,c,false),mul(cf->axis,.0012f)),cf->caseR,StyleCartLive,std::min(cf->caseLen,.9f*cylLen),FrameInCylinder,cf->axis);
+        }else if(cf){
             Record snap{};bool have=false;{std::lock_guard lock(modelMutex);if(const Record* r=recordForLocked(cf->weapon)){snap=*r;have=true;}}
             if(have){const bool spentLeft=snap.count(ChamberState::Spent)>0;
-                if(config.debug&&open&&spentLeft&&!ejectedThisOpen_)addItem(cf->rodCur,.007f,StyleSpent,pulseV,0);else if(config.debug)addItem(cf->rodCur,.006f,StyleDebug,0.f,0);
+                if(dbg&&open&&spentLeft&&!ejectedThisOpen_)addItem(cf->rodCur,.007f,StyleSpent,pulseV,0);else if(dbg)addItem(cf->rodCur,.006f,StyleDebug,0.f,0);
                 // The chambers show real cartridges (no chamber rings / dots). The open cylinder goes
                 // first as an analytic occluder, then one procedural round per LIVE (brass case + lead
                 // bullet) / SPENT (dull case, struck primer, open mouth) chamber, rim 1.2 mm proud of
                 // the rear face; EMPTY = nothing.
-                const float spacing=2.f*cf->radius*std::sin(3.14159265f/float(std::max(snap.n,2)));const float caseR=std::clamp(.42f*spacing,.0052f,.0062f);
-                const float cylLen=std::max(.030f,2.f*std::fabs(cf->rear)),rimT=.0012f;
+                const float spacing=2.f*cf->radius*std::sin(3.14159265f/float(std::max(snap.n,2)));
+                const float caseR=cf->breakGun?cf->caseR:std::clamp(.42f*spacing,.0052f,.0062f); // a 12-gauge shell
+                const float cylLen=std::max(.030f,2.f*std::fabs(cf->rear)),rimT=.0012f,roundLen=cf->breakGun?std::min(cf->caseLen,.9f*cylLen):.80f*cylLen;
                 int rounds=0;for(int c=0;c<snap.n;++c){const auto s=snap.st[std::size_t(c)];rounds+=s==ChamberState::Live||s==ChamberState::Spent;}
-                if(rounds&&(open||config.debug)){
-                    addCart(cf->rearCur,cf->radius+caseR+.0025f,StyleCylinder,cylLen,0,cf->axis);
+                if(rounds&&(open||dbg)){
+                    addCart(cf->rearCur,cf->radius+caseR+(cf->breakGun?.0015f:.0025f),StyleCylinder,cylLen,0,cf->axis); // the barrel pair
                     for(int c=0;c<snap.n;++c){const auto s=snap.st[std::size_t(c)];if(s!=ChamberState::Live&&s!=ChamberState::Spent)continue;
-                        const V3 m=slotAt(*cf,(c-snap.next+snap.n)%snap.n,false);
-                        addCart(sub(m,mul(cf->axis,rimT)),caseR,s==ChamberState::Live?StyleCartLive:StyleCartSpent,.80f*cylLen,FrameInCylinder,cf->axis);}
+                        const V3 m=slotAt(*cf,slotIx(*cf,c,snap.next,snap.n),false);
+                        addCart(sub(m,mul(cf->axis,rimT)),caseR,s==ChamberState::Live?StyleCartLive:StyleCartSpent,roundLen,FrameInCylinder,cf->axis);}
                 }
-                if(config.debug)for(int c=0;c<snap.n;++c)if(snap.st[std::size_t(c)]==ChamberState::Empty) // calibration only (.reload.debug 1)
-                    addItem(slotAt(*cf,(c-snap.next+snap.n)%snap.n,false),.0065f,StyleEmpty,magnetChamber_==c?1.f:0.f,0);
-            }else if(config.debug){for(int c=0;c<cf->n&&c<maxChambers;++c)addItem(cf->slotCur[std::size_t(c)],.006f,StyleDebug,c==0?1.f:0.f,0);}
-            if(config.debug)addItem(cf->rearCur,.006f,StyleDebug,0.f,0);
+                if(dbg)for(int c=0;c<snap.n;++c)if(snap.st[std::size_t(c)]==ChamberState::Empty) // calibration only (.reload.debug 1)
+                    addItem(slotAt(*cf,slotIx(*cf,c,snap.next,snap.n),false),.0065f,StyleEmpty,magnetChamber_==c?1.f:0.f,0);
+            }else if(dbg){for(int c=0;c<cf->n&&c<maxChambers;++c)addItem(cf->slotCur[std::size_t(c)],.006f,StyleDebug,c==0?1.f:0.f,0);}
+            if(dbg)addItem(cf->rearCur,.006f,StyleDebug,0.f,0);
         }
         if(held_!=HeldKind::None&&tipLocalValid_){ // The held round is a cartridge (nose at the tip, along the free hand's aim); FULL = a ring
-            const V3 ax=normalized(tipAxisLocal_);const float r=.0057f,len=.030f,oal=len+1.45f*r;const V3 base=sub(tipLocal_,mul(ax,oal));
-            if(held_==HeldKind::Single)addCart(base,r,StyleCartLive,len,1,ax);
+            // a held shotgun shell: the shell's radius / length, drawn as the open-mouth case (the cartridge shader has a lead bullet only)
+            const V3 ax=normalized(tipAxisLocal_);const float r=shellOn_?shellR_:.0057f,len=shellOn_?shellLen_:.030f,oal=shellOn_?len:len+1.45f*r;const V3 base=sub(tipLocal_,mul(ax,oal));
+            const std::uint32_t heldStyle=shellOn_?StyleCartSpent:StyleCartLive;
+            if(held_==HeldKind::Single)addCart(base,r,heldStyle,len,1,ax);
             else{const float rr=cf&&cf->radius>0.f?cf->radius:.0137f;const int slots=cf&&cf->n>0?cf->n:6;
                 V3 e1=normalized(cross(ax,V3{0.f,1.f,0.f}));if(length(e1)<.5f)e1=normalized(cross(ax,V3{1.f,0.f,0.f}));const V3 e2=cross(ax,e1);
                 for(int k=0;k<heldCount_&&k<slots;++k){const float a=6.2831853f*float(k)/float(slots);
-                    addCart(add(base,add(mul(e1,rr*std::cos(a)),mul(e2,rr*std::sin(a)))),r,StyleCartLive,len,1,ax);}}
+                    addCart(add(base,add(mul(e1,rr*std::cos(a)),mul(e2,rr*std::sin(a)))),r,heldStyle,len,1,ax);}}
         }
         if(config.debug&&st.phase==Phase::Open&&held_==HeldKind::None&&freeEligible_&&!config.zoneAny){ // zones only with .reload.debug 1
             const auto& c=sockets_[std::size_t(H::SlotThrown)];addItem({c[0],c[1],c[2]},config.zoneChest,StyleZone,inZone_?1.f:0.f,1);
@@ -1862,19 +2469,27 @@ inline void Brain::publishOverlay(const runtime::ControllerSample& in,int hold,c
         b.v[1]-=9.81f*dt;b.p=add(b.p,mul(b.v,dt));
         const float ang=b.spin*dt,cs=std::cos(ang),sn=std::sin(ang);const V3 k=b.spinAxis;
         b.axis=normalized(add(add(mul(b.axis,cs),mul(cross(k,b.axis),sn)),mul(k,dot(k,b.axis)*(1.f-cs))));
-        addCart(b.p,b.radius,b.live?StyleCartLive:StyleCartSpent,.030f,1,b.axis);
+        addCart(b.p,b.radius,b.live&&!b.shell?StyleCartLive:StyleCartSpent,b.len,1,b.axis);
     }
     if(!o.count&&!overlayWasVisible_)return;
     overlayWasVisible_=o.count>0;
     overlayBox.store(o);overlayLastCount.store(o.count,std::memory_order_relaxed);bump(ctr.overlayPublished);
     if(const auto sink=overlaySink.load(std::memory_order_acquire)){try{sink(o);}catch(...){}}else if(o.count)bump(ctr.overlayUnavailable);
 }
+// the VR menu suspends the holsters' input brain, so frame() + its overlay stop while a menu page is up (the hands pass drops an overlay older than
+// 100 ms): the SHELLS FIT page publishes the two shells from here, else the player would calibrate an open gun with nothing in it. Input thread, as frame().
+inline void Brain::menuFrame(const runtime::ControllerSample& in,int hold,std::uint64_t now) noexcept {
+    ChamberFrame cf{};
+    const bool on=::rdrvr::vr::calib::fitPreview(now)&&chamberBox.load(cf)&&cf.valid&&cf.breakGun&&cf.weapon==ownerWeapon.load(std::memory_order_acquire)&&cf.hand==hold&&
+        cf.referenceSpace==in.referenceSpace&&(now>cf.ns?now-cf.ns:cf.ns-now)<=frameMaxAgeNs;
+    if(!on&&!fitShellsShown_)return; // anything else: nothing is published while the menu is open
+    fitShellsShown_=on;publishOverlay(in,hold,on?&cf:nullptr,stateSnapshot(now),now);}
 inline void Brain::frame(const H::ReloadFacts& f) noexcept {
     if(!f.in)return;const auto& in=*f.in;const auto now=f.now;const int hold=f.hold;
     inputSeenNs.store(now,std::memory_order_release);bump(ctr.frames);flushPulses(now);
     if(f.resumed||(lastBrainNs_&&now>lastBrainNs_+100'000'000ull)){resumeNs_=now;detector.reset(C::BlockResume);++detector.stats.resumes;prevTipValid_=prevPinchValid_=false;}
     lastBrainNs_=now;
-    sockets_=f.sockets;
+    sockets_=f.sockets;fixedSockets_=f.fixedSockets;bodySockets_=f.bodySockets;
     for(unsigned h=0;h<2;++h){handValid_[h]=H::detail::poseOk(in.grip[h]);if(handValid_[h])handPos_[h]={in.grip[h].position[0],in.grip[h].position[1],in.grip[h].position[2]};
         if(handValid_[h]&&H::detail::poseOk(in.aim[h])){ // the aim forward / up in the grip frame (filter 0.2)
             const Q gq{in.grip[h].orientation[0],in.grip[h].orientation[1],in.grip[h].orientation[2],in.grip[h].orientation[3]};
@@ -1901,7 +2516,7 @@ inline void Brain::frame(const H::ReloadFacts& f) noexcept {
     }
     gate_=manualActive(now);const bool visual=gate_||forceVisual(now);
     const auto veto=contextVeto(now);
-    gateWhy_=gate_?"OPEN":!armedNow()?(mode==Mode::Native?"NATIVE":"NOT_ARMED"):hold<0?"NOT_HELD":!revolverKind(H::heldKind.load(std::memory_order_relaxed))?"NOT_REVOLVER":
+    gateWhy_=gate_?"OPEN":!armedNow()?(mode==Mode::Native?"NATIVE":"NOT_ARMED"):hold<0?"NOT_HELD":!reloadKind(H::heldKind.load(std::memory_order_relaxed))?"NOT_REVOLVER":
         !modelMechanics(w)?"MODEL_NATIVE":(veto&VetoNoWorld)?"NO_WORLD":(veto&VetoNoContext)?"NO_CONTEXT":veto?"CONTEXT":
         !contextFresh(contextWord.load(std::memory_order_acquire),now,config.ownerFreshNs)?"STALE":
         inList(fallbackWeapons,w)?"FALLBACK":!inList(manualWeapons,w)?"NO_RECORD":"OWNER";
@@ -1921,7 +2536,9 @@ inline void Brain::frame(const H::ReloadFacts& f) noexcept {
         openStartNs_=0;tailUntil_=st.closedNs+300'000'000ull;detector.clear(C::BlockOpen);
     }
     if(st.phase!=Phase::Closed&&lastPhase_==Phase::Closed){openStartNs_=now;seatedThisOpen_=ejectedThisOpen_=anyActionThisOpen_=false;detector.newOpen();
+        breakEjectPending_=true; // (tapeStep: a BREAK-ACTION's ejectors at OPEN)
         lastTapeNs_=std::max<std::uint64_t>(lastTapeNs_,now>40'000'000ull?now-40'000'000ull:0);prevHoldValid_=prevPinchValid_=prevTipValid_=false;shakeArmTau_=tiltSince_=0;
+        liveStrokes_=0;liveStrokeTau_=breakQuietNs_=0;
         lastFrameOkNs_=now;inZone_=zoneTicked_=false;magnetChamber_=occupiedChamber_=-1;}
     lastPhase_=st.phase;openish_=st.phase==Phase::Open||st.phase==Phase::Opening;
     // the RT edge while open: a refuse tick (the holsters' route zeroes RT)
@@ -1933,13 +2550,15 @@ inline void Brain::frame(const H::ReloadFacts& f) noexcept {
         if(held_!=HeldKind::None){held_=HeldKind::None;bump(ctr.drops);}
         rollReset();rollWord.store(0.f,std::memory_order_relaxed);advanceTicks.store(0,std::memory_order_relaxed);cylOmega.store(0.f,std::memory_order_relaxed);
         ChamberFrame cf{};frameFresh_=false;
-        const bool cfOk=config.debug&&chamberBox.load(cf)&&cf.valid&&cf.weapon==w&&cf.hand==hold&&cf.referenceSpace==in.referenceSpace&&now<=cf.ns+frameMaxAgeNs+50'000'000ull;
+        // the SHELLS FIT page shows the shells in any reload mode too
+        const bool cfOk=(config.debug||::rdrvr::vr::calib::fitPreview(now))&&chamberBox.load(cf)&&cf.valid&&(config.debug||cf.breakGun)&&cf.weapon==w&&cf.hand==hold&&cf.referenceSpace==in.referenceSpace&&now<=cf.ns+frameMaxAgeNs+50'000'000ull;
         publishOverlay(in,hold,cfOk?&cf:nullptr,st,now);return;
     }
     ChamberFrame cf{};
     const bool wasFresh=frameFresh_;
     frameFresh_=chamberBox.load(cf)&&cf.valid&&cf.weapon==w&&cf.hand==hold&&cf.referenceSpace==in.referenceSpace&&(now>cf.ns?now-cf.ns:cf.ns-now)<=frameMaxAgeNs;
     if(frameFresh_)lastFrameOkNs_=now;else bump(ctr.frameStale);
+    if(frameFresh_){shellOn_=cf.breakGun!=0;if(shellOn_){shellR_=cf.caseR;shellLen_=cf.caseLen;}}
     // a new reference space / a lost ChamberFrame resets the detectors (the tape before it is never read again)
     if(in.referenceSpace!=tapeSpace_||(wasFresh&&!frameFresh_)){
         if(tapeSpace_&&st.phase!=Phase::Closed){detector.reset(C::BlockResume);resumeNs_=now;prevTipValid_=prevPinchValid_=prevHoldValid_=false;}
@@ -2010,6 +2629,7 @@ inline void Brain::frame(const H::ReloadFacts& f) noexcept {
 // ---- sinks registered in the holsters (input thread) ----
 inline bool padFilter(const runtime::ControllerSample& in,int hold,std::uint64_t now) noexcept {try{return brain.pad(in,hold,now);}catch(...){return false;}}
 inline void brainSink(const H::ReloadFacts& f) noexcept {try{brain.frame(f);brain.publishReport();}catch(...){}}
+inline void menuSink(const runtime::ControllerSample& in,int hold,std::uint64_t now) noexcept {try{brain.menuFrame(in,hold,now);}catch(...){}}
 inline bool freeHandOwned(unsigned h,std::uint64_t now) noexcept {return brain.owned(h,now);}
 inline void grabSink(unsigned h,std::uint64_t now) noexcept {try{brain.grab(h,now);}catch(...){}}
 // VrControls ReloadConsumer (before the holster filter): ownership only - the edge belongs to padFilter.
@@ -2035,10 +2655,10 @@ inline void publishStatus() noexcept {
     const auto now=clockNow();const char* note=nullptr;
     if(effectiveMode()!=Mode::Native){
         const int hold=H::holdHand.load(std::memory_order_relaxed);const auto w=ownerWeapon.load(std::memory_order_acquire);
-        if(hold>=0&&revolverKind(H::heldKind.load(std::memory_order_relaxed))){
+        if(hold>=0&&reloadKind(H::heldKind.load(std::memory_order_relaxed))){
             if(phase(now)!=Phase::Closed)note="OPEN";
             else if(!modelMechanics(w))note="GAME RELOAD"; // This model has no trusted geometry
-            else if(cylinder.load(std::memory_order_relaxed)==int(Cylinder::Missing)&&cylinderWeapon.load(std::memory_order_relaxed)==w)note="NO CYLINDER";
+            else if(cylinder.load(std::memory_order_relaxed)==int(Cylinder::Missing)&&cylinderWeapon.load(std::memory_order_relaxed)==w)note=breakGunOf(w)?"NO HINGE":"NO CYLINDER";
             else if(inList(fallbackWeapons,w))note="NO FRAME";
             else if(contextVeto(now))note="CONTEXT";
             else{std::lock_guard lock(modelMutex);if(const Record* r=recordForLocked(w)){
@@ -2054,6 +2674,22 @@ inline void publishStatus() noexcept {
 inline bool parseFloats(const std::string& text,float* out,int maxN,int& n) noexcept {
     n=0;const char* p=text.c_str();while(*p&&n<maxN){char* end=nullptr;const float x=std::strtof(p,&end);if(end==p||!std::isfinite(x))break;out[n++]=x;p=end;while(*p==' '||*p==','||*p==';')++p;}
     return n>0;}
+// .bones.<KEY> "hammer=<spec> cylinder=<spec> hinge=<spec> spin=finger|trigger break=<deg> down=<mm> ahead=<mm>" | "off"
+inline void parseRoles(const std::string& text,BoneRoles& r) noexcept {
+    if(text.empty())return;
+    if(text=="off"||text=="0"||text=="none"){r=BoneRoles{};return;}
+    std::size_t i=0;bool any=false;
+    while(i<text.size()){
+        while(i<text.size()&&(text[i]==' '||text[i]==','||text[i]==';'))++i;
+        std::size_t j=i;while(j<text.size()&&text[j]!=' '&&text[j]!=','&&text[j]!=';')++j;
+        const std::string tok=text.substr(i,j-i);i=j;const auto eq=tok.find('=');if(eq==std::string::npos||eq==0)continue;
+        const std::string k=tok.substr(0,eq),v=tok.substr(eq+1);
+        const auto name=[&](std::array<char,32>& out){out={};std::snprintf(out.data(),out.size(),"%s",v.c_str());any=true;};
+        const auto f=[&](float& out,float lo,float hi){char* e{};const float x=std::strtof(v.c_str(),&e);if(e!=v.c_str()&&std::isfinite(x)&&x>=lo&&x<=hi){out=x;any=true;}};
+        if(k=="hammer")name(r.hammer);else if(k=="cylinder")name(r.cylinder);else if(k=="hinge")name(r.hinge);
+        else if(k=="spin"){r.spinFinger=v=="finger";any=true;}
+        else if(k=="break")f(r.breakDeg,5.f,120.f);else if(k=="down")f(r.axisDownMm,4.f,40.f);else if(k=="ahead")f(r.rearAheadMm,-40.f,80.f);}
+    if(any)r.set=true;}
 inline Config readConfig() noexcept {
     const auto prop=[](const char* suffix){return H::property((std::string("debug.rdrvr.vr.reload")+suffix).c_str());};
     const auto off=[](const std::string& v){return !v.empty()&&v[0]=='0';};
@@ -2083,16 +2719,31 @@ inline Config readConfig() noexcept {
     { // Per-model handguns: .models (trust list) and.geom.<KEY> "rearMm chamberMm spurX spurY spurZ" (mm)
         std::string u=prop(".models");for(char& ch:u)ch=char(std::toupper((unsigned char)ch));
         for(std::size_t m=1;m<models.size();++m){auto& s=models[m];
-            if(u=="NONE")s.manual=false;else if(!u.empty()&&(u=="ALL"||u.find(s.key)!=std::string::npos))s.manual=s.revolver;
+            // every revolver is trusted by default; "NONE" = none, "ALL" = all, a list = only the listed models (e.g. "CATTLEMAN")
+            if(u=="NONE")s.manual=false;else if(u=="ALL")s.manual=s.revolver||s.shotgun;else if(!u.empty())s.manual=(s.revolver||s.shotgun)&&u.find(s.key)!=std::string::npos;
             float v[5]{s.rearMm,s.chamberMm,s.spur[0],s.spur[1],s.spur[2]};int n=0;
             if(parseFloats(prop((std::string(".geom.")+s.key).c_str()),v,5,n)&&std::fabs(v[0])<=60.f&&(v[1]<0.f||(v[1]>=4.f&&v[1]<=40.f))&&
-               std::fabs(v[2])<=60.f&&std::fabs(v[3])<=60.f&&std::fabs(v[4])<=60.f){s.geom=true;s.rearMm=v[0];s.chamberMm=v[1]<0.f?-1.f:v[1];s.spur={v[2],v[3],v[4]};}}}
+               std::fabs(v[2])<=60.f&&std::fabs(v[3])<=60.f&&std::fabs(v[4])<=60.f){s.geom=true;s.rearMm=v[0];s.chamberMm=v[1]<0.f?-1.f:v[1];s.spur={v[2],v[3],v[4]};}
+            parseRoles(prop((std::string(".bones.")+s.key).c_str()),roles[m]);
+            if(s.shotgun){breakGuns[m]=BreakGunCfg{};
+                // its breech is 5 cm ahead of the hammers (the long double-barrel: 3 cm); a smaller value leaves the rims ~2 cm behind the breech face
+                if(int(m)==ModelSawedOff)breakGuns[m].aheadMm=50.f;
+                parseBreakGun(prop((std::string(".breakgun.")+s.key).c_str()),breakGuns[m]);}}}
+    { // CRANE per model: .crane.<KEY> "radiusMm [swingDeg]" (on) | "0" / "off" (the axis rule)
+        cranes=defaultCranes();
+        for(std::size_t m=1;m<models.size();++m){const auto t=prop((std::string(".crane.")+models[m].key).c_str());if(t.empty())continue;
+            auto& cc=cranes[m];if(t=="off"||t=="0"){cc.on=false;continue;}
+            float v[2]{cc.radiusMm,cc.swingDeg};int n=0;
+            if(parseFloats(t,v,2,n)&&v[0]>=8.f&&v[0]<=30.f){cc.on=true;cc.radiusMm=v[0];if(n>=2&&v[1]>=0.f&&v[1]<=170.f)cc.swingDeg=v[1];}}}
     num(".shake",.2f,5.f,c.shake);num(".ejectUp",0.f,85.f,c.close.ejectUpDeg);ms(".tiltMs",0.f,5000.f,c.tiltNs);num(".tiltDeg",10.f,85.f,c.tiltDeg);c.brass=!off(prop(".brass"));
     c.rod=!off(prop(".rod"));c.keepLive=!off(prop(".keepLive"));c.autoIndex=!off(prop(".autoIndex"));c.holsterRefill=on(prop(".holsterRefill"));
+    c.shotgun=!off(prop(".shotgun"));c.shotgunEject=!off(prop(".shotgunEject"));c.shotgunLearn=!off(prop(".shotgunLearn"));
+    num(".breakTiltDeg",5.f,85.f,c.breakTiltDeg);num(".breakShakeLive",.2f,8.f,c.breakShakeLive);
     {float v=-1.f;num(".longMs",0.f,5000.f,v);if(v>=0.f)c.longNs=std::uint64_t(double(v)*1e6);}
     ms(".shotTimeoutMs",50.f,3000.f,c.shotTimeoutNs);ms(".hookGraceMs",0.f,10000.f,c.hookGraceNs);
     c.block=!off(prop(".block"));c.dry=!off(prop(".dry"));c.audit=!off(prop(".audit"));c.debug=on(prop(".debug"));c.forceOpen=on(prop(".forceOpen"));
     auto& z=c.close;z.flick=!off(prop(".flick"));z.wave=!off(prop(".wave"));z.push=!off(prop(".push"));
+    {float v[2]{z.flickPitch,z.flickPitchNetDeg};int n=0;if(parseFloats(prop(".flickPitch"),v,2,n)){if(v[0]>=2.f&&v[0]<=40.f)z.flickPitch=v[0];if(n>=2&&v[1]>=20.f&&v[1]<=150.f)z.flickPitchNetDeg=v[1];}}
     num(".flickRoll",2.f,40.f,z.flickRoll);num(".flickRollUp",2.f,40.f,z.flickRollUp);num(".flickBig",2.f,60.f,z.flickBig);num(".flickNet",20.f,120.f,z.flickNetDeg);
     ms(".flickWindow",40.f,150.f,z.flickWindowNs);z.flickClose=prop(".flickDir")=="close";
     num(".waveClose",.8f,4.f,z.waveClose);{const auto a=prop(".waveAxes");z.waveAxes=a=="lateral"?1:a=="perp"?2:0;}z.waveClose_=prop(".waveDir")=="close";
@@ -2115,7 +2766,7 @@ inline void startup() noexcept {
     if(config.enabled){
         H::bButtonSink.store(&padFilter,std::memory_order_release);H::fireBlockSink.store(&fireBlocked,std::memory_order_release);
         H::cylinderPhaseSink.store(&phaseCode,std::memory_order_release);H::rtGateSink.store(&rtGateSink,std::memory_order_release);
-        H::rtHeldSink.store(&rtHeld,std::memory_order_release);H::reloadBrainSink.store(&brainSink,std::memory_order_release);
+        H::rtHeldSink.store(&rtHeld,std::memory_order_release);H::reloadBrainSink.store(&brainSink,std::memory_order_release);H::reloadMenuSink.store(&menuSink,std::memory_order_release);
         H::freeHandOwnedSink.store(&freeHandOwned,std::memory_order_release);H::reloadGrabSink.store(&grabSink,std::memory_order_release);
     }else installState.store(int(Install::Killed),std::memory_order_release);
     started.store(true);
@@ -2163,7 +2814,7 @@ inline void resetForTests() noexcept {
     envReady.store(false);env=Env{};tickState=TickState{};lastOpExpiredNs=0;lastLongPressWord.store(0);
     unmanagedWeapon.store(0);unmanagedSinceNs.store(0);inputSeenNs.store(0);
     brain.resetForTests();brain.detector.cfg=config.close;{std::lock_guard lock(brainReportMutex);brainReport=BrainReport{};}ammoBox.store(EngineAmmo{});chamberBox.store(ChamberFrame{});overlayBox.store(Overlay{});
-    {std::lock_guard lock(recordMutex);record=SwingRecord{};instBases={};typeBases={};}cylinder.store(int(Cylinder::Unknown));cylinderWeapon.store(0);
+    {std::lock_guard lock(recordMutex);record=SwingRecord{};instBases={};typeBases={};craneRep=CraneRep{};skelDumps={};}cylinder.store(int(Cylinder::Unknown));cylinderWeapon.store(0);
     H::bForce.store(false);H::cylinderClosedNs.store(0);H::cylinderFollow.store(false);rollWord.store(0.f);rollNs.store(0);
     for(auto* a:{&chLiveShots,&chDryClicks,&chAdvances,&chCockAdvances,&cylSpins,&cylSpinMilliRevs,&cylSpinsStopped})a->store(0);
     cylLastSpinRevs.store(0.f);cylOmega.store(0.f);advanceTicks.store(0);
@@ -2196,8 +2847,80 @@ inline std::string report() {
         double(config.fullMm),double(config.fullDeg),double(config.shake),double(config.longNs)/1e6,config.debug?"true":"false",config.keepLive?"true":"false",
         config.autoIndex?"true":"false",config.holsterRefill?"true":"false",config.zoneAny?"ANY":"BODY");out+=b;
     {const auto ow=ownerWeapon.load();const auto& ms=specOf(ow);
-        std::snprintf(b,sizeof b,"\"model\":{\"key\":\"%s\",\"bound\":%s,\"mechanics\":%s,\"geom\":%s,\"rearMm\":%.1f,\"chamberMm\":%.1f},",ms.key,
-            ow&&modelWeapon.load()==ow?"true":"false",modelMechanics(ow)?"true":"false",ms.geom?"true":"false",double(ms.rearMm),double(ms.chamberMm));out+=b;}
+        const int mo=modelOf(ow);const ModelFit fit=fitOf(mo);
+        std::snprintf(b,sizeof b,"\"model\":{\"key\":\"%s\",\"bound\":%s,\"mechanics\":%s,\"geom\":%s,\"auto\":%s,\"rearMm\":%.1f,\"chamberMm\":%.1f,"
+            "\"fitMm\":[%.0f,%.0f,%.0f,%.0f,%.0f]},",ms.key,
+            ow&&modelWeapon.load()==ow?"true":"false",modelMechanics(ow)?"true":"false",ms.geom?"true":"false",autoGeometry(mo)?"true":"false",
+            double(ms.rearMm),double(ms.chamberMm),double(fit.spurMm[0]),double(fit.spurMm[1]),double(fit.spurMm[2]),double(fit.rearMm),double(fit.radiusMm));out+=b;}
+    { // the bone roles of the held model: the specs, the bones chosen on the device (name#index), the mode, the virtual cylinder
+        SwingRecord sr{};{std::lock_guard lock(recordMutex);sr=record;}
+        const int mo=sr.model;const BoneRoles& ro=rolesOf(mo);
+        const auto bn=[&](int i){std::string t=i>=0&&unsigned(i)<sr.count?std::string(sr.names[unsigned(i)].data())+"#"+std::to_string(i):std::string("-");
+            for(char& ch:t)if(ch=='"'||ch=='\\'||(unsigned char)ch<0x20||(unsigned char)ch>0x7e)ch='?';return t;};
+        const auto sp=[](const std::array<char,32>& a){std::string t(a.data());for(char& ch:t)if(ch=='"'||ch=='\\'||(unsigned char)ch<0x20||(unsigned char)ch>0x7e)ch='?';return t;};
+        std::snprintf(b,sizeof b,"\"roles\":{\"model\":\"%s\",\"set\":%s,\"spec\":{\"hammer\":\"%s\",\"cylinder\":\"%s\",\"hinge\":\"%s\",\"spin\":\"%s\"},"
+            "\"mode\":\"%s\",\"swingBone\":\"%s\",\"hammerBone\":\"%s\",\"breakDeg\":%.0f,\"axisDownMm\":%.1f,\"rearAheadMm\":%.1f,"
+            "\"virtualCm\":[%.2f,%.2f,%.2f],\"hingeCm\":[%.2f,%.2f,%.2f],\"virtualValid\":%s,\"hingeFrameFailures\":%llu},",
+            mo>ModelUnknown&&mo<ModelCount?models[std::size_t(mo)].key:"NONE",ro.set?"true":"false",sp(ro.hammer).c_str(),sp(ro.cylinder).c_str(),sp(ro.hinge).c_str(),
+            ro.set&&ro.spinFinger?"FINGER":"TRIGGER",sr.bone<0?"NONE":sr.hinge?"BREAK":"SWING",bn(sr.bone).c_str(),bn(sr.hammerBone).c_str(),
+            double(ro.breakDeg),double(ro.axisDownMm),double(ro.rearAheadMm),double(sr.virtualCm[0]),double(sr.virtualCm[1]),double(sr.virtualCm[2]),
+            double(sr.hingeCm[0]),double(sr.hingeCm[1]),double(sr.hingeCm[2]),sr.haveVirtual?"true":"false",u(hingeFrameFailures));out+=b;
+        // BREAK-ACTION shotgun: the hinge rule that won, the bones, the levers, the pin / breech face (model cm), the learn watch (the
+        // game's own reload: the most-turned bone, its angle, the solved pin + axis, the per-bone maxima of the last game reload)
+        const int bm=shotgunModel(mo)?mo:shotgunModel(modelOf(w))?modelOf(w):-1;
+        BreakLearn L{};BreakWatch W{};bool lf=false;float od=0.f;
+        {std::lock_guard lock(recordMutex);if(bm>0)L=breakLearn[std::size_t(bm)];lf=learnedFor(sr);od=sr.shotgun?breakGunDeg(sr):0.f;W.reloading=breakWatch.reloading;W.frames=breakWatch.frames;
+            W.bestBone=breakWatch.bestBone;W.bestDeg=breakWatch.bestDeg;W.restValid=breakWatch.restValid;W.weapon=breakWatch.weapon;}
+        const BreakGunCfg& bc=breakGunCfgOf(bm);
+        std::snprintf(b,sizeof b,"\"breakGun\":{\"enabled\":%s,\"eject\":%s,\"learnOn\":%s,\"model\":\"%s\",\"record\":%s,\"rule\":\"%s\",\"hinge\":\"%s\",\"hammer\":\"%s\","
+            "\"openDeg\":%.1f,\"cfg\":{\"halfMm\":%.1f,\"sideMm\":%.1f,\"downMm\":%.1f,\"breechMm\":%.1f,\"barrelMm\":%.0f,\"shellMm\":%.1f,\"shellRMm\":%.1f,"
+            "\"tipMm\":%.0f,\"pinMm\":[%.1f,%.1f],\"openDeg\":%.0f},\"pinCm\":[%.2f,%.2f,%.2f],\"breechCm\":[%.2f,%.2f,%.2f],"
+            "\"learn\":{\"valid\":%s,\"bone\":\"%s\",\"deg\":%.1f,\"residualMm\":%.2f,\"pivotCm\":[%.2f,%.2f,%.2f],\"axis\":[%.3f,%.3f,%.3f],\"reloads\":%u,"
+            "\"lastFrames\":%u,\"lastBest\":%d,\"lastBestDeg\":%.1f,\"why\":\"%s\",\"learned\":%llu,\"rejected\":%llu,\"watchReloads\":%llu,\"watching\":%s,"
+            "\"watchFrames\":%u,\"watchBest\":%d,\"watchBestDeg\":%.1f,\"restValid\":%s,\"lastMaxDeg\":[",
+            config.shotgun?"true":"false",config.shotgunEject?"true":"false",config.shotgunLearn?"true":"false",bm>0?models[std::size_t(bm)].key:"NONE",
+            sr.shotgun?"true":"false",!sr.shotgun?"-":sr.boneFrom==1?"LEVER":sr.boneFrom==2||lf?"LEARNED":sr.boneFrom==3?"NAME":sr.boneFrom==4?"SOLE":"NONE",
+            sr.shotgun?bn(sr.bone).c_str():"-",sr.shotgun?bn(sr.hammerBone).c_str():"-",double(od),
+            double(bc.halfMm),double(bc.sideMm),double(bc.downMm),double(bc.breechMm),double(bc.barrelMm),double(bc.shellMm),double(bc.shellRMm),double(bc.tipMm),
+            double(bc.pinAlongMm),double(bc.pinUpMm),double(bc.openDeg),
+            sr.shotgun?double(sr.hingeCm[0]):0.0,sr.shotgun?double(sr.hingeCm[1]):0.0,sr.shotgun?double(sr.hingeCm[2]):0.0,
+            sr.shotgun?double(sr.virtualCm[0]):0.0,sr.shotgun?double(sr.virtualCm[1]):0.0,sr.shotgun?double(sr.virtualCm[2]):0.0,
+            L.valid?"true":"false",L.valid?sp(L.name).c_str():"-",double(L.deg),double(L.residualMm),double(L.pivotCm[0]),double(L.pivotCm[1]),double(L.pivotCm[2]),
+            double(L.axisM[0]),double(L.axisM[1]),double(L.axisM[2]),L.reloads,L.lastFrames,L.lastBest,double(L.lastBestDeg),breakLearnWhy.load(),
+            u(breakLearned),u(breakLearnRejected),u(breakWatchReloads),W.reloading?"true":"false",W.frames,W.bestBone,double(W.bestDeg),W.restValid?"true":"false");out+=b;
+        {bool firstM=true;for(unsigned i=0;i<maxBones;++i){if(L.lastMax[i]<1.f)continue;
+            std::snprintf(b,sizeof b,"%s{\"i\":%u,\"name\":\"%s\",\"deg\":%.1f}",firstM?"":",",i,i<sr.count?bn(int(i)).c_str():"?",double(L.lastMax[i]));out+=b;firstM=false;}}
+        std::snprintf(b,sizeof b,"]},\"rechosen\":%llu,\"ejectsOnOpen\":%llu,\"ejectNothing\":%llu,\"flickPitch\":[%.1f,%.0f],",u(breakRechosen),u(breakEjectsOpen),
+            u(breakEjectNothing),double(config.close.flickPitch),double(config.close.flickPitchNetDeg));out+=b;
+        // SHELL EJECT: the value in force (LEVER_OFF = .shotgunEject 0), the shaken / tipped out ejects, the last eject's cause, the thresholds [tiltDeg, spent m/s, live m/s]
+        std::snprintf(b,sizeof b,"\"ejectMode\":\"%s\",\"shakeEjects\":%llu,\"tiltEjects\":%llu,\"lastEjectWhy\":\"%s\",\"shakeOut\":[%.0f,%.2f,%.2f],",
+            !config.shotgunEject?"LEVER_OFF":settings().shellShakeOut()?"SHAKE OUT":"AUTO",u(breakShakeEjects),u(breakTiltEjects),breakLastEjectWhy.load(std::memory_order_relaxed),
+            double(config.breakTiltDeg),double(config.shake),double(config.breakShakeLive));out+=b;
+        std::snprintf(b,sizeof b,"\"pinAtHinge\":%s,\"longFullOpen\":%llu,",sr.pinAtHinge?"true":"false",u(breakLongFull));out+=b;
+        // the breech rule: what it chose, the candidates along the bore from the muzzle (cm; null = no such bone), the barrels' length, the shells'
+        // rims + the muzzle (model cm), the SHELLS FIT; dumped = this model's bones are in skeletons[] (the first held frame, no need to open the gun)
+        const ModelFit bf=fitOf(bm);const char* br=!sr.shotgun?"-":sr.breechRule==BreechLever?"LEVER":sr.breechRule==BreechHammer?"HAMMER":sr.breechRule==BreechTrigger?"TRIGGER":sr.breechRule==BreechPin?"PIN":"NONE";
+        const auto al=[](bool ok,float m){char t[24];if(ok)std::snprintf(t,sizeof t,"%.2f",double(m*100.f));else std::snprintf(t,sizeof t,"null");return std::string(t);};
+        bool dumped=false;{std::lock_guard lock(recordMutex);for(const auto& d:skelDumps)if(bm>0&&d.model==bm)dumped=true;}
+        std::snprintf(b,sizeof b,"\"breechRule\":\"%s\",\"breechClamped\":%s,\"aheadMm\":%.0f,\"alongCm\":{\"pin\":%.2f,\"hammer\":%s,\"trigger\":%s,\"breech\":%.2f},\"barrelsCm\":%.2f,"
+            "\"muzzleCm\":[%.2f,%.2f,%.2f],\"shellsCm\":[[%.2f,%.2f,%.2f],[%.2f,%.2f,%.2f]],\"fitMm\":{\"forward\":%.0f,\"up\":%.0f,\"right\":%.0f,\"spacing\":%.0f},\"halfUsedMm\":%.1f,\"dumped\":%s},",
+            br,sr.breechClamped?"true":"false",double(bc.aheadMm),double(sr.pinAlongM*100.f),al(sr.refHammerOk,sr.refHammerM).c_str(),al(sr.refTriggerOk,sr.refTriggerM).c_str(),double(sr.breechAlongM*100.f),
+            double(-(sr.breechAlongM+bf.spurMm[2]*.001f)*100.f),double(sr.muzzleCm[0]),double(sr.muzzleCm[1]),double(sr.muzzleCm[2]),
+            double(sr.shellCm[0][0]),double(sr.shellCm[0][1]),double(sr.shellCm[0][2]),double(sr.shellCm[1][0]),double(sr.shellCm[1][1]),double(sr.shellCm[1][2]),
+            double(bf.spurMm[2]),double(bf.spurMm[1]),double(bf.spurMm[0]),double(bf.rearMm),double(sr.spreadMm),dumped?"true":"false");out+=b;}
+    { // SKELETON DUMP per model (model space cm; axes = the bone's model-space x / y / z columns)
+        std::array<SkelDump,8> ds{};{std::lock_guard lock(recordMutex);ds=skelDumps;}
+        out+="\"skeletons\":[";bool firstD=true;
+        for(const auto& d:ds){if(d.model<=ModelUnknown||d.model>=ModelCount)continue;
+            std::snprintf(b,sizeof b,"%s{\"model\":\"%s\",\"muzzleCm\":[%.2f,%.2f,%.2f],\"barrel\":[%.2f,%.2f,%.2f],\"up\":[%.2f,%.2f,%.2f],\"bones\":[",
+                firstD?"":",",models[std::size_t(d.model)].key,double(d.muzzleCm[0]),double(d.muzzleCm[1]),double(d.muzzleCm[2]),
+                double(d.barrel[0]),double(d.barrel[1]),double(d.barrel[2]),double(d.up[0]),double(d.up[1]),double(d.up[2]));out+=b;firstD=false;
+            for(unsigned i=0;i<d.count&&i<maxBones;++i){std::string nm(d.names[i].data());for(char& ch:nm)if(ch=='"'||ch=='\\'||(unsigned char)ch<0x20||(unsigned char)ch>0x7e)ch='?';
+                const auto v=[](const V3& x){char t[64];std::snprintf(t,sizeof t,"[%.2f,%.2f,%.2f]",double(x[0]),double(x[1]),double(x[2]));return std::string(t);};
+                std::snprintf(b,sizeof b,"%s{\"i\":%u,\"name\":\"%s\",\"parent\":%d,\"cm\":%s,\"localCm\":%s,\"x\":%s,\"y\":%s,\"z\":%s}",i?",":"",i,nm.c_str(),
+                    d.parents[i],v(d.posCm[i]).c_str(),v(d.localCm[i]).c_str(),v(d.ax[i]).c_str(),v(d.ay[i]).c_str(),v(d.az[i]).c_str());out+=b;}
+            out+="]}";}
+        out+="],";}
     { // The context word (fresh / stale, raw veto incl. NO_CONTEXT 2048 / NO_WORLD 4096), the hook's UNMANAGED grace, the executor snaps
         const auto word=contextWord.load();const auto uw=unmanagedWeapon.load();const auto us=unmanagedSinceNs.load();
         std::snprintf(b,sizeof b,"\"context\":{\"word\":\"%s\",\"vetoRaw\":%u,\"notes\":%llu,\"empty\":%llu,\"noContext\":%llu,\"noWorld\":%llu},"
@@ -2248,13 +2971,13 @@ inline std::string report() {
         "\"AUTOLOAD\":%llu,\"SNAP\":%llu},\"lastSnap\":\"%s\",\"ejects\":{\"SHAKE\":%llu,\"ROD\":%llu,\"TILT\":%llu},\"ejectBlocked\":{\"AFTER_SEAT\":%llu,\"NO_SPENT\":%llu,"
         "\"NOTHING\":%llu},\"ejectsAfterSeat\":%llu,\"shakeSubThreshold\":[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f],\"tiltAborted\":%llu,\"ejectedSpent\":%llu,"
         "\"ejectedLive\":%llu,\"grabs\":{\"SINGLE\":%llu,\"FULL\":%llu},\"grabRefused\":{\"NO_AMMO\":%llu,\"NO_EMPTY\":%llu,\"HAND_BUSY\":%llu},"
-        "\"grabOutsideZone\":{\"n\":%llu,\"lastM\":%.2f},\"inserts\":%llu,\"roundsSeated\":%llu,\"insertRefused\":{\"OCCUPIED\":%llu,\"SPENT\":%llu},",
+        "\"grabOutsideZone\":{\"n\":%llu,\"lastM\":%.2f},\"crouchZoneHits\":%llu,\"inserts\":%llu,\"roundsSeated\":%llu,\"insertRefused\":{\"OCCUPIED\":%llu,\"SPENT\":%llu},",
         u(ctr.opens),u(opensRefusedBusy),u(closeCounts[unsigned(CloseSource::B)]),u(closeCounts[unsigned(CloseSource::Flick)]),u(closeCounts[unsigned(CloseSource::Wave)]),
         u(closeCounts[unsigned(CloseSource::Push)]),u(closeCounts[unsigned(CloseSource::AutoLoad)]),u(closeCounts[unsigned(CloseSource::Snap)]),lastSnapReason.load(),
         u(ctr.ejectShake),u(ctr.ejectRod),u(ctr.ejectTilt),u(ctr.ejectAfterSeat),u(ctr.ejectNoSpent),u(ctr.ejectNothing),u(ctr.ejectsAfterSeat),
         double(ctr.shakeSub[0].load()),double(ctr.shakeSub[1].load()),double(ctr.shakeSub[2].load()),double(ctr.shakeSub[3].load()),double(ctr.shakeSub[4].load()),
         double(ctr.shakeSub[5].load()),double(ctr.shakeSub[6].load()),double(ctr.shakeSub[7].load()),u(ctr.tiltAborted),u(ctr.ejectedSpent),u(ctr.ejectedLive),
-        u(ctr.grabsSingle),u(ctr.grabsFull),u(ctr.grabNoAmmo),u(ctr.grabNoEmpty),u(ctr.grabBusy),u(ctr.grabOutside),double(ctr.grabOutsideLastM.load()),u(ctr.inserts),u(ctr.roundsSeated),
+        u(ctr.grabsSingle),u(ctr.grabsFull),u(ctr.grabNoAmmo),u(ctr.grabNoEmpty),u(ctr.grabBusy),u(ctr.grabOutside),double(ctr.grabOutsideLastM.load()),u(ctr.crouchZoneHits),u(ctr.inserts),u(ctr.roundsSeated),
         u(ctr.insertOccupied),u(ctr.insertSpent));out+=b;
     out+="\"insertNearMiss\":{\"distMm7\":[";for(unsigned i=0;i<8;++i)out+=(i?",":"")+std::to_string(ctr.nearMissMm[i].load());
     out+="],\"angleDeg15\":[";for(unsigned i=0;i<8;++i)out+=(i?",":"")+std::to_string(ctr.nearMissDeg[i].load());
@@ -2324,6 +3047,20 @@ inline std::string report() {
     SwingRecord sr{};{std::lock_guard lock(recordMutex);sr=record;}
     for(unsigned i=0;i<sr.count&&i<maxBones;++i){std::string nm(sr.names[i].data());for(char& ch:nm)if(ch=='"'||ch=='\\'||(unsigned char)ch<0x20||(unsigned char)ch>0x7e)ch='?';
         std::snprintf(b,sizeof b,"%s{\"name\":\"%s\",\"parent\":%d}",i?",":"",nm.c_str(),sr.parents[i]);out+=b;}
-    out+="]}";return out;
+    out+="],";
+    { // CRANE: per-model levers + the held model's last decision (model space cm; lat + = right, up + = up, along the bore's frame)
+        CraneRep cr{};{std::lock_guard lock(recordMutex);cr=craneRep;}
+        out+="\"crane\":{\"levers\":{";bool first=true;
+        for(std::size_t m=1;m<models.size();++m){if(!models[m].revolver)continue;const auto& cc=cranes[m];
+            std::snprintf(b,sizeof b,"%s\"%s\":%s",first?"":",",models[m].key,cc.on?"":"\"OFF\"");out+=b;first=false;
+            if(cc.on){std::snprintf(b,sizeof b,"[%.1f,%.1f]",double(cc.radiusMm),double(cc.swingDeg));out+=b;}}
+        const auto v3=[](V3 v){char t[64];std::snprintf(t,sizeof t,"[%.2f,%.2f,%.2f]",double(v[0]),double(v[1]),double(v[2]));return std::string(t);};
+        std::snprintf(b,sizeof b,"},\"model\":\"%s\",\"rule\":\"%s\",\"poses\":%llu,\"sign\":%.0f,\"signFrom\":\"%s\",\"deg\":%.1f,\"radiusMm\":%.1f,"
+            "\"hingeCm\":%s,\"axisCm\":%s,\"armCm\":%.2f,\"boreFromHingeCm\":[%.2f,%.2f],\"openMoveCm\":[%.2f,%.2f]}}",
+            cr.model>0&&cr.model<ModelCount?models[std::size_t(cr.model)].key:"NONE",cr.on?"CRANE":"AXIS",(unsigned long long)cr.poses,double(cr.sign),
+            cr.signFromHinge?"HINGE":"HAND",double(cr.deg),double(cr.radiusMm),v3(cr.hingeCm).c_str(),v3(cr.axisCm).c_str(),double(cr.armCm),
+            double(cr.boreLatCm),double(cr.boreUpCm),double(cr.openLatCm),double(cr.openUpCm));out+=b;
+        }
+    return out;
 }
 } // namespace rdrvr::vr::reload

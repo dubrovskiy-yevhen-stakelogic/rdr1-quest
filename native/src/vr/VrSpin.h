@@ -24,6 +24,8 @@
 //  - main / input thread: publishStatus (menu row note GUN SPIN), report().
 // Kill: debug.rdrvr.vr.spin 0 (startup; no touch action, no entry, holsters unchanged). Menu: HANDS / WEAPONS -> GUN SPIN OFF / ON (default ON).
 //  - pivot = the weapon's 'trigger' bone (+ trigOff into the guard) moved ONTO the VR index finger (grip + fingerPt along the gun's axes);
+//  - a model with roles spin=finger (the Schofield: its 'trigger' bone is the template point every revolver shares) pivots at the
+//    FINGER point of the holding grip frame instead - the Cattleman's pivot as held (learned per hand), else Config::fingerRef;
 //  - physics = rigid body pinned at the finger: gravity + the finger's linear acceleration + light friction (no assists);
 //  - entry = touch (either mapping) OR trigger analog > 0.02 anywhere in the 1.5 s before the opening; untracked finger never "lifts";
 //  - menu GUN SPIN note shows the last refusal ("MISS: ...") until the next entry.
@@ -78,6 +80,12 @@ struct Config {
     // PIVOT = THE INSIDE OF THE TRIGGER GUARD on the gun as held: the weapon's 'trigger' bone + trigOff (fwd along the barrel, down;
     // m). No shift: the gun keeps its held pose and turns through this point.
     V3 trigOff{.015f,.015f,0.f};
+    // FINGER pivot (a model whose roles say spin=finger, VrReload BoneRoles: the Schofield, whose 'trigger' bone is a template
+    // bone at the same model point on every revolver): the pivot = the trigger finger point of the HOLDING GRIP frame - the Cattleman's
+    // pivot as held (learned per hand while a Cattleman is held), else this default (m, right hand = hand 1; the left hand mirrors x).
+    // Device 10-29: Cattleman (-1.2, -7.4, -5.0) cm, the Schofield's template pivot (-1.2, -8.5, -8.6) = 2.8 cm ahead, 2.6 cm high.
+    // .spin.fingerpt "x y z" (cm, right hand) fixes it (no learning).
+    V3 fingerRef{-.012f,-.074f,-.050f};bool fingerFixed{};
     // FLICK ENTRY (no finger signal needed), the push of a fast hand turn, "fully still" for the rest rule, the drop exits
     float flickOmega{4.f},flickV{1.f},flickPerp{.70f},throwV{3.f},flickPush{40.f},seedGain{1.2f},stillV{.15f},stillW{1.f},stillRel{1.f};
     unsigned flickMs{150};bool restDrop{true},dropOn{true};
@@ -136,8 +144,8 @@ struct Hinge {                           // pose thread -> input thread, one per
     V3 shiftM{};std::uint32_t source{};   // model-space translation (always zero: no shift); PivotSource
     V3 fwdG{};float pad1{};               // The barrel direction in the grip frame (the hand flick's "perpendicular to the barrel")
 };
-enum PivotSource : std::uint32_t {PivotGeometry=0,PivotTriggerBone=1,PivotProperty=2};
-inline constexpr std::array<const char*,3> pivotSourceNames{"GEOMETRY","TRIGGER_BONE","PROPERTY"};
+enum PivotSource : std::uint32_t {PivotGeometry=0,PivotTriggerBone=1,PivotProperty=2,PivotFinger=3};
+inline constexpr std::array<const char*,4> pivotSourceNames{"GEOMETRY","TRIGGER_BONE","PROPERTY","FINGER"};
 static_assert(sizeof(Hinge)%8==0);
 enum State : std::uint32_t {Off=0,Arming=1,OnFinger=2,Unhooked=3,Catching=4,Leaving=5};
 inline constexpr std::array<const char*,6> stateNames{"OFF","ARMING","ON_FINGER","UNHOOKED","CATCHING","LEAVING"};
@@ -299,7 +307,15 @@ struct PlacementIn {
     V3 handM{},muzzleM{},upM{0,1,0};     // model space: the hand bone point (inverse locator origin), the muzzle origin, the gun's up
     V3 fwdM{0,0,-1};                     // Model space barrel direction (authored muzzle locator -Z)
     float upm{1};                        // world units per metre
+    bool fingerPivot{},reference{};      // this model spins about the grip-frame finger point; this model teaches it (the Cattleman)
 };
+// the learned finger point per hand (grip frame, m): the reference model's pivot as held. Pose threads (benign float races).
+struct FingerRef {std::atomic<float> x{},y{},z{};std::atomic<bool> learned{};std::atomic<std::uint64_t> samples{};};
+inline std::array<FingerRef,2> fingerRefs{};
+inline V3 fingerPointFor(int hand) noexcept {
+    const auto& f=fingerRefs[std::size_t(hand&1)];
+    if(!config.fingerFixed&&f.learned.load(std::memory_order_relaxed))return V3{f.x.load(std::memory_order_relaxed),f.y.load(std::memory_order_relaxed),f.z.load(std::memory_order_relaxed)};
+    return hand==1?config.fingerRef:V3{-config.fingerRef[0],config.fingerRef[1],config.fingerRef[2]};}
 inline bool notePlacement(const PlacementIn& in) noexcept {
     if(in.hand<0||in.hand>1||!in.weapon||!TM::finite(in.model)||!TM::finite(in.map)||!sm::finiteQ(in.gripRot)){bump(stats.hingeRefused);return false;}
     M4 inv{};if(!TM::inverseUniform(in.map,inv)){bump(stats.hingeRefused);return false;}
@@ -310,6 +326,10 @@ inline bool notePlacement(const PlacementIn& in) noexcept {
     if(!TM::finite(fwd)||TM::length(fwd)<.5f)fwd=V3{0,0,-1};
     V3 pivotM{};std::uint32_t source=PivotGeometry;V3 trig{};
     if(config.pivotSet){pivotM=TM::mul(config.pivot,k);source=PivotProperty;}
+    else if(in.fingerPivot){ // the gun point under the finger point of the holding grip frame (inverse of toG below)
+        const Q q0=sm::qnorm(in.gripRot);const V3 l=TM::add(in.gripPos,sm::rot(q0,fingerPointFor(in.hand)));M4 minv{};
+        if(!TM::inverseUniform(in.model,minv)){bump(stats.hingeRefused);return false;}
+        pivotM=TM::xform(minv,TM::xform(in.map,l));source=PivotFinger;}
     else if(triggerFor(in.weapon,trig)){pivotM=TM::add(trig,TM::mul(TM::sub(TM::mul(fwd,config.trigOff[0]),TM::mul(up,config.trigOff[1])),k));source=PivotTriggerBone;}
     else pivotM=TM::sub(TM::add(in.handM,TM::mul(TM::sub(in.muzzleM,in.handM),.18f)),TM::mul(up,.015f*k));
     const Q q=sm::qnorm(in.gripRot);
@@ -324,6 +344,9 @@ inline bool notePlacement(const PlacementIn& in) noexcept {
     // entry on: the brain keeps the hinge of the entry frame); the gun turns through it about its own lateral axis
     const V3 guardG=toG(pivotM),fG=dirG(fwd);
     if(!TM::finite(guardG)||!TM::finite(fG)){bump(stats.hingeRefused);return false;}
+    if(in.reference&&source==PivotTriggerBone&&TM::length(guardG)<.25f){ // the Cattleman's finger point as held teaches the FINGER pivot
+        auto& f=fingerRefs[std::size_t(in.hand&1)];f.x.store(guardG[0],std::memory_order_relaxed);f.y.store(guardG[1],std::memory_order_relaxed);
+        f.z.store(guardG[2],std::memory_order_relaxed);f.learned.store(true,std::memory_order_relaxed);bump(f.samples);}
     const V3 fingerG=guardG;
     Hinge h{};h.weapon=in.weapon;h.generation=in.generation;h.hand=in.hand;
     h.pivotM=pivotM;h.axisM=axisM;h.upm=k;h.pivotG=guardG;h.axisG=aG;h.shiftM=V3{};h.source=source;h.fwdG=fG;
@@ -621,7 +644,7 @@ private:
             if(oNow||oRecent){touchNow=oNow;touchRecent=oRecent;touchHand=o;}
         }
         const bool on=touchNow||touchRecent||lightNow||lightRecent;
-        if(!on&&!failCounted_[h]){ // the field facts of a finger miss (report entries.lastFail*)
+        if(!on&&!failCounted_[h]){ // the facts of a finger miss (report entries.lastFail*)
             lastFailTrigger.store(trig,std::memory_order_relaxed);lastFailWindowMs.store(float(double(pub-from)*1e-6),std::memory_order_relaxed);
             lastFailTouchAgeMs.store(ageMs(tOn),std::memory_order_relaxed);lastFailLightAgeMs.store(ageMs(lOn),std::memory_order_relaxed);
             lastFailOtherTouchAgeMs.store(ageMs(tOther),std::memory_order_relaxed); // Both mappings logged
@@ -1022,6 +1045,8 @@ inline void startup() noexcept {
     parseV3(property("debug.rdrvr.vr.spin.pivot"),c.pivot,c.pivotSet);
     {bool s=false;parseV3(property("debug.rdrvr.vr.spin.com"),c.com,s);}
     {bool s=false;parseV3(property("debug.rdrvr.vr.spin.trigoff"),c.trigOff,s);}   // "fwd down 0" (m)
+    {bool s=false;V3 v{};parseV3(property("debug.rdrvr.vr.spin.fingerpt"),v,s); // FINGER pivot point "x y z" (cm, right-hand grip frame)
+        if(s&&TM::length(v)<20.f){c.fingerRef=TM::mul(v,.01f);c.fingerFixed=true;}}
     msv("debug.rdrvr.vr.spin.window",c.entryWindowMs,5000);
     // the flick entry, the push, "fully still", the drop exits
     real("debug.rdrvr.vr.spin.flickomega",c.flickOmega,1.f,30.f);real("debug.rdrvr.vr.spin.flickv",c.flickV,.2f,5.f);
@@ -1114,12 +1139,17 @@ inline std::string report() {
         out.pop_back(); // reopen the root object
         const int ps=pivotSourceSeen.load();TriggerBone tb{};{std::lock_guard lock(triggerMutex);tb=triggerBone;}
         std::snprintf(b,sizeof b,",\"pivot\":{\"source\":\"%s\",\"modelCm\":[%.1f,%.1f,%.1f],\"fingerGripCm\":[%.1f,%.1f,%.1f],\"shiftCm\":%.1f,"
-            "\"shiftClamped\":%llu,\"trigger\":{\"bone\":\"%s\",\"ok\":%s,\"reads\":%llu,\"found\":%llu,\"missing\":%llu}},"
+            "\"shiftClamped\":%llu,\"trigger\":{\"bone\":\"%s\",\"ok\":%s,\"reads\":%llu,\"found\":%llu,\"missing\":%llu},"
+            "\"finger\":{\"fixed\":%s,\"refCm\":[[%.1f,%.1f,%.1f],[%.1f,%.1f,%.1f]],\"learned\":[%s,%s],\"samples\":[%llu,%llu]}},"
             "\"physics\":{\"gravity\":%.2f,\"drive\":%.2f,\"visc\":%.2f,\"coul\":%.2f,\"maxOmega\":%.1f}}",
-            ps>=0&&ps<3?pivotSourceNames[unsigned(ps)]:"NONE",double(pivotModelCmX.load()),double(pivotModelCmY.load()),double(pivotModelCmZ.load()),
+            ps>=0&&ps<int(pivotSourceNames.size())?pivotSourceNames[unsigned(ps)]:"NONE",double(pivotModelCmX.load()),double(pivotModelCmY.load()),double(pivotModelCmZ.load()),
             double(fingerGCmX.load()),double(fingerGCmY.load()),double(fingerGCmZ.load()),double(pivotShiftCm.load()),
             (unsigned long long)shiftClamped.load(),tb.name,tb.ok?"true":"false",(unsigned long long)triggerReads.load(),
             (unsigned long long)triggerFound.load(),(unsigned long long)triggerMissing.load(),
+            config.fingerFixed?"true":"false",double(fingerPointFor(0)[0])*100.0,double(fingerPointFor(0)[1])*100.0,double(fingerPointFor(0)[2])*100.0,
+            double(fingerPointFor(1)[0])*100.0,double(fingerPointFor(1)[1])*100.0,double(fingerPointFor(1)[2])*100.0,
+            fingerRefs[0].learned.load()?"true":"false",fingerRefs[1].learned.load()?"true":"false",
+            (unsigned long long)fingerRefs[0].samples.load(),(unsigned long long)fingerRefs[1].samples.load(),
             double(config.gravity),double(config.drive),double(config.visc),double(config.coul),double(config.maxOmega));out+=b;}
     { // The flick entry / push / drop counters and the decision log (newest last; ageMs = now - the decision)
         out.pop_back();

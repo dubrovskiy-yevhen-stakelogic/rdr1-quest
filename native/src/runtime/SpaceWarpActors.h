@@ -20,6 +20,8 @@
 // Still / behind / off-screen are decided before any part math (boundBoneSteps / boundBoneBox); blocks with parts come
 // first and shape.w = rank: a part of any actor beats every root cylinder (a horse or pedestrian
 // listed first never hides a rider's / walker's parts).
+// Player body: race -3 = the player BODY (parts only: bones.z = -1, no root claim; no parts = no block); RIG part layouts (player body, horse
+// parts: rigPartLayout) are centred relative to their root (prepareBoneParts rootRel) and skip the cheap world bound.
 #include "SpaceWarpMath.h"
 #include "SpaceWarpBones.h"
 #include <array>
@@ -43,7 +45,19 @@ struct ActorSet {
     unsigned count{};
     std::array<ActorPose,maxActors> actor{};
     unsigned boneCount{},boneMode{};    // Actors with parts in the BoneSet of this serial; mode = debug.rdrvr.mvbones (0 off, 1 on, 2 pin)
+    // RIG map of this tick (vr/VrMotionBodyLink.h, only with debug.rdrvr.mvbody / .vr.riding.horseparts): VrBody hook A's OpenXR LOCAL ->
+    // world map of the frame these matrices belong to (rows a, b, c, d like ActorPose, scale included). SpaceWarp::prepareActorPair moves
+    // the rig actors' parts of this snapshot onto the DRAWN frame's rig: x' = worldFromLocal(pair) * inverse(rig) * x.
+    float rig[12]{};bool rigValid{};
+    unsigned rigParts{};                // BoneSet entries of rig actors (player body / horse parts): the pair loads the parts also when
+                                        // the previous snapshot has none / the same serial
 };
+// Synthetic rig actors (SpaceWarp::prepareActorPair): the player (race -2, root cylinder + the VR hands as parts) and the player BODY
+// (race -3, John's skeleton parts only: no root claim). Part layouts of the rig actors (SpaceWarpActors.h handPartLayout = 0xFFFF0001).
+inline constexpr std::uint32_t playerGuid=0xFFFFFF01u,playerBodyGuid=0xFFFFFF02u;
+inline constexpr std::uint32_t horsePartLayout=0xFFFF0002u,playerBodyLayout=0xFFFF0003u; // vr/VrRideSteadyLink.h horsePartLayout
+// Parts that ride the camera rig: centred / widened relative to the actor root (prepareBoneParts rootRel), no cheap world bound.
+inline bool rigPartLayout(std::uint32_t layout) noexcept {return layout==horsePartLayout||layout==playerBodyLayout;}
 // The parts of one main-thread tick. NOT part of ActorSet: an ActorSet travels BY VALUE through the render path (SpaceWarpFrame
 // -> GameStereoCapture slot -> SpaceWarpSource on the stack); 8 x 1.3 KB of parts would add ~10 KB to each of those copies on threads
 // whose stack size the engine chose. The channel keeps the last boneRing BoneSets by serial; SpaceWarp::produce copies the two it
@@ -83,8 +97,25 @@ inline ActorChannel actorChannel;
 // race 0 human, 1 horse (VrMelee / VrLasso sizesOf), anything else a generic animal.
 struct ActorShape {float radius,bottom,top;};
 inline ActorShape actorShape(std::int32_t race) noexcept {
-    if(race==-2)return ActorShape{0.75f,0.15f,2.00f}; // The PLAYER (synthetic, SpaceWarp::buildActors): arms' reach, ground excluded
+    if(race==-2)return ActorShape{0.75f,0.15f,2.00f}; // The PLAYER (synthetic, SpaceWarp::prepareActorPair): arms' reach, ground excluded
+    // The player BODY (synthetic, same root as the player = 1.5 m under the eyes): parts only (buildActorBlock: no root claim), so the
+    // bounding cylinder reaches the feet (running: ~0.2 m under the root; riding: the stirrups) without the root cylinder taking ground
+    if(race==-3)return ActorShape{0.05f,-2.00f,2.00f};
     return race==0?ActorShape{0.55f,0.10f,2.05f}:race==1?ActorShape{1.50f,0.12f,2.85f}:ActorShape{1.00f,0.06f,1.70f};
+}
+// A VR hand of one frame (GameXr spaceWarpFrame): the controller grip pose in engine world (rows a, b, c, d like ActorPose: orthonormal
+// basis + position, = worldFromLocal * grip) and the aim forward (world, unit). weapon = the hand holds a weapon (holsters holdHand /
+// phantomHand: the weapon's grip after the two-hand bend). The engine places the VR hands and the held weapon from the controller each
+// frame, not from any actor root, so the player block carries them as PARTS that move with the grip (SpaceWarp::prepareActorPair).
+struct SpaceWarpHand {float m[12]{};float forward[3]{};bool valid{},weapon{};};
+inline constexpr std::uint32_t handPartLayout=0xFFFF0001u;
+// The hand's capsule along the aim forward: an empty hand (palm + fingers) or hand + weapon (rifle stock behind the grip, barrel in
+// front; a pistol's capsule is longer than the pistol, but membership is 3D, so only surfaces within the radius of the axis are taken).
+inline BonePart handPart(const SpaceWarpHand& h,unsigned index,double upm) noexcept {
+    const double back=h.weapon?0.30:0.06,front=h.weapon?0.85:0.14,radius=h.weapon?0.12:0.10;
+    BonePart p{};std::memcpy(p.m,h.m,sizeof p.m);p.radius=float(radius*upm);p.spec=std::uint8_t(index);p.bone=std::uint16_t(index);
+    for(int i=0;i<3;++i){p.a[i]=float(h.m[9+i]-back*upm*h.forward[i]);p.b[i]=float(h.m[9+i]+front*upm*h.forward[i]);}
+    return p;
 }
 // Uniform block of the motion-vector pass (std140), one per eye at eyeStride. rect = engine-NDC
 // xmin, ymin, xmax, ymax; shape = r^2, bottom, top, 0 of the membership cylinder (with parts: the
@@ -191,12 +222,15 @@ inline unsigned buildActorBlock(const ActorEye& cur,const ActorEye& prev,double 
         const ActorBones* cb=cs&&a.bones>=0&&unsigned(a.bones)<cs->count&&unsigned(a.bones)<maxBoneActors&&cs->bones[unsigned(a.bones)].guid==a.guid?&cs->bones[unsigned(a.bones)]:nullptr;
         const ActorBones* pb=ps&&b->bones>=0&&unsigned(b->bones)<ps->count&&unsigned(b->bones)<maxBoneActors&&ps->bones[unsigned(b->bones)].guid==a.guid?&ps->bones[unsigned(b->bones)]:nullptr;
         const bool withParts=cb&&pb,rootStill=step<0.002&&cosA>0.999994;const double mid[3]{mx,my,mz}; // < 2 mm and < 0.2 deg
+        // RIG parts (player body / ridden horse): capsules centred relative to the root (rootRel = Mcur * inverse(Mprev) = inverse(d)); the
+        // cheap bound below is in world steps and does not hold for them, so they take the exact path only
+        const bool rigParts=withParts&&rigPartLayout(cb->layout);M4 rootRel{};const bool haveRootRel=rigParts&&invert(d,rootRel);
         // still / behind / off-screen are decided on a CHEAP bound (SpaceWarpBones.h boundBoneSteps / boundBoneBox, no inverse,
         // once per pair in the cache entry) before any part math, so no parts are prepared, emitted and thrown
         // away for the still / behind ones.
         PreparedParts* pp=withParts?(cache?&cache->entry[unsigned(a.bones)]:&local.emplace()):nullptr; // a.bones < maxBoneActors (checked above)
         bool bounded=false;
-        if(pp){if(!(pp->bGuid==a.guid&&pp->bCur==ca.serial&&pp->bPrev==pa.serial)){pp->bounded=boundBoneSteps(*cb,*pb,pp->bound);pp->bGuid=a.guid;pp->bCur=ca.serial;pp->bPrev=pa.serial;}
+        if(pp&&!rigParts){if(!(pp->bGuid==a.guid&&pp->bCur==ca.serial&&pp->bPrev==pa.serial)){pp->bounded=boundBoneSteps(*cb,*pb,pp->bound);pp->bGuid=a.guid;pp->bCur=ca.serial;pp->bPrev=pa.serial;}
             bounded=pp->bounded;}
         if(rootStill&&(!withParts||(!pin&&bounded&&pp->bound.step<0.002*upm))){                 // bound.step >= every exact part step
             t.boneStepM=pp?float(pp->bound.step/upm):0.f;if(countSkips)++st.still;done(ActorStill);continue;}
@@ -218,7 +252,7 @@ inline unsigned buildActorBlock(const ActorEye& cur,const ActorEye& prev,double 
         bool valid=false;double boundR=0,boundTop=0,boneStep=0;
         if(pp){BoneStats bs{};
             if(!(pp->guid==a.guid&&pp->cur==ca.serial&&pp->prev==pa.serial)){                    // first eye of this pair that needs it
-                prepareBoneParts(*cb,*pb,mid,padSteps,upm,*pp,bs,tight);pp->guid=a.guid;pp->cur=ca.serial;pp->prev=pa.serial;}
+                prepareBoneParts(*cb,*pb,mid,padSteps,upm,*pp,bs,tight&&!rigParts,haveRootRel?&rootRel:nullptr);pp->guid=a.guid;pp->cur=ca.serial;pp->prev=pa.serial;}
             valid=pp->valid;if(valid){boundR=pp->boundR;boundTop=pp->boundTop;boneStep=pp->maxStep;}
             if(countSkips){st.bones.actors+=bs.actors;st.bones.parts+=bs.parts;st.bones.unmatched+=bs.unmatched;st.bones.jump+=bs.jump;
                 st.bones.math+=bs.math;st.bones.maxStepM=std::max(st.bones.maxStepM,bs.maxStepM);}
@@ -234,13 +268,14 @@ inline unsigned buildActorBlock(const ActorEye& cur,const ActorEye& prev,double 
         if(vis==BoxClipped)++st.clipped;
         unsigned parts=0;
         if(valid){parts=emitBoneParts(*pp,base,prevView,out.bone+nb,maxGpuBones-nb);if(!parts&&countSkips)++st.bones.overflow;} // only for a written block
+        if(a.race==-3&&!parts){if(countSkips)++st.math;done(ActorMath);continue;} // the player body has no root claim: no parts = no block
         const M4 toLocal=mul(translation(-mx,-my,-mz),base);
         const M4 toPrev=mul(prevView,mul(d,base));
         auto& g=out.actor[n];bool finite=true;
         for(int k=0;k<16;++k){g.toLocal[k]=float(toLocal[k]);g.toPrev[k]=float(toPrev[k]);finite=finite&&std::isfinite(g.toLocal[k])&&std::isfinite(g.toPrev[k]);}
         if(!finite){if(countSkips)++st.math;done(ActorMath);continue;}
         std::memcpy(g.rect,rect,sizeof rect);g.shape[0]=float(boxR*boxR);g.shape[1]=float(bottom);g.shape[2]=float(boxTop);g.shape[3]=float(i);
-        g.bones[0]=float(nb);g.bones[1]=float(parts);g.bones[2]=float(radius*radius);g.bones[3]=float(top);
+        g.bones[0]=float(nb);g.bones[1]=float(parts);g.bones[2]=a.race==-3?-1.f:float(radius*radius);g.bones[3]=float(top); // -3: parts only
         t.block=int(n);t.bones=int(parts);done(ActorWritten);
         nb+=parts;++n;
     }

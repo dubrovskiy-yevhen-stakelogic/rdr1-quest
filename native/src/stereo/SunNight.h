@@ -14,6 +14,7 @@
 // Report graphics.shadowUpdate.sunNight; byState signature: SunStagger suffix "z" while the gate holds the sun shadows off
 // (_su7z at night, _su7 by day; _su<row>z when the property engages another row).
 #include "GameClock.h"
+#include "ShadowTimeline.h"
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -80,6 +81,7 @@ inline void readClock() noexcept {
 // Every RenderScene (VisibleTrims.h). nowNs = steady_clock ns. Returns the governed SUN SHADOWS flag for GraphicsDrawPolicy.
 inline bool sceneBegin(bool shadows,unsigned update,std::uint64_t nowNs) noexcept {
     auto& c=counters;c.scenes.fetch_add(1,std::memory_order_relaxed);lastSceneNs.store(nowNs,std::memory_order_relaxed);
+    shadowtimeline::tick(nowNs);shadowtimeline::bump(shadowtimeline::Frames);
     if(nowNs>=nextPollNs){
         nextPollNs=nowNs+1'000'000'000ull;
 #if defined(__ANDROID__)
@@ -92,7 +94,7 @@ inline bool sceneBegin(bool shadows,unsigned update,std::uint64_t nowNs) noexcep
     if(minute>=0)nightLatched=nightAt(unsigned(minute),nightLatched);
     const Decision d=decide(shadows,update,p,minute>=0,nightLatched);
     if(d.off!=off.load(std::memory_order_relaxed)){
-        c.switches.fetch_add(1,std::memory_order_relaxed);lastSwitchTo.store(d.off?1:0,std::memory_order_relaxed);
+        c.switches.fetch_add(1,std::memory_order_relaxed);lastSwitchTo.store(d.off?1:0,std::memory_order_relaxed);shadowtimeline::bump(shadowtimeline::SunFlip);
         lastSwitchMinute.store(minute,std::memory_order_relaxed);lastSwitchNs.store(nowNs,std::memory_order_relaxed);}
     off.store(d.off,std::memory_order_relaxed);state.store(int(d.state),std::memory_order_relaxed);
     c.byState[d.state].fetch_add(1,std::memory_order_relaxed);if(d.off)c.offScenes.fetch_add(1,std::memory_order_relaxed);

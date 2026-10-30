@@ -301,6 +301,10 @@ inline std::uint32_t nowMs() noexcept {
     return std::uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 #endif
 }
+// MAIN camera position published by DrawBig (< 2 s old), any thread; false = none / stale (ClothUpdateGate.h).
+inline bool freshMainCam(float (&out)[3]) noexcept {
+    const std::uint32_t ms=mainCamMs.load(std::memory_order_acquire);if(!ms||nowMs()-ms>=2000u)return false;
+    for(unsigned i=0;i<3;++i)out[i]=floatOf(mainCam[i].load(std::memory_order_relaxed));return true;}
 inline constexpr std::array<float,5> distEdges{6.f,14.f,24.f,40.f,80.f}; // engine LOD metric (metres for a human); 6 buckets
 inline unsigned distBucket(float m) noexcept {unsigned b=0;while(b<distEdges.size()&&!(m<distEdges[b]))++b;return b;}
 using Counter=std::atomic<std::uint64_t>;
@@ -361,7 +365,15 @@ struct CtxScope {const Ctx* saved;explicit CtxScope(const Ctx* c) noexcept:saved
 inline void drawBigCore(std::uintptr_t caller,void* node,void* dn,const void* type,const void* m1,const void* m2,const float* cam,
     const void* skel,void* hier,float f) {
     const Kind kind=Kind(live.kind.load(std::memory_order_relaxed));
-    if(kind==Kind::Off||!node||!type||!cam){originalDrawBig(node,dn,type,m1,m2,cam,skel,hier,f);return;}
+    if(kind==Kind::Off||!node||!type||!cam){
+        // CLOTH GATE (ClothUpdateGate.h) needs the MAIN camera even with the LOD policy off: publish it from the audited caller
+        // only (request = cam - 0x120, the Draw @0x2a79864 argument), at most once per ms per thread. Reads only; the draw is native.
+        if(kind==Kind::Off&&cam&&caller==engine+drawBigReturnOffset&&
+           ld<std::int32_t>(reinterpret_cast<std::uintptr_t>(cam)-requestFromCamera+requestType)==requestMain){
+            thread_local std::uint32_t last{~0u};const std::uint32_t now=nowMs();
+            if(now!=last){last=now;for(unsigned i=0;i<3;++i)mainCam[i].store(bitsOf(cam[i]),std::memory_order_relaxed);
+                mainCamMs.store(now,std::memory_order_release);}}
+        originalDrawBig(node,dn,type,m1,m2,cam,skel,hier,f);return;}
     {thread_local unsigned calls{};if(!(++calls&63u))bump(stats.drawBig,64);} // every DrawBig (sampled: no shared atomic per call)
     if(caller!=engine+drawBigReturnOffset){bump(stats.foreignDrawBig);originalDrawBig(node,dn,type,m1,m2,cam,skel,hier,f);return;}
     const int savedErrno=errno;

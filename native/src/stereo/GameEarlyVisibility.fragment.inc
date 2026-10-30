@@ -196,8 +196,8 @@ static bool earlyBegin(void* renderer,void* stock)noexcept {
             EarlyBinding::Setup setup{&boot,&rdr95::nativeResourceGate,&experimental::nativeEarlyListOwner,&effectMutationEpoch,
                 &coldOcclusionRegistry,sessionBinding.device,s.renderer,epoch,{s.renderer,epoch},buffer,
                 // The opaque route proves synchronous render activity only.
-                // Keep camera memo disabled until the deferred-worker audit
-                // also establishes exclusive access to this exact context.
+                // Camera memo stays disabled: exclusive access to this exact
+                // context is not established for deferred workers.
                 {&s,earlyGuarded,earlyFrozen,earlyCurrentPass,
                  ordinary?nullptr:earlyPrepareJoinedRead,ordinary?nullptr:earlyMatrixSetCurrent,earlyGeometryStorageCurrent,nullptr}};
             // One physical lifetime check for this exact short Read. Covered

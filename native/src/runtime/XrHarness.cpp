@@ -15,6 +15,7 @@
 // Theater anchor/display-validity adapted from MiamiVR Quest xr_vulkan_session.cpp.
 // Copyright (c) 2026 the MiamiVR Quest port contributors. MIT; see MiamiVR-Quest-LICENSE.txt.
 #include "XrHarness.h"
+#include <sys/system_properties.h>
 #include "vr/HandsPass.h"  // HANDS: XR-frame keyed controller pose ring (pushPose)
 #include "vr/VrHolsters.h" // HOLSTERS: menu freeze note + VR haptic pulses (VrHaptics.h)
 #include "vr/VrMelee.h"    // MELEE: XR-rate controller tape (pushSample)
@@ -22,7 +23,9 @@
 #include "vr/VrCutscene.h" // CUTSCENES: an engaged stereo cutscene shows the stereo layer like World
 #include "vr/VrHud.h"         // HUD: head / wrist quads of the game's HUD
 #include "vr/VrWelcome.h"      // WELCOME: first-steps message on the menu panel
+#include "vr/VrGameMsg.h"      // GAME MESSAGES: the game's help text on the stats quad
 #include "vr/VrInputRec.h"     // INPUT RECORD / REPLAY (debug.rdrvr.input.record / .replay): hooks after every OpenXR input call
+#include "vr/VrDeadEye.h"     // DEAD EYE FILTER: projection-layer colour scale while Dead Eye runs
 #ifdef RDRVR_HEAD_CAMERA
 #endif
 #include "GraphicsResolution.h"
@@ -33,7 +36,9 @@
 #include "diagnostics/PerformanceProfile.h"
 #include "GameTheater.h"
 #include "FramePacing.h"
-#include "HeatWarning.h" // heat01: OVERHEAT WARNING (red lines on the stats quad)
+#include "HeatWarning.h" // CLOCK NOTICE (two calm lines on the stats quad)
+#include "ModVersion.h"
+#include "diagnostics/PerfRecorder.h" // PERF RECORD: XR frame counts, menu edges, setting poll
 #include "contracts/SubmissionPolicy.h"
 #include <algorithm>
 #include <cstring>
@@ -50,7 +55,7 @@ bool stereoCutscene(const PresentationMailbox* m) noexcept {
     const auto now=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     const auto st=m->snapshot(now);
     return (st.context==PresentationContext::Cutscene||st.context==PresentationContext::CameraTransition||
-            (st.context==PresentationContext::CameraOverride&&::rdrvr::vr::cutscene::overrideLever.load(std::memory_order_relaxed)))&&
+            (st.context==PresentationContext::CameraOverride&&::rdrvr::vr::cutscene::overrideEligible()))&&
            ::rdrvr::vr::cutscene::engaged(st.revision,now);
 }
 // pdtMono of the XR frame whose predictedDisplayTime locateHands locates (XR thread; kept outside the
@@ -130,7 +135,9 @@ struct TimeConvert {
     }
 };
 TimeConvert timeConvert;
-// dynres01: XR_META_recommended_layer_resolution (enabled by GameXr G5, runtime::xrDynresEnabled; debug.rdrvr.dynres 0 = not requested).
+// The periodic layer / frame counter lines in logcat: debug.rdrvr.xr.heartbeat 1, read once. The report carries the same counters.
+bool xrHeartbeat() noexcept {static const bool on=[]{char v[PROP_VALUE_MAX]{};return __system_property_get("debug.rdrvr.xr.heartbeat",v)>0&&v[0]=='1';}();return on;}
+// XR_META_recommended_layer_resolution (enabled by GameXr, runtime::xrDynresEnabled; debug.rdrvr.dynres 0 = not requested).
 // Hypothesis: on Quest 3/3S the runtime grants GPU levels 5/6 on battery only to "dynamic resolution" apps -> query the recommendation
 // for the world projection layer once per XR frame that submits it and only REPORT it (runtime::xrDynres); never touches rendering.
 struct DynresQuery {
@@ -140,7 +147,7 @@ struct DynresQuery {
         PFN_xrVoidFunction f{};
         if(XR_SUCCEEDED(xrGetInstanceProcAddr(inst,"xrGetRecommendedLayerResolutionMETA",&f))&&f)fn=reinterpret_cast<PFN_xrGetRecommendedLayerResolutionMETA>(f);
         xrDynres.fn.store(fn?1:0,std::memory_order_relaxed);
-        __android_log_print(ANDROID_LOG_INFO,"RdrVrXR","dynres01 xrGetRecommendedLayerResolutionMETA %s",fn?"resolved":"MISSING");
+        __android_log_print(ANDROID_LOG_INFO,"RdrVrXR","dynres xrGetRecommendedLayerResolutionMETA %s",fn?"resolved":"MISSING");
     }
     void query(XrSession session,const XrCompositionLayerProjection& layer,XrTime time) noexcept {
         if(!fn||!session||time<=0)return;
@@ -154,7 +161,7 @@ struct DynresQuery {
         if(XR_FAILED(result))t.fail.fetch_add(1,r);
         else{t.ok.fetch_add(1,r);t.valid.store(out.isValid?1:0,r);if(out.isValid)t.validFrames.fetch_add(1,r);
              t.w.store(out.recommendedImageDimensions.width,r);t.h.store(out.recommendedImageDimensions.height,r);}
-        if(!logged){logged=true;__android_log_print(ANDROID_LOG_INFO,"RdrVrXR","dynres01 first query result=%d valid=%u recommended=%dx%d",
+        if(!logged){logged=true;__android_log_print(ANDROID_LOG_INFO,"RdrVrXR","dynres first query result=%d valid=%u recommended=%dx%d",
             int(result),unsigned(out.isValid),out.recommendedImageDimensions.width,out.recommendedImageDimensions.height);}
     }
 };
@@ -273,7 +280,7 @@ void XrHarness::initializeBorrowed(XrInstance instance,XrSystemId system,const V
     auto binding=gpu_.binding();
     XrSessionCreateInfo create{XR_TYPE_SESSION_CREATE_INFO};create.next=&binding;create.systemId=system_;
     checkXr(xrCreateSession(instance_,&create,&session_),"create game-device XR session");
-    dynresQuery.resolve(instance_); // dynres01: game instance (GameXr G5); nothing when the extension is not enabled
+    dynresQuery.resolve(instance_); // Game instance (GameXr); nothing when the extension is not enabled
     performance_.initialize(instance_,session_,performanceSupport_);
     configureThreads(performance_,instance_,session_,performanceSupport_.threads);
     XrReferenceSpaceCreateInfo space{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
@@ -367,7 +374,7 @@ void XrHarness::events() {
             const bool focus=state_==XR_SESSION_STATE_FOCUSED;
             if(focus!=focused_ && !::rdrvr::vr::inputrec::ignoreLive()) invalidateTracking(); // While replaying, the recorded focus rules
             focused_=focus;
-            gpuBoost.setSession(state_==XR_SESSION_STATE_VISIBLE||state_==XR_SESSION_STATE_FOCUSED); // boost01: 0 while not shown
+            gpuBoost.setSession(state_==XR_SESSION_STATE_VISIBLE||state_==XR_SESSION_STATE_FOCUSED); // 0 while not shown
             __android_log_print(ANDROID_LOG_INFO,"RdrVrXR","session_state=%d epoch=%llu",state_,static_cast<unsigned long long>(tracking_.epoch));
             if(state_==XR_SESSION_STATE_READY && !running_) {
                 XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO}; begin.primaryViewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -755,25 +762,28 @@ void XrHarness::frame() {
     if(perfOverlayEnabled_&&rendered)try{
         const auto now=diagnostics::monotonicNs();const diagnostics::PerfPanel* update=nullptr;
         if(graphicsMenu_.takeDirty())perfOverlay_.requestUpdate();
-        if(heatWarning.takeRedraw())perfOverlay_.requestUpdate(); // heat01: show / hide the red lines now, not at the next 2 Hz slot
+        if(heatWarning.takeRedraw())perfOverlay_.requestUpdate(); // Show / hide the notice now, not at the next 2 Hz slot
         const bool menuOpen=graphicsMenu_.open();
         if(::rdrvr::vr::welcome::frame(gameStereo,now))perfOverlay_.requestUpdate();
         const bool welcomeOn=!menuOpen&&::rdrvr::vr::welcome::active();
         {static bool wasWelcome{};if(wasWelcome!=welcomeOn){wasWelcome=welcomeOn;perfOverlay_.requestUpdate();}}
         const auto profilerMode=graphicsSettings.profilerMode();
         const bool fpsOnly=profilerMode==GraphicsSettings::ProfilerMode::Fps;
-        // heat01 OVERHEAT WARNING (HeatWarning.h): the red lines do not depend on PROFILER - under the FPS line, alone (heatOnly) when
+        // CLOCK NOTICE (HeatWarning.h): the lines do not depend on PROFILER - under the FPS line, alone (heatOnly) when
         // the readout is off, on top of DETAIL; never over the open menu.
-        static_assert(diagnostics::PerfPanel::red=='\x01'&&HeatWarning::panelText[0]==diagnostics::PerfPanel::red);
         const bool heat=!menuOpen&&heatWarning.shown();
-        const bool heatOnly=heat&&!fpsOnly&&!diagnostics::profilingEnabled();
+        // GAME MESSAGES (vr/VrGameMsg.h): the same way, under the notice lines; not over the menu or the welcome panel
+        namespace msgs=::rdrvr::vr::gamemsg;
+        if(msgs::frame(now,::rdrvr::vr::settings().gameMessages(),!menuOpen&&!welcomeOn))perfOverlay_.requestUpdate();
+        const bool msg=!menuOpen&&!welcomeOn&&msgs::visible();
+        const bool heatOnly=(heat||msg)&&!fpsOnly&&!diagnostics::profilingEnabled();
         if(menuOpen&&perfOverlay_.due(now)){
             const auto pairs=diagnostics::stereoHistory.recent("CAPTURED",now);
             perfPixels_->draw(graphicsMenu_.pageText(pairs.hz,performance_.displayHz(),pairs.width,pairs.height));update=perfPixels_.get(); // GRAPHICS / VR / CHEATS
         }else if(welcomeOn&&perfOverlay_.due(now)){
-            perfPixels_->draw(::rdrvr::vr::welcome::text);update=perfPixels_.get();
+            char welcomeText[1024];::rdrvr::vr::welcome::compose(welcomeText,sizeof welcomeText);perfPixels_->draw(welcomeText);update=perfPixels_.get(); // Boost state re-read on every redraw (2 Hz)
         }else if(!menuOpen&&!welcomeOn&&(fpsOnly||heatOnly)&&perfOverlay_.due(now)){
-            char text[128];int n=0; // heat01: + the red lines (was text[32], FPS only)
+            char text[128+msgs::panelChars];int n=0; // FPS line + the notice lines + the game's message
             if(fpsOnly){
             const auto pairs=diagnostics::stereoHistory.recent("CAPTURED",now);
             const char* tag=framePacer.overlayTag(); // ADAPTIVE level ("36A" / "24A"), 12 glyphs fit the 156 px crop
@@ -781,7 +791,8 @@ void XrHarness::frame() {
             else n=std::snprintf(text,sizeof text,"-- FPS");
             }
             n=n<0?0:std::min(n,int(sizeof text)-1);text[n]=0;
-            if(heat)std::snprintf(text+n,sizeof text-std::size_t(n),"%s%s",n?"\n":"",HeatWarning::panelText); // heat01
+            if(heat){const int w=std::snprintf(text+n,sizeof text-std::size_t(n),"%s%s",n?"\n":"",HeatWarning::panelText);n=std::min(n+std::max(w,0),int(sizeof text)-1);}
+            if(msg)std::snprintf(text+n,sizeof text-std::size_t(n),"%s%s",n?"\n":"",msgs::lines());
             perfPixels_->draw(text);update=perfPixels_.get();
         }else if(!menuOpen&&diagnostics::profilingEnabled()&&perfOverlay_.due(now)){
             const auto pairs=diagnostics::stereoHistory.recent("CAPTURED",now);
@@ -812,11 +823,7 @@ void XrHarness::frame() {
             char renderLoad[24];const auto load=diagnostics::renderThreadLoad.snapshot(now);
             if(load.valid)std::snprintf(renderLoad,sizeof(renderLoad),"%.0f%%",load.percent);else std::snprintf(renderLoad,sizeof(renderLoad),"N/A");
             const auto rateState=fragmentRateReadiness.load(std::memory_order_relaxed);
-#ifdef RDRVR_HEAD_CAMERA
-            constexpr const char* displayVersion="0.1.1";
-#else
-            constexpr const char* displayVersion="0.1.1";
-#endif
+            constexpr const char* displayVersion=modVersion; // ModVersion.h
             char descriptorReuse[40];
 #ifdef RDRVR_HEAD_CAMERA
             const auto ds=engine::dynamicUniformDescriptors.snapshot();
@@ -860,7 +867,8 @@ void XrHarness::frame() {
             std::snprintf(cull,sizeof(cull),"CULL N/A");
 #endif
             const char* tag=framePacer.overlayTag();char xrLine[48];std::snprintf(xrLine,sizeof xrLine,*tag?"XR %.1f HZ %s":"XR %.1f HZ",xrHz,tag);
-            char text[1600];const int heatN=heat?std::max(0,std::snprintf(text,sizeof text,"%s\n",HeatWarning::panelText)):0; // heat01: red lines on top
+            char text[1600+msgs::panelChars];int heatN=heat?std::max(0,std::snprintf(text,sizeof text,"%s\n",HeatWarning::panelText)):0; // The notice lines on top
+            if(msg)heatN+=std::max(0,std::snprintf(text+heatN,sizeof text-std::size_t(heatN),"%s\n",msgs::lines()));
             std::snprintf(text+heatN,sizeof(text)-std::size_t(heatN),
                 "RDR VR %s - %s %s\nDETAILED LOG ON\nNEW %.1f FPS   %s\nEYE %uX%u REC %uX%u DRS %s AGE %.0f MS\nEXTRA WALL %.1f MS CPU %s MS\nSCENE CPU %.1f MS /36FPS BUDGET 27.8\nLEFT  DEPTH %.1f COLOR %.1f MS CPU\nRIGHT DEPTH %.1f COLOR %.1f MS CPU\n%s\n%s\nRENDER THREAD %s - 100%% IS 1 THREAD\nAPP CPU %s CORES RSS PEAK %llu MB\nDEVICE GPU %s CPU AVG %s MAX %s DS %s\nDROP %.0f%% LAST %.30s\nDISPLAY %.0f /72 HZ HINT CPU %s GPU %s VRS %s",
                 displayVersion,gameStereo?"STEREO":"THEATER",primary?"MAIN+RIGHT":"REPLAY2",pairs.hz,xrLine,pairs.width,pairs.height,resolutionTelemetry.recommendedWidth.load(),resolutionTelemetry.recommendedHeight.load(),drs,pairs.ageNs/1e6,
@@ -870,25 +878,27 @@ void XrHarness::frame() {
             perfPixels_->draw(text);update=perfPixels_.get();perfStamp_=now;perfFrame_=frame_;
         }
         statsReady=perfOverlay_.pump(now,update,hudSpace_,stats);
-        // (user: the eyes had to look up a lot): 0.95 -> 0.78 m wide, centre 0.10 m below eye level (top edge ~9 deg up, was ~17)
+        // 0.78 m wide, centre 0.10 m below eye level (top edge ~9 deg up), so the eyes do not have to look up a lot
         if(menuOpen||welcomeOn){stats.pose.position={0,-0.10f,-1.1f};stats.size={0.78f,0.78f*diagnostics::PerfPanel::height/diagnostics::PerfPanel::width};}
         if(!menuOpen&&!welcomeOn&&(fpsOnly||heatOnly)){
             // Crop the same persistent overlay to one text line; retain glyph size.
-            // heat01: + the red lines (or those alone): the crop grows right / down from the FPS readout's top-left corner, so the
-            // FPS text never moves (w 156, h 38 = the old quad exactly: centre -0.30, 0.24 as pump() places it).
+            // + the notice lines (or those alone): the crop grows right / down from the FPS readout's top-left corner, so the
+            // FPS text never moves (w 156, h 38 = the FPS-only quad: centre -0.30, 0.24 as pump() places it).
             constexpr float W=float(diagnostics::PerfPanel::width);
-            const unsigned w=heat?std::max(156u,HeatWarning::cropWidth):156u,h=heat?HeatWarning::cropHeight(HeatWarning::panelLines+(fpsOnly?1u:0u)):38u;
+            const unsigned noteLines=(heat?HeatWarning::panelLines:0u)+(msg?msgs::lineCount():0u);
+            const unsigned w=std::max({156u,heat?HeatWarning::cropWidth:0u,msg?12u+12u*msgs::longest():0u}),h=noteLines?HeatWarning::cropHeight(noteLines+(fpsOnly?1u:0u)):38u;
             stats.subImage.imageRect.extent={int(w),int(h)};
             stats.size={0.70f*float(w)/W,0.70f*float(h)/W};
             stats.pose.position.x=-0.30f-0.35f*156/W+0.5f*stats.size.width;stats.pose.position.y=0.24f+0.35f*38/W-0.5f*stats.size.height;
         }
-        if(!menuOpen&&!welcomeOn&&!graphicsSettings.fpsVisible()&&!heat)statsReady=false; // heat01: the warning shows with the readout OFF
+        if(!menuOpen&&!welcomeOn&&!graphicsSettings.fpsVisible()&&!heat&&!msg)statsReady=false; // The notice shows with the readout OFF; the game's message too
     }catch(const std::exception& e){perfOverlayEnabled_=false;__android_log_print(ANDROID_LOG_WARN,"RdrVrXR","stats disabled: %s",e.what());}
-    std::array<const XrCompositionLayerBaseHeader*,6> submittedLayers{};unsigned layerCount=0; // + HUD head / wrist / map quads
+    std::array<const XrCompositionLayerBaseHeader*,7> submittedLayers{};unsigned layerCount=0; // + HUD head / wrist / map / ammo quads
     if(rendered){submittedLayers[layerCount++]=submitted;if(hudRendered)submittedLayers[layerCount++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud);
         if(gameStereo&&vrHud.headValid)submittedLayers[layerCount++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&vrHud.head);
         if(gameStereo&&vrHud.wristValid)submittedLayers[layerCount++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&vrHud.wrist);
         if(gameStereo&&vrHud.mapValid)submittedLayers[layerCount++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&vrHud.map);
+        if(gameStereo&&vrHud.ammoValid)submittedLayers[layerCount++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&vrHud.ammo);
         if(statsReady)submittedLayers[layerCount++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&stats);}
     // TELEPORT BLINK: XR_KHR_composition_layer_color_scale_bias (a, a, a, 1) on EVERY submitted layer while a fade
     // runs - the projection (in front of SHARPEN's settings struct), the theater / cinema fall-through (never a bright flat screen mid-blink),
@@ -897,15 +907,27 @@ void XrHarness::frame() {
     namespace tf=::rdrvr::vr::tploco::fade;
     const auto blinkNs=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     const auto blink=tf::xrFrame(blinkNs,!presentation_||presentationGate_.world());
-    std::array<XrCompositionLayerColorScaleBiasKHR,6> blinkScale{}; // One per submitted layer
+    std::array<XrCompositionLayerColorScaleBiasKHR,7> blinkScale{}; // One per submitted layer
     XrCompositionLayerColorScaleBiasKHR wristScale{XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR}; // Opaque wrist minimap
-    if(gameStereo&&vrHud.wristValid&&!blink.active&&tf::extensionEnabled.load(std::memory_order_relaxed)==1&&vrHud.wristAlphaScale>1.001f){
+    if(gameStereo&&vrHud.wristValid&&!blink.active&&tf::extensionEnabled.load(std::memory_order_relaxed)==1&&std::fabs(vrHud.wristAlphaScale-1.f)>.001f){ // x2 opacity x reveal fade
         const float k=vrHud.wristAlphaScale;wristScale.colorScale={k,k,k,k};wristScale.colorBias={0,0,0,0};wristScale.next=vrHud.wrist.next;vrHud.wrist.next=&wristScale;}
     if(blink.active&&tf::extensionEnabled.load(std::memory_order_relaxed)==1)for(unsigned i=0;i<layerCount;++i){
         auto* base=const_cast<XrCompositionLayerBaseHeader*>(submittedLayers[i]);auto& sc=blinkScale[i];
         sc.type=XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR;sc.colorScale={blink.alpha,blink.alpha,blink.alpha,1.f};sc.colorBias={0,0,0,0};
         sc.next=base->next;base->next=&sc;
         if(submittedLayers[i]==reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cinema))::rdrvr::vr::tploco::linkBump(tf::stats.cinemaDuringFade);
+    }
+    // DEAD EYE FILTER (vr/VrDeadEye.h): the game's sepia post FX never reaches the eyes, so while Dead Eye runs the projection layer
+    // gets a warm colour scale / bias (same extension as the blink; never during a blink, never on the HUD quads / theater / menu stats).
+    XrCompositionLayerColorScaleBiasKHR deadEyeScale{XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR};
+    if(!blink.active&&gameStereo&&rendered&&submitted==reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)&&
+       tf::extensionEnabled.load(std::memory_order_relaxed)==1){
+        namespace de=::rdrvr::vr::deadeye;
+        if(const float a=de::tintAlpha(blinkNs);a>.001f){
+            float s[3],b[3];de::tintScaleBias(a,s,b);
+            deadEyeScale.colorScale={s[0],s[1],s[2],1.f};deadEyeScale.colorBias={b[0],b[1],b[2],0.f};
+            deadEyeScale.next=layer.next;layer.next=&deadEyeScale;de::bump(de::tintFrames);
+        }
     }
     end.layerCount=layerCount;end.layers=layerCount?submittedLayers.data():nullptr;
     workTiming.finish();
@@ -916,7 +938,7 @@ void XrHarness::frame() {
     // The next eye images are acquired + waited now, in the idle time before xrWaitFrame, not between the next latch and xrEndFrame
     if(gameStereo&&stereo_)try{stereo_->prefetchImages();}catch(const std::exception& e){__android_log_print(ANDROID_LOG_ERROR,"RdrVrXR","stereo prefetch failed: %s",e.what());}
     const auto endDone=diagnostics::monotonicNs();
-    // dynres01: the projection layer exactly as submitted (still in scope), after xrEndFrame + prefetch so it never delays the frame and stays out
+    // The projection layer exactly as submitted (still in scope), after xrEndFrame + prefetch so it never delays the frame and stays out
     // of endUs; once per XR frame that submitted it (world stereo; the standalone diagnostic never has the extension). Result ignored.
     if(rendered&&submitted==reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer))dynresQuery.query(session_,layer,frameState.predictedDisplayTime);
     ir::frameEnd(gameStereo,!presentation_||presentationGate_.world()); // Commit this frame's inputs; record / replay start at the first world stereo frame
@@ -936,7 +958,9 @@ void XrHarness::frame() {
      if(gameStereo)presentState.lastPair=presentedPair;
      {const auto fnow=diagnostics::monotonicNs(); // Flight recorder (1 Hz row; the overlay FPS value is sampled only when a row is due)
       const float fps=framePacer.flightDue(fnow)?float(diagnostics::stereoHistory.recent("CAPTURED",fnow).hz):-1.f;
-      framePacer.flightTick(fnow,gameStereo,newPair,gameStereo&&mailboxAsked&&!newPair,fps,spaceWarpControl.synthesizing());}
+      framePacer.flightTick(fnow,gameStereo,newPair,gameStereo&&mailboxAsked&&!newPair,fps,spaceWarpControl.synthesizing());
+      diagnostics::perfrec::xrFrame(::rdrvr::vr::settings().perfRecord(),gameStereo,newPair,gameStereo&&mailboxAsked&&!newPair, // PERF RECORD
+          spaceWarpControl.synthesizing(),::rdrvr::vr::menuOpen.load(std::memory_order_relaxed));}
      const LayerKind kind=gameStereo?(stale?LayerKind::StereoStale:newPair?LayerKind::StereoNew:LayerKind::StereoRepeat):gameFrame?LayerKind::Theater:diagnostic?LayerKind::Diagnostic:LayerKind::None;
      XrFrameRecord r{};r.frame=frame_;r.wakeNs=wake;r.pdtNs=pdtMono>0?pdtMono:std::int64_t(frameState.predictedDisplayTime);
      r.waitUs=toUs(wake-waitBegin);r.workUs=toUs(endBegin>wake?endBegin-wake:0);r.endUs=toUs(endDone>endBegin?endDone-endBegin:0);
@@ -959,8 +983,8 @@ void XrHarness::frame() {
     if(gameFrame)++theaterFrames_;
     if(gameStereo)++worldStereoLayers_;
     if(hudRendered)++hudLayers_;
-    if(frame_%300==0)__android_log_print(ANDROID_LOG_INFO,"RdrVrXR","layers=%llu theater=%llu should0=%llu invalidViews=%llu flags=0x%llx",static_cast<unsigned long long>(layerFrames_),static_cast<unsigned long long>(theaterFrames_),static_cast<unsigned long long>(shouldNotRender_),static_cast<unsigned long long>(invalidViews_),static_cast<unsigned long long>(viewFlags_));
-    if(frame_%300==0) __android_log_print(ANDROID_LOG_INFO,"RdrVrXR","xr_frames=%llu new_pairs=%llu tracking_epoch=%llu space_epoch=%llu focused=%d",static_cast<unsigned long long>(frame_),static_cast<unsigned long long>(pairs_),static_cast<unsigned long long>(tracking_.epoch),static_cast<unsigned long long>(spaceEpoch_),focused_);
+    if(frame_%300==0&&xrHeartbeat())__android_log_print(ANDROID_LOG_INFO,"RdrVrXR","layers=%llu theater=%llu should0=%llu invalidViews=%llu flags=0x%llx",static_cast<unsigned long long>(layerFrames_),static_cast<unsigned long long>(theaterFrames_),static_cast<unsigned long long>(shouldNotRender_),static_cast<unsigned long long>(invalidViews_),static_cast<unsigned long long>(viewFlags_));
+    if(frame_%300==0&&xrHeartbeat())__android_log_print(ANDROID_LOG_INFO,"RdrVrXR","xr_frames=%llu new_pairs=%llu tracking_epoch=%llu space_epoch=%llu focused=%d",static_cast<unsigned long long>(frame_),static_cast<unsigned long long>(pairs_),static_cast<unsigned long long>(tracking_.epoch),static_cast<unsigned long long>(spaceEpoch_),focused_);
 }
 XrHarness::~XrHarness() {
     ::rdrvr::vr::inputrec::sessionEnd(); // The final chunk goes to the writer (detached thread; fflush per chunk)

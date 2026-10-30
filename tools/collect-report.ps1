@@ -25,6 +25,7 @@ $script:PlatformTools = @{
 }
 $script:ReportFiles = @('vulkan-trace.json', 'flight.json', 'graphics.cfg', 'vr.cfg', 'weapons.cfg')
 $script:MaxSessionFiles = 6
+$script:MaxProfileFiles = 3
 $script:DeviceProperties = @(
     'ro.product.model', 'ro.product.device', 'ro.product.manufacturer',
     'ro.build.fingerprint', 'ro.build.display.id', 'ro.build.version.incremental'
@@ -406,6 +407,22 @@ try {
             Where-Object { $_ -cmatch '^session-[A-Za-z0-9_.-]+\.json$' } | Sort-Object -Descending |
             Select-Object -First $script:MaxSessionFiles)
         foreach ($name in $sessionNames) { $remoteFiles.Add("trace-runs/$name") }
+    }
+    # PERF RECORD (menu HUD > PERF RECORD): the newest profiles (tools/perf_profile.py summarizes them).
+    $profiles = Invoke-Adb -Arguments @('shell', 'ls', '-1', "$($script:RemoteSettingsRoot)/profiles")
+    if ($profiles.ExitCode -eq 0) {
+        $profileNames = @($profiles.Lines | ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -cmatch '^profile-[0-9-]+\.csv$' } | Sort-Object -Descending |
+            Select-Object -First $script:MaxProfileFiles)
+        foreach ($name in $profileNames) { $remoteFiles.Add("profiles/$name") }
+    }
+    # Menu > SAVE LOG: the reports the player saved on the headset.
+    $savedLogs = Invoke-Adb -Arguments @('shell', 'ls', '-1', "$($script:RemoteSettingsRoot)/saved-logs")
+    if ($savedLogs.ExitCode -eq 0) {
+        $savedNames = @($savedLogs.Lines | ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -cmatch '^log-[0-9-]+\.json$' } | Sort-Object -Descending |
+            Select-Object -First $script:MaxProfileFiles)
+        foreach ($name in $savedNames) { $remoteFiles.Add("saved-logs/$name") }
     }
     foreach ($relative in $remoteFiles) {
         $remote = "$($script:RemoteSettingsRoot)/$relative"

@@ -99,10 +99,10 @@ struct Hit {V3 point{},normal{};float distance{},fraction{};bool normalValid{};s
             std::uintptr_t instance{};    // phIntersection +0x00: borrowed, COMPARE-ONLY, never dereferenced, never kept past the tick
             std::uint16_t levelIndex{};}; // +0x08 (pre-filled 0xffff; meaning [H])
 enum class ProbeResult : std::uint8_t {Clear,Hit,NoBudget,Failed};  // Failed = engine refused / saturated / invalid: NEVER "clear"
-enum class ProbeUser : std::uint8_t {Laser,ThrowFlight,Teleport,Lasso,Debug,Commit,Validate,Reload,Count};
+enum class ProbeUser : std::uint8_t {Laser,ThrowFlight,Teleport,Lasso,Debug,Commit,Validate,Reload,Throwable,Count}; // THROWABLE: the aim arc (VrThrowableTick.h)
 inline constexpr unsigned probeUsers=unsigned(ProbeUser::Count);
-inline constexpr std::array<const char*,probeUsers> probeUserNames{"LASER","THROW_FLIGHT","TELEPORT","LASSO","DEBUG","COMMIT","VALIDATE","RELOAD"};
-inline constexpr bool softUser(ProbeUser u) noexcept {return u==ProbeUser::Laser||u==ProbeUser::Teleport||u==ProbeUser::Lasso||u==ProbeUser::Debug;}
+inline constexpr std::array<const char*,probeUsers> probeUserNames{"LASER","THROW_FLIGHT","TELEPORT","LASSO","DEBUG","COMMIT","VALIDATE","RELOAD","THROWABLE"};
+inline constexpr bool softUser(ProbeUser u) noexcept {return u==ProbeUser::Laser||u==ProbeUser::Teleport||u==ProbeUser::Lasso||u==ProbeUser::Debug||u==ProbeUser::Throwable;}
 inline constexpr bool hardUser(ProbeUser u) noexcept {return u==ProbeUser::ThrowFlight||u==ProbeUser::Validate||u==ProbeUser::Reload;}
 
 namespace detail {
@@ -862,7 +862,7 @@ inline std::string report() {
         acc?double(u64(ts.shownToCommittedUmSum))/double(acc)/1e4:0.0,double(u64(ts.shownToCommittedUmMax))/1e4,
         (unsigned long long)u64(ts.rejectedAfterShownValid),(unsigned long long)u64(ts.cancelled),(unsigned long long)u64(ts.expired));o+=b;
     o+=",\"channels\":[";
-    constexpr std::array<ProbeUser,hs::arcChannels> channelUser{ProbeUser::Lasso,ProbeUser::Teleport,ProbeUser::Count,ProbeUser::Debug,ProbeUser::Count}; // THROW / MARKER: no probes
+    constexpr std::array<ProbeUser,hs::arcChannels> channelUser{ProbeUser::Lasso,ProbeUser::Teleport,ProbeUser::Throwable,ProbeUser::Debug,ProbeUser::Count}; // MARKER: no probes
     for(unsigned c=0;c<hs::arcChannels;++c){
         const auto st=hs::arcChannelStats(hs::ArcChannel(c));const auto u=channelUser[c];
         std::snprintf(b,sizeof b,"%s{\"name\":\"%s\",\"published\":%llu,\"cleared\":%llu,\"hidden\":%llu,\"wrongThread\":%llu,\"rejected\":%llu,\"budgetStarved\":%llu}",

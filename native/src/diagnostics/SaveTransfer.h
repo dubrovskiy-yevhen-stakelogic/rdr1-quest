@@ -67,17 +67,20 @@ inline void run() noexcept {
 #endif
         const int savedErrno=errno;
         const std::string base=rdrvrDir;mkdir((base+"/save-export").c_str(),0770);
-        std::FILE* log=std::fopen((base+"/save-transfer.log").c_str(),"a");
+        const std::string logPath=base+"/save-transfer.log";
+        // Appended at every launch: starts over past 256 KB
+        struct stat logInfo{};const bool logFull=stat(logPath.c_str(),&logInfo)==0&&logInfo.st_size>256*1024;
+        std::FILE* log=std::fopen(logPath.c_str(),logFull?"w":"a");
         const auto say=[&](const char* what,const std::string& a,const char* result){if(log){std::fprintf(log,"%s %s %s\n",what,a.c_str(),result);std::fflush(log);}};
         const long long now=(long long)std::time(nullptr);
-        if(log)std::fprintf(log,"=== %lld save01 start\n",now);
+        if(log)std::fprintf(log,"=== %lld save transfer start\n",now);
         std::string root;std::vector<Found> found;unsigned dirs=0;
         for(const char* r:dataDirs){struct stat st{};if(stat(r,&st)==0&&S_ISDIR(st.st_mode)){root=r;break;}}
         if(root.empty()){say("root","-","NOT FOUND");if(log)std::fclose(log);errno=savedErrno;return;}
         walk(root,"",0,found,dirs);
         std::sort(found.begin(),found.end(),[](const Found& a,const Found& b){return a.rel<b.rel;});
         if(std::FILE* list=std::fopen((base+"/save-files.txt").c_str(),"w")){
-            std::fprintf(list,"# save01 %lld root %s dirs %u files %zu\n",now,root.c_str(),dirs,found.size());
+            std::fprintf(list,"# save list %lld root %s dirs %u files %zu\n",now,root.c_str(),dirs,found.size());
             for(const auto& f:found)std::fprintf(list,"%s\t%lld\t%lld\n",f.rel.c_str(),f.size,f.mtime);
             std::fclose(list);
         }
@@ -90,8 +93,8 @@ inline void run() noexcept {
                 std::string targetRel;for(const auto& f:found)if(flat(f.rel)==name){targetRel=f.rel;break;}
                 if(targetRel.empty()){
                     if(found.empty()){say("import",name,"SKIPPED (no save dir known)");continue;}
-                    // a NEW file goes to its own flattened path ("files__RDR2SAVE1.SAV" -> files/RDR2SAVE1.SAV); before, it
-                    // landed next to the first save under its flat name (files/files__RDR2SAVE1.SAV, never read by the game).
+                    // a NEW file goes to its own flattened path ("files__RDR2SAVE1.SAV" -> files/RDR2SAVE1.SAV), not next to
+                    // the first save under its flat name (files/files__RDR2SAVE1.SAV, which the game never reads).
                     for(std::size_t i=0;i<name.size();++i){if(i+1<name.size()&&name[i]=='_'&&name[i+1]=='_'){targetRel+='/';++i;}else targetRel+=name[i];}
                     say("import",name+" -> "+targetRel,"NEW FILE");
                 }
@@ -111,7 +114,7 @@ inline void run() noexcept {
             }
             closedir(d);
         }
-        if(log){std::fprintf(log,"=== save01 end (%zu saves)\n",found.size());std::fclose(log);}
+        if(log){std::fprintf(log,"=== save transfer end (%zu saves)\n",found.size());std::fclose(log);}
         errno=savedErrno;
     }catch(...){}
 }

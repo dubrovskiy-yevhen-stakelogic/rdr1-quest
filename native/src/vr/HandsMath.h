@@ -245,6 +245,9 @@ struct WeaponFrame {
     Mat4 map{};                      // LOCAL metres -> world of that placement (uniform scale = unitsPerMetre)
     Vec3 muzzle{},direction{};       // world, direction unit
     float laserMetres{},laserWidthMm{},unitsPerMetre{1};
+    // SNIPER SCOPE (world, rigid with the engine-drawn MODEL; zero = unknown, the scope falls back to the grip)
+    Vec3 gunUp{};        // muzzle locator +Y (unit) = the rifle's up
+    Vec3 modelOrigin{};  // placement.model origin (attachment * locator = what the engine draws; the same in either hand)
 };
 class WeaponBoard {
     static constexpr unsigned size=8;

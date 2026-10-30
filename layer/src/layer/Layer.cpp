@@ -590,7 +590,7 @@ bool OriginalHostQuery86::complete(bool originalAccepted)noexcept{
  errno=incoming;return valid;
 }
 bool originalObservedQueryShape86(VkQueryPool pool,unsigned first,unsigned count,size_t bytes,void*data,VkDeviceSize stride,VkQueryResultFlags flags)noexcept{
- // Exact actual85 arguments narrow the route, not object or caller authority.
+ // Exact arguments of the observed call narrow the route, not object or caller authority.
  // No query data is inspected, copied, deferred or replaced.
  return pool&&first==0&&count==2&&bytes==16&&data&&stride==8&&flags==VK_QUERY_RESULT_64_BIT;
 }
@@ -690,7 +690,7 @@ bool descriptorAllocationShape81(Device*d,const VkDescriptorSetAllocateInfo*c,Fr
  return true;
 }
 // A successful reset can restore a quarantined, cold-certified pool. The
-// diagnostic82 observation maps are deliberately absent from this protocol.
+// diagnostic observation maps are deliberately absent from this protocol.
 DescriptorPoolReset83 snapshotDescriptorPoolReset83(Device*d,VkDescriptorPool pool,VkDescriptorPoolResetFlags flags)noexcept{
  ObservationErrno82 preserve;
  std::lock_guard<std::mutex>lock(d->descriptorMetadata81);

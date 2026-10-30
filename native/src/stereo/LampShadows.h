@@ -37,6 +37,7 @@
 //    @0x294c8a4), exactly what DrawCubeShadowMaps itself does for an empty caster list.
 //  * presets 4 1/3 CAP 2 (preset 3 + cap 2), 5 OFF (preset 3 + cap 0 + slot clear); debug.rdrvr.lampcap 0..3 (0 native =
 //    kill switch, 1 cap 2, 2 cap 1, 3 OFF) beats the row; signature _ls<cap><update><cascade><cull> (cap digit only when != 0).
+#include "ShadowTimeline.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -319,6 +320,7 @@ inline Stats stats;
 inline Planner planner;                         // render thread only
 inline std::array<SlotView,slotCount> views{};  // render thread only (this frame's slots)
 inline std::uint64_t lastRenderIntoScene{};     // render thread only
+inline std::array<std::uint32_t,slotCount> timelineIds{}; // render thread only: lamp ids of the last rendered frame (report timeline)
 inline bool lastPoseValid{};inline float lastPose[3]{};
 inline std::uint32_t cullLastWritten=cubeThresholdNativeBits; // render thread only
 inline std::atomic<bool> insideRender{},insideFace{};
@@ -503,6 +505,8 @@ inline void drawCube(void* self,std::uintptr_t caller) noexcept {
     const auto t1=nowUs();s.drawCubeUsSum.fetch_add(t1>t0?t1-t0:0,std::memory_order_relaxed);
     // readout after the native call: slot table as the receivers will use it (+0x40 cleared for empty caster lists)
     std::array<SlotView,slotCount> after{};const unsigned n=readSlots(cubeMap(),after);
+    if(lastRenderIntoScene==sceneSerial.load(std::memory_order_relaxed))for(unsigned j=0;j<n;++j)
+        if(views[j].id&&!after[j].id)shadowtimeline::bump(shadowtimeline::LampEmpty);
     unsigned shadowed{};
     for(unsigned j=0;j<n;++j){auto& st=s.slots[j];const auto& v=after[j];
         st.lastId.store(v.id,std::memory_order_relaxed);st.lastType.store(v.type,std::memory_order_relaxed);st.lastCascade.store(v.cascade?1u:0u,std::memory_order_relaxed);
@@ -539,6 +543,18 @@ inline void renderInto(void* cube,std::uintptr_t caller) noexcept {
     if(cut)s.cuts.fetch_add(1,std::memory_order_relaxed);
     planner.plan(views,n,interval(update),gap||cut||disabled);
     updateEffective.store(update,std::memory_order_relaxed);
+    { // Report timeline: lamps that lost / got a slot this frame, slots that changed lamp, slots whose key alone changed
+        namespace tl=shadowtimeline;std::array<std::uint32_t,slotCount> ids{};unsigned lit{};
+        for(unsigned j=0;j<n;++j){ids[j]=views[j].id;lit+=views[j].id?1u:0u;}
+        const auto has=[](const std::array<std::uint32_t,slotCount>& a,std::uint32_t id){for(const auto v:a)if(v==id)return true;return false;};
+        for(unsigned j=0;j<slotCount;++j){
+            if(timelineIds[j]&&!has(ids,timelineIds[j]))tl::bump(tl::LampLost);
+            if(ids[j]&&!has(timelineIds,ids[j]))tl::bump(tl::LampGain);
+            if(ids[j]!=timelineIds[j])tl::bump(tl::LampMove);
+            else if(ids[j]&&planner.changed[j])tl::bump(tl::LampKey);
+        }
+        timelineIds=ids;if(lit)tl::bump(tl::LampActive,lit);
+    }
     const auto before=planner.faceDraws,beforeSkips=planner.faceSkips,beforeNew=planner.newFaceDraws;
     std::array<std::uint64_t,slotCount> castersBefore{};for(unsigned j=0;j<slotCount;++j)castersBefore[j]=s.slots[j].casters.load(std::memory_order_relaxed);
     const auto t0=nowUs();

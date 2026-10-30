@@ -250,7 +250,7 @@ inline void tick(const mainthread::Frame& fr) noexcept {
         if(!s.levers||fr.index>=s.lastLeverIndex+64||fr.index<s.lastLeverIndex){s.levers=true;s.lastLeverIndex=fr.index;bump(stats.leverReads);
             sourcesLever.store(std::uint32_t(arc::propertyInt("debug.rdrvr.vr.marker.sources",int(SrcObjective|SrcMission|SrcGlow)))&SrcAll,std::memory_order_relaxed);
             depthLever.store(arc::propertyInt("debug.rdrvr.vr.marker.depth",1)?1u:0u,std::memory_order_relaxed);} // World-tested by default
-        // release (user): our cheap beacon is back ON by default (the game's own yellow X is drawn only while the camera is
+        // our cheap beacon is ON by default (the game's own yellow X is drawn only while the camera is
         // indoors, cause not found yet); debug.rdrvr.vr.marker.custom 0 hides it
         static int custom=1;if(s.lastLeverIndex==fr.index)custom=arc::propertyInt("debug.rdrvr.vr.marker.custom",1);
         if(!custom||!settings().questMarker()||killed(Feature::Marker)||killed(Feature::Arc)||killed(Feature::Hands)){hide(s,custom?"OFF":"CUSTOM_OFF");arm(s,false);s.scanned=false;return;}

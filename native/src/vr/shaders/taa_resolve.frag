@@ -9,7 +9,7 @@ precision highp float;precision highp int;
 // - neighbourhood: the 5-tap cross (default, RDR cost lever) or the GTA5 3x3 (flag kTaps9) for the YCoCg moments;
 //   nearest depth (forward Z: min) from two depth gathers = 7 of the 3x3 incl. the cross (GTA5 lever 1: cross);
 // - history: 5-tap Catmull-Rom at the reprojected position (weight n = the centre tap's alpha, as GTA5), clipped to
-//   the YCoCg box mean +- gamma sigma (at least 1/255) grown to contain the current sample (integ2), clipping towards
+//   the YCoCg box mean +- gamma sigma (at least 1/255) grown to contain the current sample, clipping towards
 //   the grown box's centre; a clipped history loses weight;
 // - one-sided disocclusion test: the point's inverse depth in the previous view against the four nearest history
 //   inverse depths (one gather): all nearer or all farther (+-15 %) drops the history, only within 1 / w_test (far

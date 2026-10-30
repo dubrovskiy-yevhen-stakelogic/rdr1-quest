@@ -6,9 +6,9 @@
 #include "diagnostics/ProfilerControl.h"
 #include "StereoTestMode.h"
 #include "Teleport.h"
-#include "HeatWarning.h" // heat01
-#include "GpuBoost.h" // boost01
-#include "vr/VrMenuPages.h" // VR and CHEATS pages (candidate/vr)
+#include "HeatWarning.h"
+#include "GpuBoost.h"
+#include "vr/VrMenuPages.h" // VR and CHEATS pages
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -16,22 +16,18 @@
 #include <string>
 
 namespace rdrvr::runtime {
-// 23 rows (+ TELEPORT), the stick help line is gone; still 25 lines.
-// + LAMP SHADOWS, - CLOSE (B closes): 23 rows, 25 lines.
-// heat01: + HEAT WARNING after PROFILER: 24 rows, 26 lines (PerfPanel height 414 -> 430 keeps the 16 px pitch).
-// boost01: + GPU BOOST after HEAT WARNING: 25 rows, 27 lines (PerfPanel 430 -> 446).
-// layout: 25 panel lines = the title/FPS line, 22 rows, the stick help and one status/restart line (PerfPanel:
-// 25 lines at the 16 px pitch, 52 glyphs per line; glyphs A-Z 0-9 space . : / - % ? < > only, suffixes " - WORD").
+// Layout: 27 panel lines = the title/FPS line, the rows (hidden rows pad the count) and one status/restart line (PerfPanel:
+// height 446, 16 px pitch, 52 glyphs per line; glyphs A-Z 0-9 space . : / - % ? < > only, suffixes " - WORD"). B closes the menu.
 // Row text = line(row,label,value) "%c %-16s%s"; values are clipped to the 34 columns the panel can draw.
-// Three pages GRAPHICS / VR / CHEATS (X = previous, Y = next while open). text() is still the GRAPHICS page exactly as
-// before (host tests compare it); the headset draws pageText(), whose line 0 is the page header with the FPS on the right.
+// Three pages GRAPHICS / VR / CHEATS (X = previous, Y = next while open). text() is the GRAPHICS page
+// (host tests compare it); the headset draws pageText(), whose line 0 is the page header with the FPS on the right.
 // debug.rdrvr.vr.menu 0: one page, pageText() == text().
 // ROOT + submenus (VrMenuPages.h): every open starts on ROOT (GRAPHICS / MOVEMENT / HANDS / WEAPONS / CHEATS /
 // RECENTER), A opens the marked submenu, B in a submenu returns to ROOT, B on ROOT closes; X/Y jump between submenus.
-// The GRAPHICS submenu is text() minus its title line (rows, input and graphics.cfg exactly as before).
+// The GRAPHICS submenu is text() minus its title line (same rows, input and graphics.cfg).
 class GraphicsMenu {
 public:
-    // release: the GRAPHICS page shows only user rows; STEREO TEST, TELEPORT, PROFILER, XR QUEUE, OCCLUSION (experimental)
+    // release: the GRAPHICS page shows only player rows; STEREO TEST, TELEPORT, PROFILER, XR QUEUE, OCCLUSION (experimental)
     // FOVEATION API and EDGE MARGIN are hidden (their values stay as saved / defaults). Visible row i = enum row visibleRows[i].
     static constexpr bool hiddenRow(unsigned r) noexcept {
         return r==GraphicsMenuInput::StereoTest||r==GraphicsMenuInput::Teleport||r==GraphicsMenuInput::XrQueue||
@@ -56,7 +52,7 @@ private:
     // Generic level row: the stick clamps at both ends, A wraps.
     static int cycle(int index,int adjust,int n) noexcept {return adjust?std::clamp(index+adjust,0,n-1):(index+1)%n;}
 public:
-    static constexpr unsigned panelLines=27,panelColumns=52,labelWidth=16,valueColumns=panelColumns-2-labelWidth; // heat01: 26 lines
+    static constexpr unsigned panelLines=27,panelColumns=52,labelWidth=16,valueColumns=panelColumns-2-labelWidth;
     // SUN SHADOWS row: EVERY, 1/2, 1/3, ADAPTIVE, INDOOR, STAGGER, STAGGER FAR (shadowUpdate 0..6),
     // STAGGER / NIGHT OFF (7), then OFF.
     // GRASS row: FULL..35%, then OFF.
@@ -78,7 +74,7 @@ public:
         namespace vr=::rdrvr::vr;
         if(vr::isExtPage(page)){const auto* x=vr::extPage(page);return x?std::max(1u,x->rows()):1u;}
         return page==vr::PageRoot?vr::RootPage::rows:vr::VrPage::isVrPage(page)?vr::VrPage::rows(page):
-            page==vr::PageCheats?vr::CheatsPage::rows():page==vr::PageCalibration?vr::CalibPage::rows:page==vr::PageHelp?vr::HelpPage::rows:page==vr::PageButtons?vr::ButtonsPage::rows:visibleCount();}
+            page==vr::PageCheats?vr::CheatsPage::rows():page==vr::PageCalibration?vr::CalibPage::rows:page==vr::PageLens?vr::LensPage::rows:page==vr::PageHelp?vr::HelpPage::rows:page==vr::PageButtons?vr::ButtonsPage::rows:visibleCount();}
     bool takeDirty() noexcept {const bool d=dirty_;dirty_=false;return d;}
     void invalidate()noexcept{dirty_=dirty_||input_.open();input_.invalidate();::rdrvr::vr::menuOpen.store(false,std::memory_order_relaxed);}
     bool update(ControllerSample& input,GraphicsSettings& settings=graphicsSettings,::rdrvr::vr::VrSettingsStore& vrStore=::rdrvr::vr::vrSettings) noexcept {
@@ -87,12 +83,15 @@ public:
         if(!paged)page_=vr::PageGraphics;else if(page_>=vr::PageCount)page_=vr::PageRoot;
         // The hand holding a VR weapon may keep its grip squeezed when the menu closes (the close guard ignores that grip).
         input_.ignoreGrip(vr::calib::menuHoldHand.load(std::memory_order_relaxed));
+        if(vr::satchel::reopenWanted.exchange(false,std::memory_order_relaxed)&&paged&&input_.reopen()){showPage(vr::PageRoot);input_.select(vr::RootPage::satchelRow);} // Else a refused press looks like nothing happened
         auto e=input_.update(input,rowsOf(page_),paged&&page_!=vr::PageRoot);dirty_=dirty_||e.changed;
         // values change only with A / trigger; the stick only scrolls. CHEATS (weapon pick) and WEAPON CALIBRATION (+/- offsets)
         // keep a clear sideways push.
         e.adjust=0; // No page changes values with the stick (CHEATS / CALIBRATION too) - triggers / A only
         if(e.triggerStep&&page_!=vr::PageRoot)e.adjust=e.triggerStep; // Right trigger +1, left trigger -1 on every value page
         vr::menuOpen.store(input_.open(),std::memory_order_relaxed);
+        if(e.pulsed)vr::satchel::notePulse(); // Select goes down in the next ready pad update
+        if(e.tapped)vr::gamemenu::noteTap();
         if(e.opened&&paged){showPage(vr::PageRoot);vr::menuOpens.fetch_add(1,std::memory_order_relaxed);} // Every open shows ROOT
         if(!input_.open())return e.consume;
         vr::menuPage.store(int(page_),std::memory_order_relaxed);
@@ -106,8 +105,15 @@ public:
         if(page_==vr::PageRoot){ // A opens the marked submenu or recenters; the stick only selects
             if(e.activate){
                 const unsigned row=input_.selected();
-                if(row<vr::submenuCount){showPage(vr::RootPage::pageOfRow(row));vr::menuEnters.fetch_add(1,std::memory_order_relaxed);}
+                if(row==vr::RootPage::satchelRow){ // SATCHEL: close, then the game's own satchel by its own pad press (VrSatchel.h)
+                    if(!vr::satchel::available())return e.consume;
+                    const bool pulse=vr::satchel::request(input.publishedNs,vr::gamemenu::visible.load(std::memory_order_relaxed)==1);
+                    if(!pulse&&vr::satchel::refusedRecently(input.publishedNs)){dirty_=true;return e.consume;} // Refused at once (the pause scene owns the input): stay open, the row shows why
+                    input_.closeThenPulse(pulse,input.publishedNs+vr::satchel::releaseTimeoutNs);
+                    vr::menuOpen.store(false,std::memory_order_relaxed);dirty_=true;return e.consume;}
+                if(vr::RootPage::pageOfRow(row)!=vr::PageRoot){showPage(vr::RootPage::pageOfRow(row));vr::menuEnters.fetch_add(1,std::memory_order_relaxed);}
                 else if(row==vr::RootPage::recenterRow)vr::requestRecenter();
+                else if(row==vr::RootPage::saveLogRow)::rdrvr::diagnostics::savedlog::request(); // SAVE LOG (own background thread)
                 else if(row==vr::RootPage::resetRow&&vr::RootPage::resetPress()){ // RESET ALL: graphics.cfg, vr.cfg, controls.cfg
                     settings.restoreDefaults();vrStore.restoreDefaults();vr::controlmap::resetDefaults();}
                 dirty_=true;
@@ -122,6 +128,7 @@ public:
             return e.consume;}
         if(vr::isExtPage(page_)){if(e.adjust||e.activate)if(const auto* x=vr::extPage(page_)){x->input(input_.selected(),e.adjust,e.activate);dirty_=true;}return e.consume;}
         if(page_==vr::PageCalibration){if(e.adjust||e.activate)vr::CalibPage::input(input_.selected(),e.adjust,e.activate);return e.consume;}
+        if(page_==vr::PageLens){if(e.adjust||e.activate)vr::LensPage::input(input_.selected(),e.adjust,e.activate);return e.consume;}
         if(page_==vr::PageHelp)return e.consume;
         if(page_==vr::PageButtons){if(e.adjust||e.activate)vr::ButtonsPage::input(input_.selected(),e.adjust,e.activate);return e.consume;}
         if(page_==vr::PageGraphics&&(e.adjust||e.activate)){
@@ -154,7 +161,7 @@ public:
                 const unsigned next=level(current,grassOff+1);
                 if(next==grassOff)settings.setGrassRow(false,stored);
                 else settings.setGrassRow(true,next);break;}
-            case GraphicsMenuInput::Water: // w02: live; A toggles, triggers ON / OFF (debug.rdrvr.vr.water overrides it)
+            case GraphicsMenuInput::Water: // Live; A toggles, triggers ON / OFF (debug.rdrvr.vr.water overrides it)
                 settings.setWater(level(value.water?1u:0u,2u)!=0);break;
             case GraphicsMenuInput::EdgeMargin:{
                 const auto& values=GraphicsSettings::edgeMarginValues;
@@ -185,16 +192,16 @@ public:
             case GraphicsMenuInput::FrameRate:
                 settings.setFrameRate(level(value.frameRate,GraphicsSettings::frameRateModes));break;
             case GraphicsMenuInput::SpaceWarp: // Live (debug.rdrvr.spacewarp overrides it)
-                settings.setSpaceWarp(value.spaceWarp?0u:1u);break; // ON / OFF only (the bisection variants are gone from the menu)
+                settings.setSpaceWarp(value.spaceWarp?0u:1u);break; // ON / OFF only
             case GraphicsMenuInput::XrQueue: // Device creation, applies after restart (debug.rdrvr.queueprio overrides it)
                 settings.setXrQueuePriority(level(value.xrQueuePriority,GraphicsSettings::xrQueuePriorities));break;
-            case GraphicsMenuInput::Profiler:{ // FPS COUNTER (user): OFF / ON only DETAIL (cfg profilerMode 2, benches) -> OFF on the next press
+            case GraphicsMenuInput::Profiler:{ // FPS COUNTER: OFF / ON only. DETAIL (cfg profilerMode 2, benches) -> OFF on the next press
                 const unsigned m=unsigned(value.profilerMode);
                 const unsigned next=m>1u?0u:e.adjust>0?1u:e.adjust<0?0u:(m?0u:1u);
                 settings.setProfilerMode(static_cast<GraphicsSettings::ProfilerMode>(next));break;}
-            case GraphicsMenuInput::HeatWarning: // heat01: live; A toggles, stick right ON / left OFF (debug.rdrvr.heatwarn overrides it)
+            case GraphicsMenuInput::HeatWarning: // Live; A toggles, stick right ON / left OFF (debug.rdrvr.heatwarn overrides it)
                 settings.setHeatWarning(level(value.heatWarning?1u:0u,2u)!=0);break;
-            case GraphicsMenuInput::GpuBoost: // boost01: live; OFF / 640 / 690 (debug.rdrvr.boost overrides it)
+            case GraphicsMenuInput::GpuBoost: // Live; OFF / 640 / 690 (debug.rdrvr.boost overrides it)
                 settings.setGpuBoost(level(value.gpuBoost,GraphicsSettings::gpuBoostModes));break;
             case GraphicsMenuInput::StereoTest:{const int mode=int(::rdrvr::engine::stereo::testMode.load());const int n=int(::rdrvr::engine::stereo::testModeCount);
                 ::rdrvr::engine::stereo::testMode.store(unsigned(((e.adjust?mode+e.adjust:mode+1)%n+n)%n));break;}
@@ -206,18 +213,19 @@ public:
         }
         return e.consume;
     }
-    std::string text(double newFps,double displayHz,unsigned width,unsigned height,const GraphicsSettings& settings=graphicsSettings)const {
+    // ink = the labels' colour code (pageText); 0 = no codes, the exact text the host tests compare.
+    std::string text(double newFps,double displayHz,unsigned width,unsigned height,const GraphicsSettings& settings=graphicsSettings,char ink=0)const {
         namespace st=::rdrvr::engine::stereo;
         const auto s=settings.snapshot();const auto& v=s.requested;
         const unsigned mode=st::testMode.load(std::memory_order_relaxed);
         std::string out;out.reserve(1600);
-        char b[96];
+        char b[96];const char inkOn[2]{ink,0},inkOff[2]{ink?::rdrvr::vr::PanelInk::plain:char(0),0}; // Outside the widths, the codes take no column
         std::snprintf(b,sizeof b,"GRAPHICS  %.1f FPS  %.0f HZ  EYE %uX%u\n",newFps,displayHz,width,height);out+=b;
         const auto line=[&](unsigned row,const char* label,const char* value){
             if(hiddenRow(row))return;
             const char mark=rowAt(input_.selected())==row?'>':' ';
-            if(*value)std::snprintf(b,sizeof b,"%c %-16s%.*s\n",mark,label,int(valueColumns),value);
-            else std::snprintf(b,sizeof b,"%c %s\n",mark,label);
+            if(*value)std::snprintf(b,sizeof b,"%c %s%-16s%s%.*s\n",mark,inkOn,label,inkOff,int(valueColumns),value);
+            else std::snprintf(b,sizeof b,"%c %s%s\n",mark,inkOn,label);
             out+=b;};
         char t[64];
         std::snprintf(t,sizeof t,"%u%%",v.resolutionPercent);line(GraphicsMenuInput::Resolution,"RESOLUTION",t);
@@ -260,7 +268,7 @@ public:
             line(GraphicsMenuInput::LampShadows,"LAMP SHADOWS",t);
         }
         line(GraphicsMenuInput::Grass,"GRASS",v.grass?GraphicsSettings::grassDistanceName(v.grassDistance):"OFF"); // GRASS + GRASS DISTANCE
-        { // w02: WATER (lakes / rivers in both eyes, ~1 ms GPU + ~1 ms CPU at the Blackwater lake); PROP while debug.rdrvr.vr.water overrides it
+        { // WATER (lakes / rivers in both eyes, ~1 ms GPU + ~1 ms CPU at the Blackwater lake); PROP while debug.rdrvr.vr.water overrides it
             const int prop=waterMenuProperty.load(std::memory_order_relaxed);const bool on=prop>=0?prop!=0:v.water;
             std::snprintf(t,sizeof t,"%s%s",on?"ON":"OFF",prop>=0?" - PROP":"");line(GraphicsMenuInput::Water,"WATER",t);
         }
@@ -349,20 +357,20 @@ public:
             queueActive<0||(v.xrQueuePriority!=0)==(queueActive!=0)?"":v.xrQueuePriority?" - FALLBACK":" - PROP");
         line(GraphicsMenuInput::XrQueue,"XR QUEUE",t);
         line(GraphicsMenuInput::Profiler,"FPS COUNTER",v.profilerMode==GraphicsSettings::ProfilerMode::Off?"OFF":v.profilerMode==GraphicsSettings::ProfilerMode::Fps?"ON":"DETAIL");
-        { // heat01: red HEADSET OVERHEATING lines (HeatWarning.h). PROP while debug.rdrvr.heatwarn overrides the row (2 = TEST, always
-          // shown); HOT NOW while the thermal trigger is latched (shown when ON, suppressed when OFF).
+        { // The calm CLOCK NOTICE lines (HeatWarning.h). PROP while debug.rdrvr.heatwarn overrides the row (2 = TEST, always
+          // shown); LOWERED NOW while the thermal trigger is latched (shown when ON, suppressed when OFF).
             const int prop=heatWarning.property();const bool on=prop>=0?prop!=0:v.heatWarning;
-            std::snprintf(t,sizeof t,"%s%s",prop==2?"TEST":on?"ON":"OFF",prop>=0?" - PROP":heatWarning.latched()?" - HOT NOW":"");
-            line(GraphicsMenuInput::HeatWarning,"HEAT WARNING",t);
+            std::snprintf(t,sizeof t,"%s%s",prop==2?"TEST":on?"ON":"OFF",prop>=0?" - PROP":heatWarning.latched()?" - LOWERED NOW":"");
+            line(GraphicsMenuInput::HeatWarning,"CLOCK NOTICE",t);
         }
-        { // boost01: GPU BOOST (GpuBoost.h). NO HELPER = the kit's GPU_BOOST helper is not running (headset rebooted); ACTIVE = the
-          // clock property holds the requested level; HOT 640 = 690 held at 640 while the overheat trigger is latched; OFF shows a
+        { // GPU BOOST (GpuBoost.h). NO HELPER = the kit's GPU_BOOST helper is not running (headset rebooted); ACTIVE = the
+          // clock property holds the requested level; LOWERED 640 = 690 held at 640 while the thermal trigger is latched; OFF shows a
           // level still set in debug.oculus.gpuLevel (another tool such as QGO, or the helper for the 2 s until it clears it).
             const int prop=gpuBoost.property(),applied=gpuBoost.applied();
             const unsigned shown=prop==6?1u:prop==7?2u:prop==0?0u:v.gpuBoost;
             const int want=GpuBoost::levelOf(int(shown));
             char other[24]="";if(applied>=0)std::snprintf(other,sizeof other," - LEVEL %d SET",applied);
-            const char* state=!want?other:!gpuBoost.helper()?" - NO HELPER":gpuBoost.heatCapped()?" - HOT 640":
+            const char* state=!want?other:!gpuBoost.helper()?" - NO HELPER":gpuBoost.heatCapped()?" - LOWERED 640":
                 applied==gpuBoost.requested()&&applied>0?" - ACTIVE":" - WAIT";
             std::snprintf(t,sizeof t,"%s%s%s",GraphicsSettings::gpuBoostName(shown),prop>=0?" - PROP":"",state);
             line(GraphicsMenuInput::GpuBoost,"GPU BOOST",t);
@@ -370,15 +378,15 @@ public:
         line(GraphicsMenuInput::StereoTest,"STEREO TEST",st::testModeName(mode));
         ::rdrvr::teleport::menuText(t,sizeof t);line(GraphicsMenuInput::Teleport,"TELEPORT",t);
         line(GraphicsMenuInput::Defaults,"RESTORE DEFAULTS","");
-        for(unsigned r=visibleCount()+1;r<unsigned(GraphicsMenuInput::Count);++r)out+='\n'; // Hidden rows keep the line count (w02: WATER took one)
+        for(unsigned r=visibleCount()+1;r<unsigned(GraphicsMenuInput::Count);++r)out+='\n'; // Hidden rows keep the line count (WATER takes one)
         out+=s.persistenceOk?"SAVED  ":"SAVE FAILED - SESSION ONLY  ";
         out+=s.pendingRestart?"RESTART: RESOLUTION":apiPending?"RESTART: FOVEATION API":mapPending?"RESTART: SHADOW MAP":
             queuePending?"RESTART: XR QUEUE":"RES/API/MAP AT RESTART";
         return out;
     }
-    // FPS HZ") GRAPHICS = text() lines 1..24 (+ " B: BACK" on the footer when it fits) ROOT /
-    // MOVEMENT / HANDS / WEAPONS / CHEATS from VrMenuPages.h. Always 25 lines (heat01: GRAPHICS
-    // 26; boost01: 27), <= 52 glyphs.
+    // pageText(): line 0 = the page header. GRAPHICS = text() lines 1..24 (+ " B: BACK" on the footer when it fits); ROOT /
+    // MOVEMENT / HANDS / WEAPONS / CHEATS from VrMenuPages.h. Always 25 lines (GRAPHICS
+    // 27), <= 52 glyphs.
     std::string pageText(double newFps,double displayHz,unsigned width,unsigned height,const GraphicsSettings& settings=graphicsSettings,
                          const ::rdrvr::vr::VrSettingsStore& vrStore=::rdrvr::vr::vrSettings)const {
         namespace vr=::rdrvr::vr;
@@ -390,12 +398,13 @@ public:
         else if(vr::VrPage::isVrPage(page))vr::VrPage::text(out,page,input_.selected(),vrStore);
         else if(page==vr::PageCheats)vr::CheatsPage::text(out,input_.selected());
         else if(page==vr::PageCalibration)vr::CalibPage::text(out,input_.selected());
+        else if(page==vr::PageLens)vr::LensPage::text(out,input_.selected());
         else if(page==vr::PageHelp)vr::HelpPage::text(out,input_.selected());
         else if(page==vr::PageButtons)vr::ButtonsPage::text(out,input_.selected());
         else if(vr::isExtPage(page)){if(const auto* x=vr::extPage(page))x->text(out,input_.selected());
             else{out+="> UNAVAILABLE\n";for(unsigned r=1;r<vr::menuBodyRows;++r)out+='\n';out+="B: BACK";}}
         else{ // GRAPHICS: text() lines 1..24; the footer gets "  B: BACK" when it fits
-            const auto body=text(newFps,displayHz,width,height,settings);
+            const auto body=text(newFps,displayHz,width,height,settings,vr::pageInks[vr::PageGraphics]); // Blue labels
             const auto first=body.find('\n');out+=first==std::string::npos?body:body.substr(first+1);
             const auto last=out.rfind('\n');
             static constexpr const char back[]="  B: BACK";

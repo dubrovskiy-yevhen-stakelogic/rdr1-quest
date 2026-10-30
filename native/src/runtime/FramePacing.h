@@ -92,8 +92,9 @@
 //    yet, or the window dropped after 96 inexact completions in a row) = no wait (noData). The wait is ONE fence wait holding the
 //    mailbox lock: the render thread's capture()/copyComplete() can block for up to the budget (counted: producerBlocked).
 #include "diagnostics/FrameTimings.h"
-#include "HeatWarning.h" // heat01: fed by flightTick, reported in report()
-#include "GpuBoost.h" // boost01: reported in report()
+#include "HeatWarning.h" // Fed by flightTick, reported in report()
+#include "GpuBoost.h" // Reported in report()
+#include "EngineFrameCount.h" // REGRID: engine main updates between paced frames
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -107,6 +108,7 @@
 #include <cstdio> // KGSL temp / clock
 #if defined(__ANDROID__)
 #include <dlfcn.h> // AThermal via dlsym
+#include <sys/resource.h>
 #endif
 #include <chrono>
 #include <sstream>
@@ -782,7 +784,7 @@ public:
         r.cpuCurMhz=std::uint32_t(readSysLong("/sys/devices/system/cpu/cpufreq/policy2/scaling_cur_freq")/1000);
         if(!(r.t&1u))thermalSample();
         r.thStatus=std::uint32_t(thStatus_<0?99:thStatus_);r.headroom100=std::uint32_t(thHeadroom100_<0?9999:thHeadroom100_);
-        heatWarning.observe(now,thStatus_,thHeadroom100_,r.temp10,r.maxMhz,r.tpl); // heat01: OVERHEAT WARNING trigger (1 Hz, HeatWarning.h)
+        heatWarning.observe(now,thStatus_,thHeadroom100_,r.temp10,r.maxMhz,r.tpl); // CLOCK NOTICE trigger (1 Hz, HeatWarning.h)
         {std::lock_guard lk(flMutex_);flRing_[flNext0_]=r;flNext0_=(flNext0_+1)%flightRows;if(flCount_<flightRows)++flCount_;}
         flXr_=flStereo_=flNew_=flRep_=0;
         flNext_+=1'000'000'000ull;if(now>=flNext_)flNext_=now+1'000'000'000ull;
@@ -792,6 +794,9 @@ public:
             std::string path;{std::lock_guard lk(flMutex_);path=flPath_;}
             if(path.empty()){flWriting_.store(false,std::memory_order_release);}
             else{try{std::thread([this,path]{
+#if defined(__ANDROID__)
+                     setpriority(PRIO_PROCESS,0,10);
+#endif
                      try{const std::string body=flightJson();const std::string tmp=path+".tmp";
                          if(std::FILE* fp=std::fopen(tmp.c_str(),"wb")){std::fwrite(body.data(),1,body.size(),fp);std::fclose(fp);std::rename(tmp.c_str(),path.c_str());}}catch(...){}
                      flWriting_.store(false,std::memory_order_release);}).detach();}
@@ -884,6 +889,7 @@ public:
             // Phase controller (0 off, else on) and late-latch budget (0..6000 us, unset / invalid -> 3000)
             v[0]=0;phaseCtl_.store(!(__system_property_get("debug.rdrvr.pacing.phasectl",v)>0&&v[0]=='0'),std::memory_order_relaxed);
             v[0]=0;tight_.store(__system_property_get("debug.rdrvr.pacing.tight",v)>0&&v[0]>='0'&&v[0]<='2'&&!v[1]?int(v[0]-'0'):2,std::memory_order_relaxed); // Lockstep: 0 off, 1 AUTO, 2 always (default)
+            v[0]=0;regrid_.store(__system_property_get("debug.rdrvr.pacing.regrid",v)>0&&v[0]>='0'&&v[0]<='2'&&!v[1]?int(v[0]-'0'):1,std::memory_order_relaxed); // REGRID: 0 off, 1 on (default), 2 count only
             v[0]=0;submitGate_.store(!(__system_property_get("debug.rdrvr.submitgate",v)>0&&v[0]=='0'&&!v[1]),std::memory_order_relaxed);
             v[0]=0;{long x=-1;if(__system_property_get("debug.rdrvr.submitgate.capus",v)>0){char* e{};x=std::strtol(v,&e,10);if(e==v||*e)x=-1;}
                     submitGateCapUs_.store(x>=0&&x<=20000?int(x):4000,std::memory_order_relaxed);}
@@ -944,6 +950,7 @@ public:
     std::int64_t lateLatchNs() const noexcept {return std::int64_t(latchUs_.load(std::memory_order_relaxed))*1000;}
     std::uint64_t lastXrWakeNs() const noexcept {return lastXr_.load(std::memory_order_relaxed);}
     std::int64_t lastPdtNs() const noexcept {return lastPdt_.load(std::memory_order_relaxed);}   // 0 = unknown
+    bool lastRegrid() const noexcept {return lastRegrid_.load(std::memory_order_relaxed);} // REGRID: the last paced frame waited for the XR grid after orphans
     bool halfRate() const noexcept {const auto p=period_.load(std::memory_order_relaxed);return p>0&&spacing_.load(std::memory_order_relaxed)>p;}
     bool phaseCtlEnabled() const noexcept {return phaseCtl_.load(std::memory_order_relaxed);}
     bool phaseCtlActive() const noexcept {return phaseActive_.load(std::memory_order_relaxed);}
@@ -983,7 +990,8 @@ public:
         dlPending_=dlN;phaseRan_.store(false,std::memory_order_relaxed); // finish() counts them as ignored unless the controller took them
         // Lockstep / the submit gate hold for THIS frame only - every non-lockstep return leaves them off
         // (a flag left on would let the submit gate stall 72/24 Hz frames by up to 4 ms).
-        const bool tightWas=tightPrev_;tightPrev_=false;tightActive_.store(false,std::memory_order_relaxed);
+        const bool tightWas=tightPrev_;tightPrev_=false;tightActive_.store(false,std::memory_order_relaxed);lastRegrid_.store(false,std::memory_order_relaxed);
+        const std::uint64_t ef=engineMainFrames.load(std::memory_order_relaxed);const std::uint64_t efDelta=efSeen_?ef-efPrev_:0;efPrev_=ef;efSeen_=true; // REGRID: main updates since the previous pace (every path)
         const unsigned index=modeIndex(mode);
         if(lastPace_&&now>lastPace_&&now-lastPace_<500'000'000ull)byMode_[index].ns.fetch_add(now-lastPace_,std::memory_order_relaxed);
         lastPace_=now;byMode_[index].frames.fetch_add(1,std::memory_order_relaxed);
@@ -1034,13 +1042,25 @@ public:
                 if(phaseActive_.load(std::memory_order_relaxed)){std::lock_guard lock(mutex_);phase_.reset();phaseActive_.store(false,std::memory_order_relaxed);}
                 tightActive_.store(true,std::memory_order_relaxed);satActive_.store(false,std::memory_order_relaxed);
                 bool waited=false,late=false,timeout=false;std::uint64_t pubNs=0;
+                // REGRID (debug.rdrvr.pacing.regrid: 0 off, 1 on (default), 2 count only). Engine frames without a pair never reach pace()
+                // and run on the VR72 display limiter (~13.95 ms): two orphans fit one XR period, the next pair arrives late and the next
+                // frame would start ~8 ms after it, off the XR grid -> pair / failed attempt / WAITING_FOR_STEREO_CULL repeats (3:1, 24 fps).
+                // A late pair after orphans (>= 2 main updates) waits for the next views publish instead; it is already submitted, the
+                // XR latches it at that publish either way. Valve: 4 regrids within 1 s -> off for 3 s.
+                const int rg=regrid_.load(std::memory_order_relaxed);bool regrid=false;
                 {std::unique_lock lk(tightM_);
                  if(!tightWas)tightConsumed_=0; // Re-entry - publishes from before (other path) are not a late frame
-                 if(tightSeq_!=tightConsumed_&&tightConsumed_)late=true;      // the XR frame began during this render frame: start now
-                 else{const auto seen=tightSeq_;
+                 if(tightSeq_!=tightConsumed_&&tightConsumed_){
+                     if(rg&&efDelta>=2&&efDelta<=8&&now>=regridQuietUntil_){regridEvents_.fetch_add(1,std::memory_order_relaxed);regrid=rg==1;}
+                     if(!regrid)late=true;}      // the XR frame began during this render frame: start now
+                 if(!late){const auto seen=tightSeq_;
                       waited=tightCv_.wait_for(lk,std::chrono::nanoseconds(T+4'000'000),[&]{return tightSeq_!=seen;});timeout=!waited;}
                  tightConsumed_=tightSeq_;pubNs=tightNs_;}
                 const auto after=clockNs();
+                if(regrid){regridWaits_.fetch_add(1,std::memory_order_relaxed);regridWaitNs_.fetch_add(after-now,std::memory_order_relaxed);
+                    regridRecent_[regridNext_&3u]=now;++regridNext_;const auto oldest=regridRecent_[regridNext_&3u];
+                    if(oldest&&now-oldest<1'000'000'000ull){regridQuietUntil_=now+3'000'000'000ull;regridRecent_={};regridSuspends_.fetch_add(1,std::memory_order_relaxed);}}
+                lastRegrid_.store(regrid,std::memory_order_relaxed);
                 ++paced_;byMode_[index].paced.fetch_add(1,std::memory_order_relaxed);
                 HalfRateCounters& h=halfRate_[0];h.paced.fetch_add(1,std::memory_order_relaxed);
                 if(late){countOverrun();halfRateOverruns_.fetch_add(1,std::memory_order_relaxed);byMode_[index].overruns.fetch_add(1,std::memory_order_relaxed);
@@ -1052,7 +1072,7 @@ public:
                 if(lastWake_&&after>lastWake_)notePeriods(h,after-lastWake_,p);
                 overrunRun_=late?overrunRun_+1:0;lastWake_=after;cadenceNs_.store(T,std::memory_order_relaxed);lockError_.store(0,std::memory_order_relaxed);
                 tightPrev_=true;
-                if(adaptive)governorStep(now,busy,late); // ADAPTIVE must still drop to 24 / revoke AppSW in lockstep
+                if(adaptive)governorStep(now,busy,late||regrid); // ADAPTIVE must still drop to 24 / revoke AppSW in lockstep (a REGRID pair was late too)
                 return finish(saved,waited?after-now:0);
             }
             tightActive_.store(false,std::memory_order_relaxed);
@@ -1165,7 +1185,10 @@ public:
              <<",\"tight\":{\"property\":"<<tight_.load(std::memory_order_relaxed)<<",\"active\":"<<(tightActive_.load(std::memory_order_relaxed)?"true":"false")
              <<",\"waits\":"<<tightWaits_.load(std::memory_order_relaxed)<<",\"late\":"<<tightLate_.load(std::memory_order_relaxed)<<",\"timeouts\":"<<tightTimeouts_.load(std::memory_order_relaxed)
              <<",\"gateOpen\":"<<(tightGateOpen_.load(std::memory_order_relaxed)?"true":"false")<<",\"costUs\":"<<tightCostUs_.load(std::memory_order_relaxed)
-             <<",\"gateUs\":"<<tightGateNs_.load(std::memory_order_relaxed)/1000<<",\"opens\":"<<tightOpens_.load(std::memory_order_relaxed)<<",\"closes\":"<<tightCloses_.load(std::memory_order_relaxed)<<"}}";
+             <<",\"gateUs\":"<<tightGateNs_.load(std::memory_order_relaxed)/1000<<",\"opens\":"<<tightOpens_.load(std::memory_order_relaxed)<<",\"closes\":"<<tightCloses_.load(std::memory_order_relaxed)
+             <<",\"regrid\":{\"property\":"<<regrid_.load(std::memory_order_relaxed)<<",\"events\":"<<regridEvents_.load(std::memory_order_relaxed)
+             <<",\"waits\":"<<regridWaits_.load(std::memory_order_relaxed)<<",\"waitMs\":"<<double(regridWaitNs_.load(std::memory_order_relaxed))*1e-6
+             <<",\"suspends\":"<<regridSuspends_.load(std::memory_order_relaxed)<<"}}}";
             o<<",\"sleepNs\":"<<sleep_.json()<<",\"phaseErrorNs\":"<<phaseError_.json()<<",\"overrunLateNs\":"<<late_.json()
              <<",\"xr\":{\"frames\":"<<xrFrames_.load()<<",\"intervalNs\":"<<xrInterval_.load(std::memory_order_relaxed)<<",\"gridSpacingNs\":"<<s
              <<",\"gridResets\":"<<gridResets_.load()<<",\"gridOutliers\":"<<gridOutliers_.load()<<",\"halfRateOverruns\":"<<halfRateOverruns_.load()<<",\"phaseIndex\":"<<phaseIndex_.load(std::memory_order_relaxed)
@@ -1206,8 +1229,8 @@ public:
              <<",\"dropUs\":"<<gv.cfg.dropNs/1000<<",\"upUs\":"<<gv.cfg.upNs/1000<<",\"status\":\""<<status<<"\"}";
         }
         o<<",\"noLayerFrames\":"<<presentTelemetry.noLayerJson()<<",\"layerSettings\":"<<presentTelemetry.layerSettingsJson()<<",\"xrHistory\":"<<xrHistory.json()
-         <<",\"heatWarning\":"<<heatWarning.json(diagnostics::monotonicNs()) // heat01
-         <<",\"gpuBoost\":"<<gpuBoost.json() // boost01
+         <<",\"heatWarning\":"<<heatWarning.json(diagnostics::monotonicNs())
+         <<",\"gpuBoost\":"<<gpuBoost.json()
          <<",\"flight\":"<<flightJson()<<'}';
         return o.str();
     }
@@ -1384,6 +1407,9 @@ private:
     std::uint64_t tightConsumed_{};                                                                            // render thread
     std::atomic<int> tight_{0};std::atomic<bool> tightActive_{};std::atomic<std::uint64_t> tightWaits_{},tightLate_{},tightTimeouts_{}; // 0 off, 1 AUTO, 2 always (Android property default: 2; host tests keep 0)
     bool tightPrev_{}; // Lockstep ran the previous paced frame (render thread)
+    // REGRID (debug.rdrvr.pacing.regrid; 0 off, 1 on, 2 count only). Host tests never bump engineMainFrames: efDelta stays 0, no regrid.
+    std::atomic<int> regrid_{1};std::atomic<bool> lastRegrid_{};std::atomic<std::uint64_t> regridEvents_{},regridWaits_{},regridWaitNs_{},regridSuspends_{};
+    std::uint64_t efPrev_{},regridQuietUntil_{};bool efSeen_{};std::array<std::uint64_t,4> regridRecent_{};unsigned regridNext_{}; // render thread
     std::atomic<std::int64_t> tightGateNs_{2'800'000};std::int64_t tightCost_{};bool tightGate_{true};                 // AUTO gate
     std::atomic<std::int64_t> tightCostUs_{};std::atomic<bool> tightGateOpen_{true};std::atomic<std::uint64_t> tightOpens_{},tightCloses_{};
     std::atomic<bool> submitGate_{false};                                                                      // Android property: default on

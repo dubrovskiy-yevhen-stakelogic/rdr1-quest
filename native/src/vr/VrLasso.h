@@ -129,7 +129,7 @@ inline constexpr std::array<PrintRef,9> readerPrints{PrintRef{zoomLassoReleaseOf
 inline constexpr std::array<PrintRef,1> offscreenPrints{PrintRef{lassoOffscreenBlockOffset,lassoOffscreenBlockFingerprint.data(),lassoOffscreenBlockFingerprint.size()}};
 // Rope pull (checked lazily by the tick through env.read; a mismatch = that part off, counted):
 // aniLasso::LassoYank() 0x21798dc..0x2179964 (victim guid +0x2c/+0x2e validated, item = +0x30 -> invLassoWeapon::YankLasso(victim): the minigame
-// server OnEvent + sagMsgLassoYank to the victim, direction victim -> user) = what LassoActionTask::Begin 0x22addf0 runs for the native yank.
+// server OnEvent + sagMsgLassoYank to the victim, direction victim -> thrower) = what LassoActionTask::Begin 0x22addf0 runs for the native yank.
 inline constexpr std::uintptr_t lassoYankOffset=0x21798dc;
 inline constexpr std::array<unsigned char,136> lassoYankFingerprint{
 #include "gamecode/VrLasso_21798dc_136_8d.inc"

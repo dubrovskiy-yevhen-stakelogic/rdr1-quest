@@ -127,7 +127,7 @@ inline std::atomic<const char*> playerReason{"NO SAMPLE"};
 // menu (XR thread) -> main thread
 inline std::atomic<int> menuCursor{0};              // 0 = SAVE SPOT, k = SPOT k
 inline std::atomic<int> menuSaveRequest{0},menuTeleportRequest{0};
-// CHEATS > TELEPORT TO (user: "make a cheat teleport to Blackwater"): fixed town spots, stick picks, A goes.
+// CHEATS > TELEPORT TO: fixed town spots, stick picks, A goes.
 // Coordinates from public RDR1 trainers (connor-ms/RDR-Trainer src/mods/teleport.c; Armadillo matches our saloon spot, same world space).
 struct Town {const char* name;double x,y,z;};
 inline constexpr Town towns[]{{"BLACKWATER",711.18,78.31,1252.763},{"ARMADILLO",-2175.62,16.31,2613.50},{"ARMADILLO SALOON",-2186.040,16.409,2608.610},

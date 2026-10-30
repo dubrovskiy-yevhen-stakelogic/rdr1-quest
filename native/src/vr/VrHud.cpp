@@ -26,10 +26,12 @@ struct PreserveErrno {int v{errno};~PreserveErrno(){errno=v;}};
 std::uint64_t nowNs() noexcept {return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());}
 constexpr unsigned slotCount=3;
 constexpr float pi=3.14159265358979f;
+constexpr std::uint32_t ammoW=256,ammoH=64; // AMMO ON GUN strip, RGBA8 = 65536 bytes (the vkCmdUpdateBuffer limit)
 
 // ---- properties (XR thread every 64 frames, render thread once at bind) ----
 struct Props {
-    std::atomic<int> scale{50},every{1},alpha{0},deg{0},dist{140},down{10},follow{1},gaze{1},maxAge{400},dump{0},forceMode{0},wristAlpha{200},wristArm{1},wristFace{1};
+    std::atomic<int> scale{50},every{1},alpha{0},deg{0},dist{140},down{10},follow{1},gaze{1},maxAge{400},dump{0},forceMode{0},wristAlpha{200},wristArm{1},wristFace{1},wristTilt{70},wristFacing{1},subtitles{1},subDown{20};
+    std::array<std::atomic<int>,4> subBand{}; // SUBTITLES band x0,y0,x1,y1 per mille of the HUD image
     std::array<std::atomic<int>,4> radar{};std::array<std::atomic<int>,3> wrist{};
     std::array<std::atomic<int>,8> mapfix{}; // Source x0,y0,x1,y1 + destination x0,y0,x1,y1 per mille; mapfix[0] < 0 = off
     // PANEL: every Flash movie (help box, subtitles, objectives, prompts, ammo) is drawn 1:1 into the top-left 1374x720
@@ -37,9 +39,14 @@ struct Props {
     // panel shows that Flash area (flash = w,h per mille of the image, 0 = whole image) and the radar as its own square quad on the panel
     // (radarpanel = left, bottom, size in per mille of the panel HEIGHT).
     std::array<std::atomic<int>,2> flash{};std::array<std::atomic<int>,3> radarPanel{};
-    Props(){radar[0]=10;radar[1]=660;radar[2]=350;radar[3]=990;wrist[0]=130;wrist[1]=-15;wrist[2]=85;
+    // AMMO ON GUN: along, across, lift, width (mm) of the strip beside the barrel; crop = stock ammo element rect (per mille, -1 = digits)
+    std::array<std::atomic<int>,4> ammoPlace{},ammoCrop{};std::atomic<int> ammoTilt{50},ammoFace{1};
+    Props(){radar[0]=10;radar[1]=660;radar[2]=350;radar[3]=990;wrist[0]=130;wrist[1]=-15;wrist[2]=100;
         for(auto& m:mapfix)m=-1;
-        flash[0]=818;flash[1]=409;radarPanel[0]=50;radarPanel[1]=50;radarPanel[2]=340;}
+        ammoPlace[0]=20;ammoPlace[1]=40;ammoPlace[2]=25;ammoPlace[3]=50; // default place of the ammo strip
+        for(auto& a:ammoCrop)a=-1;
+        flash[0]=818;flash[1]=409;radarPanel[0]=50;radarPanel[1]=50;radarPanel[2]=340;
+        subBand[0]=0;subBand[1]=250;subBand[2]=818;subBand[3]=409;}
 };
 Props props;
 bool readProp(const char* name,char* out,std::size_t size) noexcept {
@@ -70,7 +77,7 @@ void readProps() noexcept {
     propList<4>("debug.rdrvr.vr.hud.radar",props.radar,{10,660,350,990},0,1000);
     if(props.radar[2].load()<=props.radar[0].load()+20||props.radar[3].load()<=props.radar[1].load()+20){
         props.radar[0]=10;props.radar[1]=660;props.radar[2]=350;props.radar[3]=990;}
-    propList<3>("debug.rdrvr.vr.hud.wrist",props.wrist,{130,-15,85},-300,300);
+    propList<3>("debug.rdrvr.vr.hud.wrist",props.wrist,{130,-15,100},-300,300);
     if(props.wrist[2].load()<30)props.wrist[2]=95;
     propList<8>("debug.rdrvr.vr.hud.mapfix",props.mapfix,{-1,-1,-1,-1,-1,-1,-1,-1},-1,1000); // Off by default (TraceEntry RADAR FIX); fallback 44,291,246,387,54,709,301,945
     {const auto& m=props.mapfix;
@@ -83,13 +90,25 @@ void readProps() noexcept {
     propInt("debug.rdrvr.vr.hud.wristalpha",props.wristAlpha,100,400,200);
     propInt("debug.rdrvr.vr.hud.wristarm",props.wristArm,0,1,1);
     propInt("debug.rdrvr.vr.hud.wristface",props.wristFace,0,1,1);
+    propInt("debug.rdrvr.vr.hud.subtitles",props.subtitles,0,1,1);propInt("debug.rdrvr.vr.hud.subdown",props.subDown,-30,60,20);
+    propList<4>("debug.rdrvr.vr.hud.subband",props.subBand,{0,250,818,409},0,1000);
+    if(props.subBand[2].load()<=props.subBand[0].load()+20||props.subBand[3].load()<=props.subBand[1].load()+10){
+        props.subBand[0]=0;props.subBand[1]=250;props.subBand[2]=818;props.subBand[3]=409;}
+    propInt("debug.rdrvr.vr.hud.wristtilt",props.wristTilt,0,100,70);propInt("debug.rdrvr.vr.hud.wristfacing",props.wristFacing,0,2,1);
+    propList<4>("debug.rdrvr.vr.hud.ammo",props.ammoPlace,{50,45,0,60},-300,300);
+    if(props.ammoPlace[3].load()<20)props.ammoPlace[3]=60;
+    propList<4>("debug.rdrvr.vr.hud.ammocrop",props.ammoCrop,{12,259,107,293},-1,1000); // the stock ammo counter
+    {const auto& a=props.ammoCrop;
+     if(a[0].load()<0||a[2].load()<=a[0].load()+5||a[3].load()<=a[1].load()+5)for(auto& x:props.ammoCrop)x.store(-1,std::memory_order_relaxed);}
+    propInt("debug.rdrvr.vr.hud.ammotilt",props.ammoTilt,0,100,50);propInt("debug.rdrvr.vr.hud.ammoface",props.ammoFace,0,1,1);
 }
 
 // ---- telemetry ----
 struct Stats {
     std::atomic<std::uint64_t> wanted{},begun{},recorded{},cancelled{},published{},consumed{},headLayers{},wristLayers{},gazeHidden{},
         staleHidden{},noGrip{},xrFrames{},ringBuilds{},swapchainBuilds{},pendingMissed{},alphaNormalized{},alphaUnsupported{},alphaTemporary{},
-        alphaReadFailures{},submitCpuNs{},submitCalls{},clearAlphaDropped{},clearAlphaTaken{},mapLayers{},dumps{},dumpFailures{},wristOnArm{};
+        alphaReadFailures{},submitCpuNs{},submitCalls{},clearAlphaDropped{},clearAlphaTaken{},mapLayers{},dumps{},dumpFailures{},wristOnArm{},subtitleFrames{},subtitleLayers{},
+        ammoLayers{},ammoHidden{},ammoUploads{};
     std::array<std::atomic<std::uint64_t>,unsigned(Skip::Count)> skips{};
     std::atomic<std::uint64_t> lastPublishedNs{},lastFrame{},lastLayout{},lastSourceW{},lastSourceH{},lastFormat{},ringW{},ringH{},swapW{},swapH{},swapFormat{};
     std::atomic<std::int64_t> radar[4]{};
@@ -113,7 +132,7 @@ struct Slot {
     VkImage image{};VkDeviceMemory memory{};
     VkCommandBuffer produce{};VkFence produceFence{};bool produceSubmitted{};
     VkCommandBuffer consume{};VkFence consumeFence{};bool reading{};
-    std::uint64_t sequence{},frame{},publishedNs{};
+    std::uint64_t sequence{},frame{},publishedNs{};bool subtitles{};
 };
 struct Shared {
     std::mutex mutex;
@@ -254,7 +273,12 @@ struct Consumer {
     bool mapShown{};std::array<float,4> mapDst{}; // Dst rect (0..1 of the HUD image) of the last blitted mapfix region
     int rollAxis{-1};std::uint64_t rollPicks{};
     std::array<float,3> diagElbow{},diagWrist{},diagLocal{};float diagLen{};std::uint64_t diagAgeMs{};bool diagOnArm{};std::uint64_t faceFrames{};
-    std::uint32_t panelW{},panelH{};bool panelRadar{}; // PANEL: head image rect (Flash area) of the last copy; radar square valid
+    float wristFade{},diagFacing{},diagGaze{}; // HAND: eased wrist map opacity (0..1), last facing / gaze cosines
+    std::uint32_t panelW{},panelH{};bool panelRadar{},subtitles{}; // PANEL: head image rect (Flash area) of the last copy; radar square valid
+    // AMMO ON GUN: device buffer of the digits strip (rewritten by vkCmdUpdateBuffer only when the text changes), the strip's place in the
+    // swapchain [W, W+ammoW) x [S, S+ammoH) and what the last released image holds there (ammoRect = x, y, w, h)
+    VkBuffer ammoBuffer{};VkDeviceMemory ammoMemory{};bool ammoFailed{},ammoText{},ammoDrawn{};std::int64_t ammoKey{INT64_MIN};
+    std::uint32_t ammoX{},ammoY{};std::array<std::int32_t,4> ammoRect{};std::array<std::uint32_t,ammoW*ammoH> ammoPixels{};
 };
 Consumer consumer;
 
@@ -267,10 +291,13 @@ void rot(Q q,const float v[3],float out[3]) noexcept {
 }
 float wrapAngle(float a) noexcept {while(a>pi)a-=2*pi;while(a<-pi)a+=2*pi;return a;}
 bool finite3(const float v[3]) noexcept {return std::isfinite(v[0])&&std::isfinite(v[1])&&std::isfinite(v[2]);}
+float smooth(float a,float b,float x) noexcept {const float t=std::clamp((x-a)/(b-a),0.f,1.f);return t*t*(3.f-2.f*t);}
+float dot3(const float a[3],const float b[3]) noexcept {return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
+bool normalize3(float v[3],float minLen) noexcept {const float l=std::sqrt(dot3(v,v));if(!(l>minLen))return false;for(unsigned i=0;i<3;++i)v[i]/=l;return true;}
 
 void destroySwapchain() noexcept {
     if(consumer.swapchain)xrDestroySwapchain(consumer.swapchain);
-    consumer.swapchain={};consumer.images.clear();consumer.valid=false;consumer.generation=0;consumer.displayedSequence=0;
+    consumer.swapchain={};consumer.images.clear();consumer.valid=false;consumer.generation=0;consumer.displayedSequence=0;consumer.ammoDrawn=false;
 }
 // XR thread: (re)create the [HUD | wrist square] swapchain for the ring generation.
 bool ensureSwapchain(XrSession session,VkExtent2D ring,VkFormat ringFormat,std::uint64_t generation) {
@@ -287,7 +314,9 @@ bool ensureSwapchain(XrSession session,VkExtent2D ring,VkFormat ringFormat,std::
     }
     if(chosen==VK_FORMAT_UNDEFINED)throw std::runtime_error("NO_SRGB_SWAPCHAIN_FORMAT");
     consumer.headW=ring.width;consumer.headH=ring.height;consumer.strip=std::max(32u,std::uint32_t(std::lround(0.35*double(ring.height))));
-    consumer.width=ring.width+2*consumer.strip;consumer.height=std::max(ring.height,consumer.strip); // [HUD | wrist S | map S]
+    // [HUD | wrist S | map S], the AMMO ON GUN strip under the wrist square
+    consumer.width=std::max(ring.width+2*consumer.strip,ring.width+ammoW);consumer.height=std::max(ring.height,consumer.strip+ammoH);
+    consumer.ammoX=ring.width;consumer.ammoY=consumer.strip;
     XrSwapchainCreateInfo c{XR_TYPE_SWAPCHAIN_CREATE_INFO};c.usageFlags=XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT|XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
     c.format=chosen;c.sampleCount=c.faceCount=c.arraySize=c.mipCount=1;c.width=consumer.width;c.height=consumer.height;
     runtime::checkXr(xrCreateSwapchain(session,&c,&consumer.swapchain),"hud swapchain");
@@ -336,6 +365,114 @@ Q quatFromColumns(const float x[3],const float y[3],const float z[3]) noexcept {
     const float n=std::sqrt(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w);if(n>1e-6f){q.x/=n;q.y/=n;q.z/=n;q.w/=n;}else q={0,0,0,1};
     return q;
 }
+
+// ---- AMMO ON GUN (the Vice City VR wrist AMMO panel idea: the counter lies along the gun in the holding hand) ----
+// Main thread noteGun() -> XR thread: the held weapon's barrel in LOCAL + its engine clip / pool. The consumer draws "clip/pool" with a
+// 5x7 pixel font into a device buffer (vkCmdUpdateBuffer, only when the text changes), copies it into the ammo strip of the HUD swapchain
+// in the same consume command buffer and places that strip as a quad beside the barrel.
+struct GunState {float muzzle[3]{},dir[3]{},up[3]{},base[3]{};int hand{-1};bool firearm{};int clip{-1},pool{-1};bool infinite{};std::uint64_t ns{};};
+std::mutex gunMutex;GunState gun;
+GunState gunSnapshot() noexcept {std::lock_guard lock(gunMutex);return gun;}
+bool ammoWanted(unsigned m) noexcept {return m!=Off&&settings().hudAmmo();}
+// 5x7 glyphs, bit 4 = left column: '0'..'9', '/'
+constexpr std::uint8_t ammoGlyphs[11][7]{
+    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},{0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},
+    {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},{0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},{0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
+    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E},{0x1F,0x01,0x02,0x04,0x08,0x08,0x08},{0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},
+    {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},{0x01,0x01,0x02,0x04,0x08,0x10,0x10}};
+// "clip/pool" ("clip" alone when the pool is unlimited / unknown), centred, premultiplied: cream ink (red at 0) on a dark outline.
+bool drawAmmoText(int clip,int pool,bool infinite,bool bgra) noexcept {
+    auto& px=consumer.ammoPixels;px.fill(0u);
+    if(clip<0)return false;
+    char text[16]{};
+    const int n=infinite||pool<0?std::snprintf(text,sizeof text,"%d",std::min(clip,9999)):std::snprintf(text,sizeof text,"%d/%d",std::min(clip,9999),std::min(pool,9999));
+    if(n<=0||n>=int(sizeof text))return false;
+    const int s=std::max(1,std::min((int(ammoH)-4)/9,(int(ammoW)-4)/(6*n)));
+    const int x0=(int(ammoW)-(6*n-1)*s)/2,y0=(int(ammoH)-7*s)/2,b=std::max(1,s/3);
+    const auto pack=[bgra](unsigned r,unsigned g,unsigned bl,unsigned a){
+        return bgra?std::uint32_t(bl|g<<8|r<<16|a<<24):std::uint32_t(r|g<<8|bl<<16|a<<24);};
+    const std::uint32_t edge=pack(0,0,0,190),ink=clip==0?pack(235,80,64,255):pack(244,236,214,255);
+    for(int pass=0;pass<2;++pass)for(int i=0;i<n;++i){
+        const char ch=text[i];const int gi=ch=='/'?10:(ch>='0'&&ch<='9'?ch-'0':-1);if(gi<0)continue;
+        const int e=pass==0?b:0;const std::uint32_t colour=pass==0?edge:ink;
+        for(int row=0;row<7;++row)for(int col=0;col<5;++col){
+            if(!((ammoGlyphs[gi][row]>>(4-col))&1u))continue;
+            const int gx=x0+(i*6+col)*s,gy=y0+row*s;
+            for(int y=std::max(0,gy-e);y<std::min(int(ammoH),gy+s+e);++y)
+                for(int x=std::max(0,gx-e);x<std::min(int(ammoW),gx+s+e);++x)px[std::size_t(y)*ammoW+std::size_t(x)]=colour;
+        }
+    }
+    return true;
+}
+void destroyAmmoBuffer(VkDevice d) noexcept {
+    if(d&&consumer.ammoBuffer)vkDestroyBuffer(d,consumer.ammoBuffer,nullptr);
+    if(d&&consumer.ammoMemory)vkFreeMemory(d,consumer.ammoMemory,nullptr);
+    consumer.ammoBuffer={};consumer.ammoMemory={};consumer.ammoKey=INT64_MIN;
+}
+// XR thread. A failure only turns AMMO ON GUN off (the HUD stays).
+bool ensureAmmoBuffer() noexcept {
+    if(consumer.ammoBuffer)return true;
+    if(consumer.ammoFailed||!shared.device)return false;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=VkDeviceSize(ammoW)*ammoH*4u;
+    bi.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT;bi.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
+    if(vkCreateBuffer(shared.device,&bi,nullptr,&consumer.ammoBuffer)!=VK_SUCCESS){consumer.ammoBuffer={};consumer.ammoFailed=true;return false;}
+    VkMemoryRequirements r{};vkGetBufferMemoryRequirements(shared.device,consumer.ammoBuffer,&r);
+    const auto type=memoryType(shared.physical,r.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};a.allocationSize=r.size;a.memoryTypeIndex=type;
+    VkDeviceMemory memory{};const bool allocated=type!=UINT32_MAX&&vkAllocateMemory(shared.device,&a,nullptr,&memory)==VK_SUCCESS;
+    if(allocated)consumer.ammoMemory=memory;
+    if(!allocated||vkBindBufferMemory(shared.device,consumer.ammoBuffer,consumer.ammoMemory,0)!=VK_SUCCESS){
+        destroyAmmoBuffer(shared.device);consumer.ammoFailed=true;return false;}
+    consumer.ammoKey=INT64_MIN;return true;
+}
+// The ammo quad: beside the held firearm on the OUTER side of the holding hand (right of a right-hand gun), lying along the barrel - read
+// across the gun with its top towards the muzzle - turned about the barrel to the eyes (ammoface) and tilted towards them (ammotilt %).
+// Hidden without a fresh (250 ms) firearm frame.
+void ammoLayer(XrSpace local,const float eye[3],std::uint64_t now,Layers& out) noexcept {
+    if(!consumer.ammoDrawn||!consumer.swapchain||consumer.ammoRect[2]<=0||consumer.ammoRect[3]<=0)return;
+    const GunState g=gunSnapshot();
+    if(!g.ns||!g.firearm||g.hand<0||g.hand>1||(now>g.ns&&now-g.ns>250'000'000ull)){stats.ammoHidden.fetch_add(1,std::memory_order_relaxed);return;}
+    float d[3]{g.dir[0],g.dir[1],g.dir[2]};if(!normalize3(d,.5f))return;
+    const float ud=dot3(g.up,d);float u[3]{g.up[0]-d[0]*ud,g.up[1]-d[1]*ud,g.up[2]-d[2]*ud};if(!normalize3(u,.2f))return;
+    const float rt[3]{d[1]*u[2]-d[2]*u[1],d[2]*u[0]-d[0]*u[2],d[0]*u[1]-d[1]*u[0]}; // gun right = barrel x up
+    const float side=g.hand==0?-1.f:1.f;
+    const float along=float(props.ammoPlace[0].load(std::memory_order_relaxed))/1000.f,across=float(props.ammoPlace[1].load(std::memory_order_relaxed))/1000.f;
+    const float lift=float(props.ammoPlace[2].load(std::memory_order_relaxed))/1000.f,size=float(std::clamp(props.ammoPlace[3].load(std::memory_order_relaxed),20,200))/1000.f;
+    float c[3];for(unsigned i=0;i<3;++i)c[i]=g.base[i]+d[i]*along+rt[i]*side*across+u[i]*lift;
+    if(!finite3(c))return;
+    float te[3]{eye[0]-c[0],eye[1]-c[1],eye[2]-c[2]};if(!normalize3(te,.02f))return;
+    // face 1 = upright beside the gun -
+    // on the INNER side of the bore near the grip (along / across / lift from the bore point level with the model origin), the quad
+    // facing back along the barrel (to the shooter), image up = WORLD up across the barrel: it never rolls with the gun; face 2 = the strip along the gun below
+    if(props.ammoFace.load(std::memory_order_relaxed)!=2){
+        float cc[3];for(unsigned i=0;i<3;++i)cc[i]=g.base[i]+d[i]*along-rt[i]*side*across+u[i]*lift;
+        if(!finite3(cc))return;
+        const float zz[3]{-d[0],-d[1],-d[2]};
+        float y[3]{-zz[1]*zz[0],1.f-zz[1]*zz[1],-zz[1]*zz[2]};if(!normalize3(y,.1f)){for(unsigned i=0;i<3;++i)y[i]=u[i];}
+        const float x[3]{y[1]*zz[2]-y[2]*zz[1],y[2]*zz[0]-y[0]*zz[2],y[0]*zz[1]-y[1]*zz[0]};
+        const Q o=quatFromColumns(x,y,zz);for(unsigned i=0;i<3;++i)c[i]=cc[i];
+        auto& q=out.ammo;q=XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        q.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;q.space=local;q.eyeVisibility=XR_EYE_VISIBILITY_BOTH;
+        q.subImage.swapchain=consumer.swapchain;q.subImage.imageRect={{consumer.ammoRect[0],consumer.ammoRect[1]},{consumer.ammoRect[2],consumer.ammoRect[3]}};
+        q.pose.orientation={o.x,o.y,o.z,o.w};q.pose.position={c[0],c[1],c[2]};
+        q.size={size,size*float(consumer.ammoRect[3])/float(consumer.ammoRect[2])};
+        out.ammoValid=true;stats.ammoLayers.fetch_add(1,std::memory_order_relaxed);return;}
+    float z[3]{u[0],u[1],u[2]};
+    {const float k=dot3(te,d);float ep[3]{te[0]-d[0]*k,te[1]-d[1]*k,te[2]-d[2]*k};
+        if(normalize3(ep,.1f))for(unsigned i=0;i<3;++i)z[i]=ep[i];}
+    {const float t=float(std::clamp(props.ammoTilt.load(std::memory_order_relaxed),0,100))/100.f;
+     float z2[3]{z[0]+(te[0]-z[0])*t,z[1]+(te[1]-z[1])*t,z[2]+(te[2]-z[2])*t};if(normalize3(z2,.1f))for(unsigned i=0;i<3;++i)z[i]=z2[i];}
+    if(dot3(z,te)<0.f)for(float& v:z)v=-v; // seen from below (ammoface 0, gun rolled over): 180 deg about the barrel, still readable
+    const float dz=dot3(d,z);float y[3]{d[0]-z[0]*dz,d[1]-z[1]*dz,d[2]-z[2]*dz};if(!normalize3(y,.1f))return; // image up = towards the muzzle
+    const float x[3]{y[1]*z[2]-y[2]*z[1],y[2]*z[0]-y[0]*z[2],y[0]*z[1]-y[1]*z[0]};                                 // image right = y x z
+    const Q o=quatFromColumns(x,y,z);
+    auto& q=out.ammo;q=XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    q.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;q.space=local;q.eyeVisibility=XR_EYE_VISIBILITY_BOTH;
+    q.subImage.swapchain=consumer.swapchain;q.subImage.imageRect={{consumer.ammoRect[0],consumer.ammoRect[1]},{consumer.ammoRect[2],consumer.ammoRect[3]}};
+    q.pose.orientation={o.x,o.y,o.z,o.w};q.pose.position={c[0],c[1],c[2]};
+    q.size={size,size*float(consumer.ammoRect[3])/float(consumer.ammoRect[2])};
+    out.ammoValid=true;stats.ammoLayers.fetch_add(1,std::memory_order_relaxed);
+}
 } // namespace
 
 const char* stateName(State s) noexcept {
@@ -346,6 +483,9 @@ unsigned mode() noexcept {
     if(killed(Feature::Hud)||state()==State::Failed)return Off;
     if(const int f=props.forceMode.load(std::memory_order_relaxed);f==1||f==2)return unsigned(f);
     return settings().hudMode();
+}
+bool subtitlesWanted() noexcept {
+    return mode()!=Off&&!settings().subtitlesOff()&&props.subtitles.load(std::memory_order_relaxed)!=0;
 }
 void bind(VkPhysicalDevice physical,VkDevice device,std::uint32_t family) noexcept {
     readProps();
@@ -446,7 +586,8 @@ void submitted(VkQueue queue,std::uint32_t count,const VkSubmitInfo* submits,VkR
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=1;si.pCommandBuffers=&c;
     // The caller is inside the game's vkQueueSubmit hook on this queue: queue external synchronization is already held.
     if(vkQueueSubmit(queue,1,&si,slot.produceFence)!=VK_SUCCESS){slot.produceSubmitted=false;if(dump.slot==pick)dump.slot=-1;fail("PRODUCE_SUBMIT");return;}
-    slot.produceSubmitted=true;slot.sequence=++shared.sequence;slot.frame=s.frame;slot.publishedNs=nowNs();
+    slot.produceSubmitted=true;slot.sequence=++shared.sequence;slot.frame=s.frame;slot.publishedNs=nowNs();slot.subtitles=s.subtitles;
+    if(s.subtitles)stats.subtitleFrames.fetch_add(1,std::memory_order_relaxed);
     stats.published.fetch_add(1,std::memory_order_relaxed);stats.lastPublishedNs.store(slot.publishedNs,std::memory_order_relaxed);
     stats.lastFrame.store(s.frame,std::memory_order_relaxed);
     if(state()==State::Idle)setState(State::Ready);
@@ -484,7 +625,7 @@ void alphaFlush(void (*original)(),bool colorDraw) {
 bool xrFrame(XrSession session,VkQueue queue,std::uint32_t queueFamily,XrSpace local,const Pose views[2],const Pose& leftGrip,
              std::uint64_t now,Layers& out) noexcept {
     PreserveErrno keep;
-    out.headValid=out.wristValid=out.mapValid=false;
+    out.headValid=out.wristValid=out.mapValid=out.ammoValid=false;
     if((consumer.frames++&63)==0)readProps();
     stats.xrFrames.fetch_add(1,std::memory_order_relaxed);
     const unsigned m=mode();
@@ -549,18 +690,39 @@ bool xrFrame(XrSession session,VkQueue queue,std::uint32_t queueFamily,XrSpace l
                 for(unsigned i=0;i<4;++i)consumer.mapDst[i]=float(std::clamp(props.mapfix[4+i].load(),0,1000))/1000.f;
                 mapfix=ms[2]-ms[0]>=4&&ms[3]-ms[1]>=4;
             }
+            const bool subs=s.subtitles;
+            if(subs)mapfix=false;
+            // AMMO ON GUN, crop source (debug.rdrvr.vr.hud.ammocrop): the stock ammo element is cut out of the head image and scaled into
+            // the ammo strip; else the strip gets the clip / pool digits after the blits
+            const bool ammoOn=ammoWanted(m)&&!subs;std::array<std::int32_t,4> ac{};
+            bool ammoCrop=ammoOn&&props.ammoCrop[0].load(std::memory_order_relaxed)>=0;
+            if(ammoCrop){
+                auto px=[](int pm,std::int32_t size){return std::int32_t(std::clamp<long>(std::lround(double(pm)*double(size)/1000.0),0,long(size)));};
+                ac={px(props.ammoCrop[0].load(),W),px(props.ammoCrop[1].load(),H),px(props.ammoCrop[2].load(),W),px(props.ammoCrop[3].load(),H)};
+                ammoCrop=ac[2]-ac[0]>=4&&ac[3]-ac[1]>=4;
+            }
+            consumer.ammoDrawn=false;
             std::vector<std::array<std::int32_t,4>> holes;
             if(m==Hand)holes.push_back(r);
             if(mapfix)holes.push_back(ms);
+            if(ammoCrop)holes.push_back(ac);
             // PANEL: the head image is the Flash area only; the radar goes into the square [W, W+S) in HEAD and HAND
             const int fw=props.flash[0].load(std::memory_order_relaxed),fh=props.flash[1].load(std::memory_order_relaxed);
-            const bool panel=fw>=100&&fh>=100&&!mapfix;
-            if(panel){
+            const bool panel=fw>=100&&fh>=100&&!mapfix&&!subs;
+            if(subs){ // SUBTITLES: only the band, 1:1 into the top-left of the swapchain (the head quad shows that rect)
+                auto px=[](int pm,std::int32_t size){return std::int32_t(std::clamp<long>(std::lround(double(pm)*double(size)/1000.0),0,long(size)));};
+                std::int32_t b0=px(props.subBand[0].load(),W),b1=px(props.subBand[1].load(),H),b2=px(props.subBand[2].load(),W),b3=px(props.subBand[3].load(),H);
+                if(b2-b0<16||b3-b1<8){b0=0;b1=0;b2=W;b3=H;}
+                addBlit(head,b0,b1,b2,b3,0,0,b2-b0,b3-b1);
+                consumer.panelW=std::uint32_t(b2-b0);consumer.panelH=std::uint32_t(b3-b1);consumer.panelRadar=false;
+            }
+            else if(panel){
                 const std::int32_t pw=std::clamp<std::int32_t>(std::int32_t(std::lround(double(fw)*W/1000.0)),16,W),ph=std::clamp<std::int32_t>(std::int32_t(std::lround(double(fh)*H/1000.0)),16,H);
                 consumer.panelW=std::uint32_t(pw);consumer.panelH=std::uint32_t(ph);
                 holes.clear();
                 // radar rect pixels inside the Flash area would show twice: cut them (normally the radar lies below the Flash area)
                 if(r[1]<ph&&r[0]<pw)holes.push_back({r[0],r[1],std::min(r[2],pw),std::min(r[3],ph)});
+                if(ammoCrop&&ac[1]<ph&&ac[0]<pw)holes.push_back({ac[0],ac[1],std::min(ac[2],pw),std::min(ac[3],ph)}); // shown on the gun instead
                 if(!holes.empty()){
                     VkClearColorValue zero{};VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
                     vkCmdClearColorImage(c,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&zero,1,&range);
@@ -571,7 +733,7 @@ bool xrFrame(XrSession session,VkQueue queue,std::uint32_t queueFamily,XrSpace l
                 addBlit(wrist,r[0],r[1],r[2],r[3],W,0,W+S,S);
                 consumer.panelRadar=true;
             }else{consumer.panelW=std::uint32_t(W);consumer.panelH=std::uint32_t(H);consumer.panelRadar=false;}
-            if(panel){}
+            if(panel||subs){}
             else if(!holes.empty()){
                 // Head part without the holes: transparent everywhere, then the complement bands (zero extra rendering).
                 VkClearColorValue zero{};VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
@@ -580,12 +742,44 @@ bool xrFrame(XrSession session,VkQueue queue,std::uint32_t queueFamily,XrSpace l
                 vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&cb,0,nullptr,0,nullptr);
                 complementBlits(head,W,H,holes);
             }else addBlit(head,0,0,W,H,0,0,W,H);
-            if(m==Hand&&!panel)addBlit(wrist,r[0],r[1],r[2],r[3],W,0,W+S,S);
+            if(m==Hand&&!panel&&!subs)addBlit(wrist,r[0],r[1],r[2],r[3],W,0,W+S,S);
             if(mapfix)addBlit(wrist,ms[0],ms[1],ms[2],ms[3],W+S,0,W+2*S,S); // same scaled blit call (LINEAR)
-            consumer.mapShown=mapfix;
+            if(ammoCrop){ // the cropped stock ammo element into the ammo strip (aspect kept, top-left)
+                const double k=std::min(double(ammoW)/double(ac[2]-ac[0]),double(ammoH)/double(ac[3]-ac[1]));
+                const std::int32_t dw=std::clamp<std::int32_t>(std::int32_t(std::lround(double(ac[2]-ac[0])*k)),1,std::int32_t(ammoW));
+                const std::int32_t dh=std::clamp<std::int32_t>(std::int32_t(std::lround(double(ac[3]-ac[1])*k)),1,std::int32_t(ammoH));
+                const auto ax=std::int32_t(consumer.ammoX),ay=std::int32_t(consumer.ammoY);
+                addBlit(wrist,ac[0],ac[1],ac[2],ac[3],ax,ay,ax+dw,ay+dh);
+                consumer.ammoRect={ax,ay,dw,dh};consumer.ammoDrawn=true;
+            }
+            consumer.mapShown=mapfix;consumer.subtitles=subs;
             if(!head.empty())vkCmdBlitImage(c,s.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,std::uint32_t(head.size()),head.data(),VK_FILTER_NEAREST);
             if(!wrist.empty())vkCmdBlitImage(c,s.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,std::uint32_t(wrist.size()),wrist.data(),
                                               shared.linear?VK_FILTER_LINEAR:VK_FILTER_NEAREST);
+            if(ammoOn&&!ammoCrop&&ensureAmmoBuffer()){ // AMMO ON GUN digits: buffer (rewritten only when the text changed) -> the ammo strip
+                const GunState g=gunSnapshot();
+                const bool bgra=consumer.format==VK_FORMAT_B8G8R8A8_SRGB||consumer.format==VK_FORMAT_B8G8R8A8_UNORM;
+                const int clip=g.firearm?std::clamp(g.clip,-1,9999):-1,pool=g.infinite?-1:std::clamp(g.pool,-1,9999);
+                const std::int64_t key=(std::int64_t(clip+1)*10001+std::int64_t(pool+1))*2+(bgra?1:0);
+                if(key!=consumer.ammoKey){
+                    // WAR against the previous consume copy: covered by the ALL_COMMANDS barrier at the start of this command buffer
+                    consumer.ammoText=drawAmmoText(clip,pool,g.infinite,bgra);
+                    vkCmdUpdateBuffer(c,consumer.ammoBuffer,0,VkDeviceSize(ammoW)*ammoH*4u,consumer.ammoPixels.data());
+                    VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};bb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;bb.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+                    bb.srcQueueFamilyIndex=bb.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;bb.buffer=consumer.ammoBuffer;bb.size=VK_WHOLE_SIZE;
+                    vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,1,&bb,0,nullptr);
+                    consumer.ammoKey=key;stats.ammoUploads.fetch_add(1,std::memory_order_relaxed);
+                }
+                if(consumer.ammoText){
+                    VkMemoryBarrier wb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};wb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;wb.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+                    vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&wb,0,nullptr,0,nullptr);
+                    VkBufferImageCopy region{};region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+                    region.imageOffset={std::int32_t(consumer.ammoX),std::int32_t(consumer.ammoY),0};region.imageExtent={ammoW,ammoH,1};
+                    vkCmdCopyBufferToImage(c,consumer.ammoBuffer,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&region);
+                    consumer.ammoRect={std::int32_t(consumer.ammoX),std::int32_t(consumer.ammoY),std::int32_t(ammoW),std::int32_t(ammoH)};
+                    consumer.ammoDrawn=true;
+                }
+            }
             barrier(c,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             runtime::checkVk(vkEndCommandBuffer(c),"hud consume end");
@@ -611,7 +805,8 @@ bool xrFrame(XrSession session,VkQueue queue,std::uint32_t queueFamily,XrSpace l
     const Q head{views[0].q[0],views[0].q[1],views[0].q[2],views[0].q[3]};
     const float fwd0[3]{0,0,-1};float fwd[3];rot(head,fwd0,fwd);
     const float dist=float(std::clamp(props.dist.load(std::memory_order_relaxed),40,500))/100.f;
-    const float down=float(std::clamp(props.down.load(std::memory_order_relaxed),-30,45))*pi/180.f;
+    const bool subs=consumer.subtitles; // SUBTITLES frame: the band quad lower (subdown), nothing else
+    const float down=float(subs?std::clamp(props.subDown.load(std::memory_order_relaxed),-30,60):std::clamp(props.down.load(std::memory_order_relaxed),-30,45))*pi/180.f;
     const int degProp=props.deg.load(std::memory_order_relaxed);
     const float deg=degProp>0?float(degProp):settings().hudWidthDeg();
     const float width=2.f*dist*std::tan(std::clamp(deg,10.f,120.f)*pi/360.f);
@@ -641,6 +836,8 @@ bool xrFrame(XrSession session,VkQueue queue,std::uint32_t queueFamily,XrSpace l
     h.pose.orientation={orient.x,orient.y,orient.z,orient.w};h.pose.position={hp[0],hp[1],hp[2]};
     h.size={width,width*float(ph)/float(std::max(1u,pw))};
     out.headValid=true;stats.headLayers.fetch_add(1,std::memory_order_relaxed);
+    if(!subs&&ammoWanted(m))ammoLayer(local,center,now,out); // AMMO ON GUN (HEAD and HAND)
+    if(subs){stats.subtitleLayers.fetch_add(1,std::memory_order_relaxed);return true;}
     const float headH=h.size.height;
     // mapfix layer: a quad over the dst rect, 3 mm in front of its parent (head quad in HEAD, wrist radar in HAND)
     auto mapLayer=[&](const Q& parent,const float centre[3],float w,float hgt,float u0,float v0,float u1,float v1){
@@ -673,7 +870,7 @@ bool xrFrame(XrSession session,VkQueue queue,std::uint32_t queueFamily,XrSpace l
     }
     // ---- wrist quad (HAND): radar square on the back of the LEFT wrist ----
     if(consumer.displayedMode==Hand&&m==Hand){
-        if(!leftGrip.valid){stats.noGrip.fetch_add(1,std::memory_order_relaxed);return true;}
+        if(!leftGrip.valid){stats.noGrip.fetch_add(1,std::memory_order_relaxed);consumer.wristFade=0;return true;}
         const Q g{leftGrip.q[0],leftGrip.q[1],leftGrip.q[2],leftGrip.q[3]};
         // The VrArmIk grip convention (the body's hands sit right on it): hand forward = aim forward in grip (0,-.71,-.71), +X leaves
         // the LEFT palm (back of the left hand = -X); the wrist is 7 cm behind the grip origin along forward and 3 cm towards the back.
@@ -690,6 +887,10 @@ bool xrFrame(XrSession session,VkQueue queue,std::uint32_t queueFamily,XrSpace l
         const float off=-.03f+nx*(std::fabs(lift)+.03f);
         float local3[3]{off,k*along,k*along};
         Q wq2=wq;bool onArm=false;
+        // quad axes in the grip frame (x = towards the fingers, z = normal) and the skin side normal (before any turn to the eyes)
+        float ax[3]{fx[0],fx[1],fx[2]},az[3]{fz[0],fz[1],fz[2]},sideN[3]{fz[0],fz[1],fz[2]};
+        float eg[3]; // eye centre in the grip frame
+        {const Q gi{-g.x,-g.y,-g.z,g.w};const float ce[3]{center[0]-leftGrip.p[0],center[1]-leftGrip.p[1],center[2]-leftGrip.p[2]};rot(gi,ce,eg);}
         { // Sit on the IK'd body forearm published by VrBody (grip frame), so the map stays on the drawn arm - it twists only
           // by the body's roll share and does not follow wrist flexion. Stale (> 200 ms) / missing -> the rigid controller mapping above.
             const auto fa=forearm::snapshot();
@@ -704,19 +905,19 @@ bool xrFrame(XrSession session,VkQueue queue,std::uint32_t queueFamily,XrSpace l
                     const auto& R=fa.roll;const float s0=palm?1.f:-1.f;
                     auto axis=[&](int i,float out[3]){out[0]=R[std::size_t(i)];out[1]=R[std::size_t(3+i)];out[2]=R[std::size_t(6+i)];};
                     auto score=[&](int i){float a[3];axis(i,a);return std::fabs(a[0]*d[0]+a[1]*d[1]+a[2]*d[2]);};
-                    int along=0;for(int i=1;i<3;++i)if(score(i)>score(along))along=i;
+                    int alongAxis=0;for(int i=1;i<3;++i)if(score(i)>score(alongAxis))alongAxis=i;
                     int& pick=consumer.rollAxis;
                     auto sideDot=[&](int code){float a[3];axis(code>>1,a);return (code&1?-1.f:1.f)*a[0]*s0;}; // code = axis*2 + negate
-                    if(pick<0||(pick>>1)==along||sideDot(pick)<-.17f){
+                    if(pick<0||(pick>>1)==alongAxis||sideDot(pick)<-.17f){
                         pick=-1;float best=-2.f;
-                        for(int i=0;i<3;++i)if(i!=along)for(int ng=0;ng<2;++ng){const float v=sideDot(i*2+ng);if(v>best){best=v;pick=i*2+ng;}}
+                        for(int i=0;i<3;++i)if(i!=alongAxis)for(int ng=0;ng<2;++ng){const float v=sideDot(i*2+ng);if(v>best){best=v;pick=i*2+ng;}}
                         consumer.rollPicks++;
                     }
                     float n[3];axis(pick>>1,n);if(pick&1)for(float& x:n)x=-x;
-                    // (user: the map was visible only for a few frames): the quad turns towards the eyes about the forearm axis
-                    // (a quad seen from behind / edge-on vanished); the bone axis only picks the side when the eye lies along the arm.
-                    {Q gi{-g.x,-g.y,-g.z,g.w};const float ce[3]{center[0]-leftGrip.p[0],center[1]-leftGrip.p[1],center[2]-leftGrip.p[2]};float eg[3];rot(gi,ce,eg);
-                     const float ev[3]{eg[0]-wr[0],eg[1]-wr[1],eg[2]-wr[2]};const float ed=ev[0]*d[0]+ev[1]*d[1]+ev[2]*d[2];
+                    for(unsigned i=0;i<3;++i)sideN[i]=n[i];
+                    // the quad turns towards the eyes about the forearm axis
+                    // (a quad seen from behind / edge-on vanishes); the bone axis only picks the side when the eye lies along the arm.
+                    {const float ev[3]{eg[0]-wr[0],eg[1]-wr[1],eg[2]-wr[2]};const float ed=ev[0]*d[0]+ev[1]*d[1]+ev[2]*d[2];
                      float ep[3]{ev[0]-d[0]*ed,ev[1]-d[1]*ed,ev[2]-d[2]*ed};const float el=std::sqrt(ep[0]*ep[0]+ep[1]*ep[1]+ep[2]*ep[2]);
                      if(el>.02f&&props.wristFace.load(std::memory_order_relaxed)){for(unsigned i=0;i<3;++i)n[i]=ep[i]/el;consumer.faceFrames++;}}
                     const float nd=n[0]*d[0]+n[1]*d[1]+n[2]*d[2];
@@ -724,12 +925,13 @@ bool xrFrame(XrSession session,VkQueue queue,std::uint32_t queueFamily,XrSpace l
                     if(zl>.2f){
                         for(float& x:z)x/=zl;
                         const float y[3]{z[1]*d[2]-z[2]*d[1],z[2]*d[0]-z[0]*d[2],z[0]*d[1]-z[1]*d[0]};
-                        // (user: the map sat towards the elbow): the quad's near edge at the drawn wrist joint (centre size/2 + 1 cm
-                        // behind it); "along" now only shifts that (along - 130 mm, default 0)
+                        // the quad's near edge at the drawn wrist joint (centre size/2 + 1 cm
+                        // behind it); "along" only shifts that (along - 130 mm, default 0)
                         const float back=std::clamp(size*.5f+.01f+(along-.13f),0.f,dl);
                         const float r=.03f+std::fabs(lift);
                         for(unsigned i=0;i<3;++i)local3[i]=wr[i]-d[i]*back+z[i]*r;
                         wq2=mul(g,quatFromColumns(d,y,z));onArm=true;
+                        for(unsigned i=0;i<3;++i){ax[i]=d[i];az[i]=z[i];}
                     }
                 }
             }
@@ -737,31 +939,80 @@ bool xrFrame(XrSession session,VkQueue queue,std::uint32_t queueFamily,XrSpace l
             consumer.diagOnArm=onArm;consumer.diagLocal={local3[0],local3[1],local3[2]};
             {const float dx=fa.wrist[0]-fa.elbow[0],dy=fa.wrist[1]-fa.elbow[1],dz=fa.wrist[2]-fa.elbow[2];consumer.diagLen=std::sqrt(dx*dx+dy*dy+dz*dz);}
         }
+        // the quad also tilts towards the eyes about its own cross axis
+        // (debug.rdrvr.vr.hud.wristtilt % of the remaining angle, default 70; the forearm turn above only rolls it), so it is read
+        // nearly face-on while it still lies along the arm (image right stays towards the fingers).
+        float facing=1.f,across=0.f;bool facingValid=false;
+        {float te[3]{eg[0]-local3[0],eg[1]-local3[1],eg[2]-local3[2]};
+         if(normalize3(te,.02f)){
+            facing=dot3(sideN,te);across=std::fabs(dot3(ax,te));facingValid=true;
+            const float t=float(std::clamp(props.wristTilt.load(std::memory_order_relaxed),0,100))/100.f;
+            float z2[3]{az[0]+(te[0]-az[0])*t,az[1]+(te[1]-az[1])*t,az[2]+(te[2]-az[2])*t};
+            if(t>0.f&&normalize3(z2,.1f)){
+                const float xz=dot3(ax,z2);float x2[3]{ax[0]-z2[0]*xz,ax[1]-z2[1]*xz,ax[2]-z2[2]*xz};
+                if(normalize3(x2,.2f)){const float y2[3]{z2[1]*x2[2]-z2[2]*x2[1],z2[2]*x2[0]-z2[0]*x2[2],z2[0]*x2[1]-z2[1]*x2[0]};wq2=mul(g,quatFromColumns(x2,y2,z2));}
+            }
+         }}
         float w[3];rot(g,local3,w);
         const float wp[3]{leftGrip.p[0]+w[0],leftGrip.p[1]+w[1],leftGrip.p[2]+w[2]};
         const Q wqUse=wq2;
         if(!finite3(wp))return true;
+        // Reveal: fades in (~0.1 s) while looked at (gaze cone ~57..44 deg, <= 0.95 m) AND while the wrist is turned towards the face
+        // debug.rdrvr.vr.hud.wristfacing 1 (default) = the forearm lies across the view like a
+        // watch check (fades out as it points at the eyes, |cos| .6 -> .85: the map edge-on), 2 = the requested skin side (palm /
+        // back) faces the eyes, 0 = gaze only.
+        float target=1.f;
         if(props.gaze.load(std::memory_order_relaxed)){
             const float v[3]{wp[0]-center[0],wp[1]-center[1],wp[2]-center[2]};
-            const float len=std::sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
-            if(len>0.95f||(len>0.01f&&(v[0]*fwd[0]+v[1]*fwd[1]+v[2]*fwd[2])/len<0.55f)){stats.gazeHidden.fetch_add(1,std::memory_order_relaxed);return true;}
+            const float len=std::sqrt(dot3(v,v));const float c=len>0.01f?dot3(v,fwd)/len:1.f;consumer.diagGaze=c;
+            target*=smooth(.55f,.72f,c)*(1.f-smooth(.85f,.95f,len));
         }
+        const int facingMode=props.wristFacing.load(std::memory_order_relaxed);
+        consumer.diagFacing=facingMode==2?facing:across;
+        if(facingValid&&facingMode==1)target*=1.f-smooth(.6f,.85f,across);
+        else if(facingValid&&facingMode==2)target*=smooth(-.15f,.25f,facing);
+        consumer.wristFade+=(target-consumer.wristFade)*std::min(1.f,dt*10.f);
+        if(!std::isfinite(consumer.wristFade))consumer.wristFade=0;
+        if(consumer.wristFade<.03f){stats.gazeHidden.fetch_add(1,std::memory_order_relaxed);return true;}
         auto& x=out.wrist;x=XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
         x.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;x.space=local;x.eyeVisibility=XR_EYE_VISIBILITY_BOTH;
         x.subImage.swapchain=consumer.swapchain;x.subImage.imageRect={{std::int32_t(consumer.headW),0},{std::int32_t(consumer.strip),std::int32_t(consumer.strip)}};
         x.pose.orientation={wqUse.x,wqUse.y,wqUse.z,wqUse.w};x.pose.position={wp[0],wp[1],wp[2]};x.size={size,size};
         out.wristValid=true;stats.wristLayers.fetch_add(1,std::memory_order_relaxed);
-        out.wristAlphaScale=float(props.wristAlpha.load(std::memory_order_relaxed))/100.f;
+        out.wristAlphaScale=float(props.wristAlpha.load(std::memory_order_relaxed))/100.f*std::min(1.f,consumer.wristFade); // x fade (colour scale)
         if(consumer.mapShown){const auto& r=consumer.radarPx;const float W=float(std::max(1u,consumer.headW)),H=float(std::max(1u,consumer.headH));
             mapLayer(wqUse,wp,size,size,float(r[0])/W,float(r[1])/H,float(r[2])/W,float(r[3])/H);}
     }
     return true;
 }
 void xrSessionEnded() noexcept {destroySwapchain();consumer.session={};consumer.init=false;}
+void noteGun(const float map[16],const float muzzle[3],const float dir[3],const float up[3],const float modelOrigin[3],
+             const float gripLocal[3],const float aimLocalQ[4],int hand,bool firearm,int clip,int pool,bool infinite) noexcept {
+    if(!map||!muzzle||!dir||!up||!modelOrigin||!gripLocal||!aimLocalQ)return;
+    // map columns = upm x the LOCAL axes in world (uniform scale): local = cols^T (world - t) / upm^2, a direction cols^T d / upm
+    const float s2=map[0]*map[0]+map[1]*map[1]+map[2]*map[2];if(!std::isfinite(s2)||!(s2>1e-8f))return;
+    const float s=std::sqrt(s2);
+    const auto point=[&](const float w[3],float o[3]){const float v[3]{w[0]-map[12],w[1]-map[13],w[2]-map[14]};
+        for(unsigned k=0;k<3;++k)o[k]=(map[4*k]*v[0]+map[4*k+1]*v[1]+map[4*k+2]*v[2])/s2;};
+    const auto direction=[&](const float w[3],float o[3]){for(unsigned k=0;k<3;++k)o[k]=(map[4*k]*w[0]+map[4*k+1]*w[1]+map[4*k+2]*w[2])/s;};
+    GunState st{};point(muzzle,st.muzzle);direction(dir,st.dir);
+    if(!finite3(st.muzzle)||!normalize3(st.dir,.5f))return;
+    direction(up,st.up);
+    if(!normalize3(st.up,.5f)){const Q a{aimLocalQ[0],aimLocalQ[1],aimLocalQ[2],aimLocalQ[3]};const float y0[3]{0,1,0};rot(a,y0,st.up);} // no locator up
+    float ref[3]{gripLocal[0],gripLocal[1],gripLocal[2]};
+    if(modelOrigin[0]!=0.f||modelOrigin[1]!=0.f||modelOrigin[2]!=0.f){ // the drawn MODEL origin (as the scope lens), not the controller grip
+        float mo[3];point(modelOrigin,mo);const float dm[3]{mo[0]-st.muzzle[0],mo[1]-st.muzzle[1],mo[2]-st.muzzle[2]};
+        if(finite3(mo)&&dot3(dm,dm)<1.5f*1.5f)for(unsigned i=0;i<3;++i)ref[i]=mo[i];}
+    const float rm[3]{ref[0]-st.muzzle[0],ref[1]-st.muzzle[1],ref[2]-st.muzzle[2]};const float k=dot3(rm,st.dir);
+    for(unsigned i=0;i<3;++i)st.base[i]=st.muzzle[i]+st.dir[i]*k; // the bore point level with the model origin / grip
+    if(!finite3(st.base))return;
+    st.hand=hand;st.firearm=firearm;st.clip=clip;st.pool=pool;st.infinite=infinite;st.ns=nowNs();
+    std::lock_guard lock(gunMutex);gun=st;
+}
 void shutdownAfterIdle(VkDevice d) noexcept {
     std::lock_guard lock(shared.mutex);
     if(!d||d!=shared.device)return;
-    destroyDump();destroyImages();
+    destroyDump();destroyImages();destroyAmmoBuffer(d);consumer.ammoFailed=false;consumer.ammoDrawn=false;
     for(auto& s:shared.slots){
         if(s.produceFence)vkDestroyFence(d,s.produceFence,nullptr);
         if(s.consumeFence)vkDestroyFence(d,s.consumeFence,nullptr);
@@ -774,7 +1025,7 @@ void shutdownAfterIdle(VkDevice d) noexcept {
     if(state()!=State::Failed&&state()!=State::Killed)setState(State::Off);
 }
 std::string report() {
-    std::ostringstream o;const auto now=nowNs();const auto last=stats.lastPublishedNs.load();
+    std::ostringstream o;const auto now=nowNs();const auto last=stats.lastPublishedNs.load();const GunState gs=gunSnapshot();
     const char* modes[3]{"OFF","HEAD","HAND"};const unsigned m=mode();
     o<<"{\"state\":\""<<stateName(state())<<"\",\"mode\":\""<<modes[m<3?m:0]<<"\",\"killed\":"<<(killed(Feature::Hud)?"true":"false")
      <<",\"frames\":"<<stats.published.load()<<",\"lastAgeMs\":"<<(last&&now>last?double(now-last)/1e6:-1.0)<<",\"lastFrame\":"<<stats.lastFrame.load()
@@ -796,8 +1047,17 @@ std::string report() {
      <<",\"wrist\":["<<props.wrist[0].load()<<','<<props.wrist[1].load()<<','<<props.wrist[2].load()<<"]"
      <<",\"mapfix\":["<<props.mapfix[0].load()<<','<<props.mapfix[1].load()<<','<<props.mapfix[2].load()<<','<<props.mapfix[3].load()<<','
      <<props.mapfix[4].load()<<','<<props.mapfix[5].load()<<','<<props.mapfix[6].load()<<','<<props.mapfix[7].load()<<"],\"dump\":"<<props.dump.load()<<"}"
+     <<",\"subtitles\":{\"wanted\":"<<(subtitlesWanted()?"true":"false")<<",\"frames\":"<<stats.subtitleFrames.load()<<",\"layers\":"<<stats.subtitleLayers.load()
+     <<",\"band\":["<<props.subBand[0].load()<<','<<props.subBand[1].load()<<','<<props.subBand[2].load()<<','<<props.subBand[3].load()<<"],\"down\":"<<props.subDown.load()<<'}'
+     <<",\"ammo\":{\"on\":"<<(settings().hudAmmo()?1:0)<<",\"layers\":"<<stats.ammoLayers.load()<<",\"hidden\":"<<stats.ammoHidden.load()
+     <<",\"uploads\":"<<stats.ammoUploads.load()<<",\"failed\":"<<(consumer.ammoFailed?1:0)<<",\"drawn\":"<<(consumer.ammoDrawn?1:0)
+     <<",\"gunAgeMs\":"<<(gs.ns&&now>gs.ns?double(now-gs.ns)/1e6:-1.0)<<",\"clip\":"<<gs.clip<<",\"pool\":"<<gs.pool<<",\"infinite\":"<<(gs.infinite?1:0)
+     <<",\"hand\":"<<gs.hand<<",\"firearm\":"<<(gs.firearm?1:0)
+     <<",\"place\":["<<props.ammoPlace[0].load()<<','<<props.ammoPlace[1].load()<<','<<props.ammoPlace[2].load()<<','<<props.ammoPlace[3].load()<<']'
+     <<",\"crop\":["<<props.ammoCrop[0].load()<<','<<props.ammoCrop[1].load()<<','<<props.ammoCrop[2].load()<<','<<props.ammoCrop[3].load()
+     <<"],\"tilt\":"<<props.ammoTilt.load()<<",\"face\":"<<props.ammoFace.load()<<'}'
      <<",\"mapLayers\":"<<stats.mapLayers.load()<<",\"wristOnArm\":"<<stats.wristOnArm.load()<<",\"rollAxis\":"<<consumer.rollAxis<<",\"rollPicks\":"<<consumer.rollPicks
-     <<",\"wristDiag\":{\"faceFrames\":"<<consumer.faceFrames<<",\"onArm\":"<<(consumer.diagOnArm?1:0)<<",\"ageMs\":"<<consumer.diagAgeMs<<",\"forearmM\":"<<consumer.diagLen
+     <<",\"wristDiag\":{\"fade\":"<<consumer.wristFade<<",\"facing\":"<<consumer.diagFacing<<",\"gaze\":"<<consumer.diagGaze<<",\"tilt\":"<<props.wristTilt.load()<<",\"faceFrames\":"<<consumer.faceFrames<<",\"onArm\":"<<(consumer.diagOnArm?1:0)<<",\"ageMs\":"<<consumer.diagAgeMs<<",\"forearmM\":"<<consumer.diagLen
      <<",\"elbow\":["<<consumer.diagElbow[0]<<','<<consumer.diagElbow[1]<<','<<consumer.diagElbow[2]<<"],\"wrist\":["<<consumer.diagWrist[0]<<','<<consumer.diagWrist[1]<<','<<consumer.diagWrist[2]
      <<"],\"quad\":["<<consumer.diagLocal[0]<<','<<consumer.diagLocal[1]<<','<<consumer.diagLocal[2]<<"]}"<<",\"dumps\":"<<stats.dumps.load()<<",\"dumpFailures\":"<<stats.dumpFailures.load()
      <<",\"alpha\":{\"live\":"<<(alphaLive()?"true":"false")<<",\"normalized\":"<<stats.alphaNormalized.load()<<",\"unsupported\":"<<stats.alphaUnsupported.load()
