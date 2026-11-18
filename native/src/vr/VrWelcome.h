@@ -50,7 +50,7 @@ inline void compose(char* out,std::size_t size) noexcept {
         "\n"
         "  CONTROLS: HOLD THE LEFT MENU BUTTON > CONTROLS\n"
         "  DISCORD:\n"
-        "  \x02https://discord.gg/5pUVuZVQj\n"
+        "  \x02https://discord.gg/rFUacmVfW\n"
         "  PRESS ANY BUTTON TO CLOSE\n",::rdrvr::runtime::modVersion,block);
 }
 enum class State : std::uint8_t {Waiting,Shown,Closing,Done};

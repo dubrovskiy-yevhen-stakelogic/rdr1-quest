@@ -236,4 +236,4 @@
   near the camera, not John.
 
 If you find other problems, please report them to the developer on the Discord
-server: https://discord.gg/5pUVuZVQj
+server: https://discord.gg/rFUacmVfW

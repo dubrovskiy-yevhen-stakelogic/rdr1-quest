@@ -1,5 +1,14 @@
 # Red Dead Redemption VR for Quest
 
+> **Warning: check your game build before you buy.**
+> Red Dead Redemption for Android exists in more builds than the Rockstar and
+> Netflix editions, and the exact number of builds is not known. The mod
+> currently supports one Rockstar build only. The Netflix edition does not
+> work at all yet. There is no guarantee that your Rockstar copy is the
+> supported build, so think twice before you buy the game for this mod.
+> If your build is not supported, share it with the developer on the Discord
+> server (https://discord.gg/rFUacmVfW) and support for it will be attempted.
+
 Version `0.3.0 alpha`. Source code and build tools for the Quest VR mod. See
 [CHANGELOG.md](CHANGELOG.md) for what changed and for the known issues.
 
@@ -226,7 +235,7 @@ choose a different input, or add `-Rebuild` to force a fresh build.
 To report a bug, open the VR menu and press A on **SAVE LOG** right after the
 problem. It writes a report to `rdrvr/saved-logs` on the headset that survives a
 game restart; the 40 newest stay. Then run `COLLECT_REPORT.bat` and send the
-result to the developer on the Discord server: https://discord.gg/5pUVuZVQj
+result to the developer on the Discord server: https://discord.gg/rFUacmVfW
 
 New rows in the VR menu and their defaults:
 
