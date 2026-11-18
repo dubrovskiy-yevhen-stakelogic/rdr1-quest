@@ -265,7 +265,9 @@ public:
     // object (anti-aliasing source view) refers to them; a slot still reading them is
     // waited for (bounded, holds the mailbox lock). False on timeout.
     bool releaseSources(const std::array<VkImage,2>& images,std::uint64_t timeoutNs) noexcept;
-    bool render(XrSession,std::uint64_t trackingEpoch,std::uint64_t spaceEpoch,std::uint64_t nowNs,StereoLayer&);
+    // bridging: a presentation change between two stereo views is in progress (XrHarness, StereoBridge.h): a pair older than
+    // maxAgeNs repeats the displayed one (same tracking / reference-space epochs) instead of no layer.
+    bool render(XrSession,std::uint64_t trackingEpoch,std::uint64_t spaceEpoch,std::uint64_t nowNs,StereoLayer&,bool bridging=false);
     // XR thread, right after xrEndFrame of a world stereo frame: acquire + wait the next ticket ahead (see Ticket).
     void prefetchImages();
     void setXrFrame(std::uint64_t frame) noexcept {xrFrameNow_=frame;} // XR thread, before render() (the frame that publishes views)

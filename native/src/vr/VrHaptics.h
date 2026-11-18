@@ -18,11 +18,11 @@
 namespace rdrvr::vr::haptics {
 enum Source : std::uint16_t {SourceOther=0,SourceSlotEnter=1,SourceGrab=2,SourceReturn=3,SourceRefuse=4,
     SourceMeleeHit=5,SourceMeleeKill=6,SourceParry=7,
-    SourceReload=8,SourceHammer=9,SourceSpin=10,SourceTeleport=11,SourceLasso=12,
-    SourceCount=13};
+    SourceReload=8,SourceHammer=9,SourceSpin=10,SourceTeleport=11,SourceLasso=12,SourceContact=13,
+    SourceCount=14};
 inline constexpr std::uint16_t sourceSlots=16; // bySource size
 inline constexpr std::array<Source,SourceCount> allSources{SourceOther,SourceSlotEnter,SourceGrab,SourceReturn,SourceRefuse,SourceMeleeHit,
-    SourceMeleeKill,SourceParry,SourceReload,SourceHammer,SourceSpin,SourceTeleport,SourceLasso};
+    SourceMeleeKill,SourceParry,SourceReload,SourceHammer,SourceSpin,SourceTeleport,SourceLasso,SourceContact};
 inline constexpr bool sourceIdsUnique() noexcept {
     for(std::size_t i=0;i<allSources.size();++i){if(allSources[i]>=sourceSlots)return false;
         for(std::size_t j=i+1;j<allSources.size();++j)if(allSources[i]==allSources[j])return false;}
@@ -88,14 +88,14 @@ inline std::string report() {
     char b[768];
     std::snprintf(b,sizeof b,"{\"enabled\":%s,\"posted\":%llu,\"started\":%llu,\"dropped\":%llu,\"stale\":%llu,\"merged\":%llu,\"suppressed\":%llu,"
         "\"bySource\":{\"enter\":%llu,\"grab\":%llu,\"return\":%llu,\"refuse\":%llu,\"meleeHit\":%llu,\"meleeKill\":%llu,"
-        "\"reload\":%llu,\"hammer\":%llu,\"spin\":%llu,\"teleport\":%llu,\"lasso\":%llu}}", // + reload, hammer, spin, teleport, lasso
+        "\"reload\":%llu,\"hammer\":%llu,\"spin\":%llu,\"teleport\":%llu,\"lasso\":%llu,\"contact\":%llu}}", // + reload, hammer, spin, teleport, lasso, contact
         enabled.load()?"true":"false",(unsigned long long)posted.load(),(unsigned long long)started.load(),(unsigned long long)dropped.load(),
         (unsigned long long)stale.load(),(unsigned long long)merged.load(),(unsigned long long)suppressed.load(),
         (unsigned long long)bySource[SourceSlotEnter].load(),(unsigned long long)bySource[SourceGrab].load(),
         (unsigned long long)bySource[SourceReturn].load(),(unsigned long long)bySource[SourceRefuse].load(),
         (unsigned long long)bySource[SourceMeleeHit].load(),(unsigned long long)bySource[SourceMeleeKill].load(),
         (unsigned long long)bySource[SourceReload].load(),(unsigned long long)bySource[SourceHammer].load(),(unsigned long long)bySource[SourceSpin].load(),
-        (unsigned long long)bySource[SourceTeleport].load(),(unsigned long long)bySource[SourceLasso].load());
+        (unsigned long long)bySource[SourceTeleport].load(),(unsigned long long)bySource[SourceLasso].load(),(unsigned long long)bySource[SourceContact].load());
     return b;
 }
 } // namespace rdrvr::vr::haptics

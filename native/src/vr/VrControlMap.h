@@ -28,6 +28,8 @@ inline constexpr std::array<std::array<const char*,buttonCount>,LayoutCount> act
     {"SPUR / GALLOP","JUMP","X BUTTON / HOLD: INVENTORY","DISMOUNT / USE","L3 - UNUSED","DEAD EYE (GUN OR LT +)"}}};
 // physical[layout][logical] = the physical button index that performs logical button `logical`
 struct Map {std::array<std::array<std::uint8_t,buttonCount>,LayoutCount> physical{{{0,1,2,3,4,5},{0,1,2,3,4,5}}};};
+// GUN DEAD EYE: on foot the crouch button with a gun in a VR hand starts Dead Eye (ON) or still crouches (OFF: Dead Eye stays on LT + that button).
+inline std::atomic<bool> gunDeadEye{true};
 inline std::atomic<std::uint64_t> packed{0}; // published Map (6 x 2 x 3 bits); 0 = identity (never valid otherwise: logical 0 -> physical 0 ...)
 inline constexpr std::uint64_t pack(const Map& m) noexcept {std::uint64_t v=0;for(unsigned l=0;l<LayoutCount;++l)for(unsigned b=0;b<buttonCount;++b)v|=std::uint64_t(m.physical[l][b]&7u)<<((l*buttonCount+b)*3);return v;}
 inline constexpr Map unpack(std::uint64_t v) noexcept {Map m{};for(unsigned l=0;l<LayoutCount;++l)for(unsigned b=0;b<buttonCount;++b)m.physical[l][b]=std::uint8_t((v>>((l*buttonCount+b)*3))&7u);return m;}
@@ -55,6 +57,8 @@ inline bool save(const Map& m) noexcept {
     std::fprintf(f,"version=1\n");
     for(unsigned l=0;l<LayoutCount;++l)for(unsigned b=0;b<buttonCount;++b)std::fprintf(f,"%s.%s=%s\n",layoutCfg[l],buttonNames[b],buttonNames[m.physical[l][b]]);
     std::fprintf(f,"horse.reins=%s\n",reins::menuOn.load(std::memory_order_relaxed)?"ON":"OFF");
+    std::fprintf(f,"coach.reins=%s\n",coach::menuOn.load(std::memory_order_relaxed)?"ON":"OFF");
+    std::fprintf(f,"foot.gundeadeye=%s\n",gunDeadEye.load(std::memory_order_relaxed)?"ON":"OFF");
     const bool ok=std::fflush(f)==0&&std::fclose(f)==0&&std::rename(tmp.c_str(),path.c_str())==0;
     (ok?saves:saveFailures).fetch_add(1);return ok;
 }
@@ -66,6 +70,8 @@ inline void loadOnce() noexcept {
         while(std::fgets(line,sizeof line,f)){
             char key[32]{},val[8]{};if(std::sscanf(line," %31[^=]=%7s",key,val)!=2)continue;
             if(std::strcmp(key,"horse.reins")==0){reins::menuOn.store(std::strcmp(val,"OFF")!=0,std::memory_order_relaxed);continue;}
+            if(std::strcmp(key,"coach.reins")==0){coach::menuOn.store(std::strcmp(val,"OFF")!=0,std::memory_order_relaxed);continue;}
+            if(std::strcmp(key,"foot.gundeadeye")==0){gunDeadEye.store(std::strcmp(val,"OFF")!=0,std::memory_order_relaxed);continue;}
             const char* dot=std::strchr(key,'.');if(!dot)continue;
             unsigned l=0;while(l<LayoutCount&&std::strncmp(key,layoutCfg[l],std::size_t(dot-key))!=0)++l;
             unsigned b=0;while(b<buttonCount&&std::strcmp(dot+1,buttonNames[b])!=0)++b;
@@ -86,12 +92,16 @@ inline void step(unsigned row,int dir) noexcept {
     m.physical[l][logical]=std::uint8_t(next);
     const auto v=pack(m);packed.store(v==pack(Map{})?0:v,std::memory_order_release);edits.fetch_add(1);save(m);
 }
-inline void resetDefaults() noexcept {loadOnce();packed.store(0,std::memory_order_release);reins::menuOn.store(true,std::memory_order_relaxed);edits.fetch_add(1);save(Map{});}
+inline void resetDefaults() noexcept {loadOnce();packed.store(0,std::memory_order_release);reins::menuOn.store(true,std::memory_order_relaxed);coach::menuOn.store(true,std::memory_order_relaxed);gunDeadEye.store(true,std::memory_order_relaxed);edits.fetch_add(1);save(Map{});}
 // REINS row: OFF / ON (saved with the button map)
 inline void toggleReins() noexcept {loadOnce();reins::menuOn.store(!reins::menuOn.load(std::memory_order_relaxed),std::memory_order_relaxed);edits.fetch_add(1);save(current());}
+// COACH REINS row: OFF / ON (saved with the button map)
+inline void toggleCoachReins() noexcept {loadOnce();coach::menuOn.store(!coach::menuOn.load(std::memory_order_relaxed),std::memory_order_relaxed);edits.fetch_add(1);save(current());}
+// GUN DEAD EYE row: ON / OFF (saved with the button map)
+inline void toggleGunDeadEye() noexcept {loadOnce();gunDeadEye.store(!gunDeadEye.load(std::memory_order_relaxed),std::memory_order_relaxed);edits.fetch_add(1);save(current());}
 inline std::string report() {
     const auto m=current();std::string o="{\"loadOk\":";o+=loadOk.load()?"true":"false";o+=",\"remapped\":";o+=packed.load()?"true":"false";
-    o+=",\"frames\":"+std::to_string(remappedFrames.load())+",\"edits\":"+std::to_string(edits.load())+",\"saves\":"+std::to_string(saves.load())+",\"saveFailures\":"+std::to_string(saveFailures.load());
+    o+=",\"gunDeadEye\":";o+=gunDeadEye.load()?"true":"false";o+=",\"frames\":"+std::to_string(remappedFrames.load())+",\"edits\":"+std::to_string(edits.load())+",\"saves\":"+std::to_string(saves.load())+",\"saveFailures\":"+std::to_string(saveFailures.load());
     for(unsigned l=0;l<LayoutCount;++l){o+=",\"";o+=layoutCfg[l];o+="\":\"";for(unsigned b=0;b<buttonCount;++b){o+=buttonNames[m.physical[l][b]];if(b+1<buttonCount)o+=' ';}o+='"';}
     return o+"}";
 }

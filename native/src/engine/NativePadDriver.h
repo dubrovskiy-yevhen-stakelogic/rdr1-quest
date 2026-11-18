@@ -102,7 +102,7 @@ public:
     std::uint64_t created()const{return created_.load();}
     std::string deliveryReport()const{return diagnostics_.report();}
     // Called on the same native input thread after a menu/world transition.
-    void rearm() noexcept {policy_.invalidate();if(outputDriver_==this)outputDriver_=nullptr;}
+    void rearm() noexcept {policy_.invalidate(runtime::rearmDiag.lastChangeWhy.load(std::memory_order_relaxed));if(outputDriver_==this)outputDriver_=nullptr;}
     // Output is accepted only on the native thread that most recently supplied
     // ready Touch input, and only while slot zero still belongs to the driver's virtual pad.
     bool outputInput(std::uint64_t now,runtime::ControllerSample& out)const noexcept {

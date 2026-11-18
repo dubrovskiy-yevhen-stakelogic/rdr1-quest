@@ -1,5 +1,7 @@
 #pragma once
 #include "runtime/Presentation.h"
+#include "runtime/ControllerInput.h"
+#include "runtime/StereoBridge.h"
 #include "NativeCameraContext.h"
 #include "NativeScopeContext.h"
 #include <array>
@@ -10,6 +12,9 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 namespace rdrvr::engine {
 struct NativeUiApi {
     bool (*read)(void*,std::uintptr_t,void*,std::size_t){};
@@ -26,6 +31,14 @@ struct PresentationTransition {
     std::uint64_t ns{};runtime::PresentationContext from{},to{};std::uintptr_t top{};
     const char* status{},*veto{},*cameraClass{};char camera[16]{};
 };
+// debug.rdrvr.vr.input.softarm 0 = every re-arm waits for the whole pad at rest (read on presentation changes only).
+inline bool softArmLever() noexcept {
+#if defined(__ANDROID__)
+    char v[PROP_VALUE_MAX]{};const int saved=errno;const bool off=__system_property_get("debug.rdrvr.vr.input.softarm",v)>0&&v[0]=='0';errno=saved;return !off;
+#else
+    return true;
+#endif
+}
 class NativeUiContext {
     NativeUiApi api_{};runtime::PresentationMailbox& mailbox_;
     std::thread::id owner_{};bool owned_{},inputRearm_{};
@@ -165,10 +178,16 @@ public:
             }else{++rejected_;status_=rejected;veto=rejected;}
         }catch(...){++rejected_;status_="UI_QUERY_FAILED";veto="UI_QUERY_FAILED";}
         if(!shot)shotSince_.store(0,std::memory_order_relaxed);else if(!shotSince_.load(std::memory_order_relaxed))shotSince_.store(now?now:1,std::memory_order_relaxed);
+        // Before the publish: a thread that sees this CameraOverride (the mailbox mutex) also sees the shot start and its report run.
+        runtime::bridge::shotSinceNs.store(shotSince_.load(std::memory_order_relaxed),std::memory_order_relaxed);
+        {using P=runtime::PresentationContext;
+         if(context==P::CameraOverride&&previous_!=P::CameraOverride)runtime::bridge::shots.begin(now,cameraClass(cameraMode,cameraTop));
+         else if(previous_==P::CameraOverride&&context!=P::CameraOverride)runtime::bridge::shots.end(now);}
         const bool changed=mailbox_.publish(context,now);
         const char* const statusAfter=status_.load();
         if(changed||statusAfter!=statusBefore)remember(now,changed?previous_:context,context,statusAfter,veto?veto:freshStereoVeto(now),cameraTop,cameraClass(cameraMode,cameraTop),cameraWrapper);
         inputRearm_=changed&&!runtime::preserveHeldInput(previous_,context);
+        if(changed)runtime::notePresentationChange(previous_,context,now,softArmLever()); // SOFT RE-ARM window (runtime/ControllerInput.h)
         if(changed){previous_=context;++changes_;}return changed;
     }
 };

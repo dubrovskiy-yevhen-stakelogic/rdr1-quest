@@ -80,6 +80,10 @@ static_assert(rdrvr::runtime::GraphicsSettings::s02MaskBits==rdrvr::engine::s02:
 #include "vr/VrControls.h"       // Controls: fast jump hook install, report vr.controls
 #include "vr/VrMelee.h"          // MELEE: install (prints, GOT hook SetupActionTreePacket), report vr.melee
 #include "vr/VrCover.h"          // AUTO COVER: install (COVER input filter + SetAttachRequest GOT hooks), report vr.cover
+#include "vr/VrNpcAim.h"         // NPC AIM: install (prints / GOT words, GetBestTarget GOT hook), report vr.npcAim
+#include "vr/VrWheel.h"          // WHEEL: install (prints / GOT word, CanQuickPickActivate GOT hook), report vr.wheel
+#include "vr/VrNoAutoAim.h"      // NO AUTO AIM: install (prints / GOT words, reticle PreUpdate + UpdateReticleParams GOT hooks), report vr.noAutoAim
+#include "vr/VrHandPhys.h"       // HAND PHYSICS: install (prints / GOT words), report vr.handphys
 #include "vr/VrBody.h"           // BODY: install, report vr.body
 #include "vr/VrCutscene.h"       // CUTSCENES: report vr.cutscene
 #include "vr/VrCutsceneSteady.h" // CUTSCENE PROPS / LIGHTS / SUN: report vr.cutscene.steady
@@ -94,6 +98,7 @@ static_assert(rdrvr::runtime::GraphicsSettings::s02MaskBits==rdrvr::engine::s02:
 #include "vr/TaaPass.h"          // TAA: report vr.taa
 #include "vr/ScopePass.h"        // SNIPER SCOPE: report vr.scope
 #include "vr/VrHud.h"            // HUD: optional coverage alpha on the HUD draw flushes, report vr.hud
+#include "vr/VrBodyLink.h"       // PLAYER ARROW: body::headYaw fallback (the head yaw the CAMERA publishes)
 #include "vr/VrCheats.h"         // CHEATS: CHEATS page rows + main-thread engine calls, report vr.cheats
 #endif
 #include "NativeDescriptorReuse.h"
@@ -948,7 +953,8 @@ bool holsterContext(void*,std::uintptr_t player,std::uintptr_t actor,std::uint32
     if(!WeaponContextReader(holsterOwnerApi).inspectPlayer(p,c))return false;
     out.alive=c.alive;out.controlDisabled=c.controlDisabled;out.deadEye=c.deadEye;out.riding=c.riding;out.ridingVehicle=c.ridingVehicle;
     out.vehicleTransition=c.vehicleTransition;out.duel=c.duel;out.duelRaw=c.duelRaw;out.mountedWeapon=c.mountedWeapon;out.mountingHorse=c.mountingHorse;
-    out.blindFiring=c.blindFiring;out.cover=c.cover;out.linkedAnimation=c.linkedAnimation;out.usingGringo=c.usingGringo;return true;
+    out.blindFiring=c.blindFiring;out.cover=c.cover;out.linkedAnimation=c.linkedAnimation;out.usingGringo=c.usingGringo;
+    out.weaponSeat=c.weaponSeat;out.seatSwap=c.seatSwap;out.vehicleType=c.vehicleType;out.seatIndex=c.seatIndex;out.seatClass=c.seatClass;return true;
 }
 // sagShellDerived::UpdateInputs (GOT 0x2e499c0). The original runs first and unchanged; only the call from
 // sagShellDerived::Execute (main thread, after PerformDMZ/WaitForRenderThread, before the next simulation step)
@@ -966,6 +972,7 @@ __attribute__((noinline)) void nativeUpdateInputs(void* self) noexcept {
     vr::mainthread::run(qualified,vr::nowNs()); // Holsters (and cheats) on the engine main thread
     gameclock::gameFrame(qualified); // Game clock (sagTimeOfDayManager): debug.rdrvr.clock / clock.freeze
     if(qualified){::rdrvr::runtime::engineMainFrames.fetch_add(1,std::memory_order_relaxed);diagnostics::perfrec::mainFrame();} // REGRID + PERF RECORD
+    if(qualified)::rdrvr::vr::npcaim::scriptPoll(readMemory); // NPC AIM: handler of native 0x86baac6c
 }
 PipelinePassHashMemo::Original nativePassHash{};
 using DynamicLayoutFn=bool(*)(void*,const void*,const void*);
@@ -1369,15 +1376,22 @@ inline constexpr std::array<unsigned char,16> ptfxCullFingerprint{
 inline constexpr std::array<unsigned char,4> ptfxCullCall{70,154,36,148};
 using PtfxCullFn=int(*)(void*,void*);PtfxCullFn originalPtfxCull{};
 std::atomic<std::uint64_t> ptfxCullSwaps{},ptfxCullKept{},ptfxCullDropped{};std::atomic<bool> ptfxCullHooked{};
+// The hand's blood drop under watch (handphys::ptfxWatch, one relaxed load per call): its calls counted inside the eye scope / outside,
+// and those that culled it.
 __attribute__((noinline)) int ptfxCullEffect(void* rule,void* inst){
     const void* eye=::rdrvr::engine::postfx::tail::early::cullViewport;
     static unsigned calls=0;static int lever=1;
     if((calls++&1023u)==0){char v[PROP_VALUE_MAX]{};lever=__system_property_get("debug.rdrvr.vr.ptfxcull",v)>0&&v[0]>='0'&&v[0]<='1'?v[0]-'0':1;}
-    if(!eye||!lever||reinterpret_cast<std::uintptr_t>(__builtin_return_address(0))!=engineBase+ptfxCullReturnOffset)return originalPtfxCull(rule,inst);
+    const bool watched=::rdrvr::vr::handphys::ptfxWatchHit(reinterpret_cast<std::uintptr_t>(inst));
+    if(!eye||!lever||reinterpret_cast<std::uintptr_t>(__builtin_return_address(0))!=engineBase+ptfxCullReturnOffset){
+        const int r0=originalPtfxCull(rule,inst);
+        if(watched)::rdrvr::vr::handphys::ptfxWatchNote(::rdrvr::vr::handphys::ptfxWatch,false,r0==1);
+        return r0;}
     auto* slot=reinterpret_cast<const void**>(engineBase+smCurrentViewportOffset);
     const void* saved=*slot;*slot=eye;
     const int r=originalPtfxCull(rule,inst);
     *slot=saved;ptfxCullSwaps.fetch_add(1,std::memory_order_relaxed);(r==1?ptfxCullDropped:ptfxCullKept).fetch_add(1,std::memory_order_relaxed);
+    if(watched)::rdrvr::vr::handphys::ptfxWatchNote(::rdrvr::vr::handphys::ptfxWatch,true,r==1);
     return r;
 }
 // TOUCH PTFX: camManager::GetViewport is the cull getter (JUMP_SLOT 0x2e48050, getterCull); its caller TouchImagePftxManager::Render
@@ -1405,6 +1419,56 @@ __attribute__((noinline)) void hudDrawBlackBox(float x0,float y0,float x1,float 
     if(!keep&&::rdrvr::vr::hud::active()&&(ret==engineBase+blackBoxReturnOffsets[0]||ret==engineBase+blackBoxReturnOffsets[1]||ret==engineBase+blackBoxReturnOffsets[2])){
         blackBoxDropped.fetch_add(1,std::memory_order_relaxed);return;}
     blackBoxPassed.fetch_add(1,std::memory_order_relaxed);originalBlackBox(x0,y0,x1,y1);
+}
+// PLAYER ARROW (always on, report vr.hud.playerArrow): the radar's player arrow is the centre blip (CRadar::iCentreBlip, created rotating by
+// PostDLCInit). CRadar = *hudManager::sm_Instance + 0xc600 (sagShellDerived::Update +0xc560 -> CFrontEnd::Update +0xa0). CRadar::Update
+// stores the player heading atan2(c.x,c.z) of the ped matrix in +0xd0 (0x2a15cac), calls hudStreamingMap::CalcRotation (bl @0x2a15dac
+// through PLT 0x2cad0a0 = br via JUMP_SLOT 0x2e5eeb0, so LR = 0x2a15db0) -> +0xd4 (the map turn), then copies +0xd0 to the centre trace's
+// +0x60 (0x2a15e64). FlushRenderList draws every blip at (pi - [+0xd4]) + trace[+0x60]. Nothing else reads +0xd0 as a float (PerformDMZ
+// copies the pair to +0xf0, never read alone), so rewriting +0xd0 inside that call turns only the arrow. The wrist map is the same radar.
+// HEAD: the stock call first and its angle returned unchanged (the map turn stays stock); on the radar call only, +0xd0 = the heading of
+// the last rendered VR view (gameViewHeading, 250 ms), else remainder(body::headYaw + pi) (200 ms), else left stock.
+// UpdateCachedDrawData's call (LR 0x2a20c24) passes through.
+struct ArrowPrint {std::uintptr_t offset;std::uint32_t size;std::uint64_t fnv;};
+inline constexpr std::uintptr_t mapRotOffset=0x2a20a9c,mapRotGotOffset=0x2e5eeb0,arrowReturnOffset=0x2a15db0,arrowHeadingOffset=0xc6d0; // hud+0xc600+0xd0
+inline constexpr std::uintptr_t arrowHudGot=0x2deb900,arrowHudSym=0x4e6ed0d8, // atSingleton<hudManager>::sm_Instance
+    arrowCentreGot=0x2e0fcb8,arrowCentreSym=0x2f76294,arrowTraceGot=0x2e0f0f8,arrowTraceSym=0x4e8511e8; // CRadar::iCentreBlip, CRadar::RadarTrace
+inline constexpr ArrowPrint arrowPrints[]{ // FNV-1a 64 (file offset = vaddr - 0x4000)
+    {0x2a20a9c,0x16c,0xe6548cc43dc09609ull}, // hudStreamingMap::CalcRotation const (hook target)
+    {0x2cad0a0,0x10, 0x919e07c64665c46dull}, // its PLT stub -> GOT 0x2e5eeb0
+    {0x2a15da4,0xc8, 0xf015088effb6d605ull}, // CRadar::Update: GetMap, bl CalcRotation, +0xd4 store .. centre trace +0x60 = [+0xd0]
+    {0x2a15ca0,0x10, 0x209d2f528da8111aull}, // CRadar::Update: atan2f(c.x,c.z) -> str [x19,#0xd0]
+    {0x2a15b9c,0x18, 0xd7649005750b6fd9ull}, // CRadar::Update: no-player camera heading -> +0xd0
+    {0x2a18ae0,0x40, 0x50fd9d72e98f275bull}, // CRadar::PerformDMZ head (+0xd0/+0xd4 pair -> +0xf0)
+    {0x2a17538,0x20, 0x7fa8960ca0476cecull}, // FlushRenderList: s12 = bActive ? 0 : pi - hud[0xc6d4]
+    {0x2a17a8c,0x10, 0xf7b8d4d223f27434ull}, // FlushRenderList: flag bit 12 skip, rot = s12 + desc[+0x60]
+    {0x2a17a5c,0xb0, 0xec16b87112abd72aull}, // FlushRenderList: draw entry fill
+    {0x29cdc94,0x14, 0x6b8e7f8e6f0913f8ull}, // CFrontEnd::Update: CRadar = this + 0xa0
+    {0x23a260c,0x10, 0xc70977a0cdfe3d85ull}, // sagShellDerived::Update: CFrontEnd = hud + 0xc560
+};
+inline constexpr std::array<std::uintptr_t,2> mapRotCallOffsets{0x2a15dac,0x2a20c20};
+inline constexpr std::array<std::array<unsigned char,4>,2> mapRotCalls{{{189,92,10,148},{32,49,10,148}}}; // bl 0x2cad0a0 at each
+using MapRotFn=float(*)(const void*);MapRotFn originalMapRot{};
+std::uintptr_t arrowHudInstance{},arrowCentre{},arrowTrace{}; // engineBase + the symbol addresses (checked against the GOT at install)
+__attribute__((noinline)) float mapCalcRotation(const void* map){
+    const float r=originalMapRot(map); // native first; the map turn is always stock
+    if(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0))!=engineBase+arrowReturnOffset)return r;
+    auto& st=::rdrvr::vr::hud::playerArrow;
+    if(!(st.calls.fetch_add(1,std::memory_order_relaxed)&255u)){ // sample: does the centre trace take its own +0x60 (byte +8)?
+        std::int32_t id=-1;std::uintptr_t trace{};std::uint16_t gen{};unsigned char own{};
+        st.centre.store(readMemory(nullptr,arrowCentre,&id,sizeof id)&&id!=-1&&readMemory(nullptr,arrowTrace+(std::uintptr_t(id)&0xffffu)*8,&trace,sizeof trace)&&trace&&
+            readMemory(nullptr,trace,&gen,sizeof gen)&&gen==(std::uint32_t(id)>>16)&&readMemory(nullptr,trace+8,&own,1)?int(own):-1,std::memory_order_relaxed);
+    }
+    float t{};bool fresh=false;
+#ifdef RDRVR_PASS_RESOURCES
+    fresh=gameViewHeading(now(),t)&&std::isfinite(t);
+#endif
+    if(!fresh){float y{};if(::rdrvr::vr::body::headYaw(y,now())&&std::isfinite(y)){t=std::remainder(y+3.14159265f,6.28318531f);fresh=true;st.fallback.fetch_add(1,std::memory_order_relaxed);}}
+    const std::uintptr_t hud=*reinterpret_cast<const std::uintptr_t*>(arrowHudInstance); // the pointer the call site just read
+    if(!fresh||!hud){st.stale.fetch_add(1,std::memory_order_relaxed);return r;}
+    auto* heading=reinterpret_cast<float*>(hud+arrowHeadingOffset);
+    if(std::isfinite(*heading))st.lastGame.store(*heading,std::memory_order_relaxed); st.lastHead.store(t,std::memory_order_relaxed); // finite only: the report JSON never prints nan
+    *heading=t;st.substituted.fetch_add(1,std::memory_order_relaxed);return r;
 }
 std::string radarFixReport(){
     return "{\"hooked\":"+std::string(radarFixHooked.load()?"true":"false")+",\"windows\":"+std::to_string(radarFixWindows.load())+",\"scissors\":"+
@@ -2866,6 +2930,8 @@ void arm(void* entry) {
         if(!hooked){if(!replacePointer(engineBase+gotOffset,reinterpret_cast<std::uintptr_t>(tracedInit),reinterpret_cast<std::uintptr_t>(originalInit)))patchFault=true;installed=false;}
     }
 #endif
+    // Object glow table (read only): prints and the GOT word; a mismatch leaves it empty for SMALL OBJECTS and QUEST MARKER.
+    if(installed)objectglow::install(readMemory,engineBase);
 #ifdef RDRVR_HEAD_CAMERA
     if(installed){
         const auto checked67=[&](std::uintptr_t offset,const auto& bytes){
@@ -3505,6 +3571,38 @@ void arm(void* entry) {
                     rdrvr::vr::cover::install(cover,checkedWeapon,locoGot,
                         [](std::uintptr_t a,std::uintptr_t e,std::uintptr_t r){return replacePointer(a,e,r);});
                 }
+                { // WHEEL: GOT hook of sagPlayer::CanQuickPickActivate (0x2e4f8b8), own FNV prints + word inside install(); the five known
+                  // call sites get false while debug.rdrvr.vr.wheel blocks (no radial weapon wheel). debug.rdrvr.vr.wheel.hook 0 = not installed.
+                    namespace vw=::rdrvr::vr::wheel;
+                    vw::clockFn.store(+[]()noexcept->std::uint64_t{return now();},std::memory_order_relaxed);
+                    char hookLever[PROP_VALUE_MAX]{};const bool killed=__system_property_get("debug.rdrvr.vr.wheel.hook",hookLever)>0&&hookLever[0]=='0';
+                    vw::install(readMemory,engineBase,killed,locoGot,
+                        [](std::uintptr_t a,std::uintptr_t e,std::uintptr_t r){return replacePointer(a,e,r);});
+                }
+                { // NPC AIM: GOT hook of tgtReticleComponent::GetBestTarget (0x2e47ef0), own FNV prints + words inside install(); ticks in gameObserveReticle.
+                    rdrvr::vr::npcaim::install(readMemory,engineBase,locoGot,
+                        [](std::uintptr_t a,std::uintptr_t e,std::uintptr_t r){return replacePointer(a,e,r);});
+                }
+                { // NO AUTO AIM: GOT hooks of tgtReticleComponent::SetLockOnActive (0x2e52f78), PreUpdate (0x2e52f38) and
+                  // camGlueCMXGame::UpdateReticleParams (0x2e51aa0), own FNV prints + words inside install(); the gate reads the holsters'
+                  // atomics (a VR firearm / throwable in hand, their force aim; never the lasso, a duel, a melee weapon).
+                    namespace na=::rdrvr::vr::noautoaim;namespace hl=::rdrvr::vr::holsters;
+                    static_assert(na::kindMelee==hl::kindMelee&&na::slotMelee==hl::SlotMelee&&na::slotThrown==hl::SlotThrown&&na::slotLasso==hl::SlotLasso);
+                    static_assert(na::aimSlot(hl::SlotSidearm)&&na::aimSlot(hl::SlotThrown)&&na::aimSlot(hl::SlotSniper)&&na::aimSlot(hl::SlotLongarm)&&
+                                  na::aimSlot(hl::SlotShotgun)&&!na::aimSlot(hl::SlotMelee)&&!na::aimSlot(hl::SlotLasso));
+                    const na::GateFn gate=[]() noexcept{na::GateIn g{};g.holding=hl::holdHand.load(std::memory_order_relaxed)>=0;
+                        g.kind=hl::heldKind.load(std::memory_order_relaxed);g.slot=hl::currentSlot.load(std::memory_order_relaxed);
+                        g.firearm=hl::heldFirearm.load(std::memory_order_relaxed);g.forceOurs=hl::forceAimOurs.load(std::memory_order_relaxed);
+                        g.duel=hl::duelActive.load(std::memory_order_relaxed);g.deadEye=hl::deadEyeRunning.load(std::memory_order_relaxed);return g;};
+                    na::install(&readMemory,engineBase,gate,locoGot,
+                        [](std::uintptr_t a,std::uintptr_t e,std::uintptr_t r){return replacePointer(a,e,r);});
+                }
+                { // HAND PHYSICS: own FNV prints + GOT / data words inside install(); the tick registers the behaviours on the main thread. The
+                  // DOORGATE group hooks the jump slots of sagPlayerInputDoor::FindDoor (0x2e53628), propDoorInst::Open (0x2e482b8) and Close
+                  // (0x2e482b0), all three or none.
+                    rdrvr::vr::handphys::install(&readMemory,engineBase,locoGot,
+                        [](std::uintptr_t a,std::uintptr_t e,std::uintptr_t r){return replacePointer(a,e,r);});
+                }
                 { // BODY: the player's body in the eyes, head collapsed for its skinning, arms IK'd to
                   // the controllers. install() checks every print (both broadcasts, UpdateAttachmentsAndIK + compose site = the qualifying
                   // returns, PartialUpdate / Update = the skeleton layout, grmMatrixSet::Update + its task site) and the three GOT words, then
@@ -3647,6 +3745,7 @@ void arm(void* entry) {
                 if(e.read&&aGot(vm::entityVtableGotOffset,vm::entityVtableOffset)&&aGot(vm::instGetSkeletonSlotOffset,vm::instSkeletonOffset)&&
                    checkedWeapon(vm::instSkeletonOffset,vm::instSkeletonFingerprint)){
                     e.entityVtable=engineBase+vm::entityVtableOffset+vm::vtableAddressPoint;e.instSkeletonFn=engineBase+vm::instSkeletonOffset;}
+                e.moverSimWord=&::rdrvr::vr::camera::moverSimVtable; // the ragdoll gate (0 until CAMERA verified the sim mover's vtable)
                 mva::install(e);
             }
             { // RELOAD: every print of reload::elf::prints
@@ -3869,6 +3968,31 @@ void arm(void* entry) {
                                fingerprint(engineBase+blackBoxReturnOffsets[2]-4,blackBoxCalls[2])){
                                 originalBlackBox=reinterpret_cast<BlackBoxFn>(engineBase+blackBoxOffset);
                                 if(replacePointer(engineBase+blackBoxGotOffset,engineBase+blackBoxOffset,reinterpret_cast<std::uintptr_t>(hudDrawBlackBox)))blackBoxHooked.store(true);
+                            }
+                        }
+                        { // PLAYER ARROW: CalcRotation JUMP_SLOT; every print, both call words and the three data slots, else no hook (stock arrow)
+                            auto& st=::rdrvr::vr::hud::playerArrow;
+                            const auto fnv=[](std::uintptr_t address,std::uint32_t size){
+                                std::uint64_t h=0xcbf29ce484222325ull;unsigned char chunk[256];
+                                for(std::uint32_t done=0;done<size;){const std::uint32_t n=std::min<std::uint32_t>(size-done,sizeof chunk);
+                                    if(!readMemory(nullptr,address+done,chunk,n))return std::uint64_t{};
+                                    for(std::uint32_t i=0;i<n;++i)h=(h^chunk[i])*0x100000001b3ull;
+                                    done+=n;}
+                                return h;};
+                            const auto slot=[](std::uintptr_t got,std::uintptr_t sym){std::uintptr_t v{};return readMemory(nullptr,engineBase+got,&v,sizeof v)&&v==engineBase+sym;};
+                            Mapping mr{};bool prints=mapping(engineBase+mapRotOffset,16,mr)&&(mr.protection&PROT_EXEC);
+                            for(const auto& p:arrowPrints)prints=prints&&fnv(engineBase+p.offset,p.size)==p.fnv;
+                            const bool calls=prints&&fingerprint(engineBase+mapRotCallOffsets[0],mapRotCalls[0])&&fingerprint(engineBase+mapRotCallOffsets[1],mapRotCalls[1]);
+                            const bool data=calls&&slot(arrowHudGot,arrowHudSym)&&slot(arrowCentreGot,arrowCentreSym)&&slot(arrowTraceGot,arrowTraceSym);
+                            if(!prints)st.why.store("PRINT MISMATCH");
+                            else if(!calls)st.why.store("CALL MISMATCH");
+                            else if(!data)st.why.store("DATA MISMATCH");
+                            else{
+                                arrowHudInstance=engineBase+arrowHudSym;arrowCentre=engineBase+arrowCentreSym;arrowTrace=engineBase+arrowTraceSym;
+                                originalMapRot=reinterpret_cast<MapRotFn>(engineBase+mapRotOffset);
+                                if(replacePointer(engineBase+mapRotGotOffset,engineBase+mapRotOffset,reinterpret_cast<std::uintptr_t>(mapCalcRotation))){
+                                    st.hooked.store(true);st.why.store("HOOKED");}
+                                else st.why.store("SLOT MISMATCH");
                             }
                         }
                         // RADAR FIX: SetWindow / SetScissor JUMP_SLOTs, only DrawRadar's two calls are changed
@@ -4678,6 +4802,10 @@ std::string vrReport() {
     out+=",\"controls\":"+::rdrvr::vr::controls::report();
     out+=",\"melee\":"+::rdrvr::vr::melee::report();
     out+=",\"cover\":"+::rdrvr::vr::cover::report();
+    out+=",\"npcAim\":"+::rdrvr::vr::npcaim::report();
+    out+=",\"wheel\":"+::rdrvr::vr::wheel::report();
+    out+=",\"noAutoAim\":"+::rdrvr::vr::noautoaim::report();
+    out+=",\"handphys\":"+::rdrvr::vr::handphys::report();
     out+=",\"body\":"+::rdrvr::vr::bodyik::report();
     out+=",\"cheats\":"+::rdrvr::vr::cheats::report();
     out+=",\"deadEye\":"+::rdrvr::vr::deadeye::report(); // DEAD EYE (vr/VrDeadEye.h)

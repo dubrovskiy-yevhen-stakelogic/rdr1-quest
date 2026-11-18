@@ -1056,6 +1056,9 @@ std::string report() {
      <<",\"place\":["<<props.ammoPlace[0].load()<<','<<props.ammoPlace[1].load()<<','<<props.ammoPlace[2].load()<<','<<props.ammoPlace[3].load()<<']'
      <<",\"crop\":["<<props.ammoCrop[0].load()<<','<<props.ammoCrop[1].load()<<','<<props.ammoCrop[2].load()<<','<<props.ammoCrop[3].load()
      <<"],\"tilt\":"<<props.ammoTilt.load()<<",\"face\":"<<props.ammoFace.load()<<'}'
+     <<",\"playerArrow\":{\"hooked\":"<<(playerArrow.hooked.load()?"true":"false")
+     <<",\"why\":\""<<playerArrow.why.load()<<"\",\"calls\":"<<playerArrow.calls.load()<<",\"substituted\":"<<playerArrow.substituted.load()<<",\"stale\":"<<playerArrow.stale.load()
+     <<",\"fallback\":"<<playerArrow.fallback.load()<<",\"lastGame\":"<<playerArrow.lastGame.load()<<",\"lastHead\":"<<playerArrow.lastHead.load()<<",\"centre\":"<<playerArrow.centre.load()<<'}'
      <<",\"mapLayers\":"<<stats.mapLayers.load()<<",\"wristOnArm\":"<<stats.wristOnArm.load()<<",\"rollAxis\":"<<consumer.rollAxis<<",\"rollPicks\":"<<consumer.rollPicks
      <<",\"wristDiag\":{\"fade\":"<<consumer.wristFade<<",\"facing\":"<<consumer.diagFacing<<",\"gaze\":"<<consumer.diagGaze<<",\"tilt\":"<<props.wristTilt.load()<<",\"faceFrames\":"<<consumer.faceFrames<<",\"onArm\":"<<(consumer.diagOnArm?1:0)<<",\"ageMs\":"<<consumer.diagAgeMs<<",\"forearmM\":"<<consumer.diagLen
      <<",\"elbow\":["<<consumer.diagElbow[0]<<','<<consumer.diagElbow[1]<<','<<consumer.diagElbow[2]<<"],\"wrist\":["<<consumer.diagWrist[0]<<','<<consumer.diagWrist[1]<<','<<consumer.diagWrist[2]

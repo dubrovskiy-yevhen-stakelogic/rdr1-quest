@@ -23,6 +23,7 @@
 #include "VrBodyLink.h"
 #include "VrSettings.h"
 #include "VrTeleportLink.h" // TELEPORT: warp note -> filter / B snap, warp head key K, psi samples
+#include "VrNoAutoAim.h"     // NO AUTO AIM: the world yaw for its edge ring (how far a lock turned the view)
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -431,6 +432,7 @@ public:
                 }
             }
             lastApplyNs_=in.now;if(psiValid_){prevPsi_=in.psi;hasPrevPsi_=true;}
+            ::rdrvr::vr::noautoaim::publishPsi(in.psi,psiValid_,in.now);
             publishStatus();return result;};
         if(!enabled_){anchor_="DISABLED";roomState_="OFF";crouchDrop_=crouchTarget_=0;status::crouchDropMm.store(0,std::memory_order_relaxed);anchor.origin={};anchor.kind=HeadCameraAnchor::Kind::LegacyHead;
             active_=false;ownedUntilNs_=0;hasLastC_=false;

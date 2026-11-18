@@ -4,6 +4,7 @@
 #include "GameQueues.h"  // The game's own queue handles (split layouts)
 #include "FramePacing.h" // presentTelemetry (stale resubmit, no-layer reasons)
 #include "KgslClock.h"   // measurementPack (debug.rdrvr.perfmetrics) gates the latch classification
+#include "StereoBridge.h" // ageVerdict: the bridge hold of the displayed pair
 #include <algorithm>
 #include <sstream>
 #include <thread> // discardGpu yields to submit-gate waiters
@@ -527,7 +528,7 @@ void StereoMailbox::screens(XrSession session) {
         }
     }
 }
-bool StereoMailbox::render(XrSession session,std::uint64_t tracking,std::uint64_t space,std::uint64_t nowNs,StereoLayer& out) {
+bool StereoMailbox::render(XrSession session,std::uint64_t tracking,std::uint64_t space,std::uint64_t nowNs,StereoLayer& out,bool bridging) {
     diagnostics::WallScope timing(diagnostics::frameTimings.stereoRender);
     diagnostics::WallScope lockTiming(diagnostics::frameTimings.stereoLockWait);
     std::lock_guard guard(mutex_);lockTiming.finish(); // Held throughout, the late-latch wait included
@@ -550,8 +551,14 @@ bool StereoMailbox::render(XrSession session,std::uint64_t tracking,std::uint64_
         ++epochRejected_;telemetry.ageRejects.fetch_add(1,std::memory_order_relaxed);
         // Stale resubmit (ADAPTIVE or debug.rdrvr.staleresubmit=1): keep the last displayed pair of these
         // epochs on screen (the compositor timewarps it) instead of a frame without a layer. No new pair is picked here.
-        if(telemetry.staleEnabled.load(std::memory_order_relaxed) && screenValid_ && displayedEpochs_.tracking==tracking && displayedEpochs_.referenceSpace==space){
-            telemetry.staleResubmits.fetch_add(1,std::memory_order_relaxed);reason(NoLayer::Stale);out=displayed_;return true;}
+        // Bridge hold: the same repeat while a change between two stereo views waits for the new context's first pair.
+        // Both are reported as Stale (xrHistory kind 3).
+        switch(bridge::ageVerdict(age,maxAgeNs,telemetry.staleEnabled.load(std::memory_order_relaxed),bridging,screenValid_,
+                                  displayedEpochs_.tracking==tracking && displayedEpochs_.referenceSpace==space)){
+        case bridge::Age::Stale:telemetry.staleResubmits.fetch_add(1,std::memory_order_relaxed);reason(NoLayer::Stale);out=displayed_;return true;
+        case bridge::Age::Hold:reason(NoLayer::Stale);out=displayed_;return true;
+        default:break;
+        }
         reason(NoLayer::Age);return false;
     }
     reason(NoLayer::None);

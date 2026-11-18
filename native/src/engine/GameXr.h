@@ -193,6 +193,10 @@ std::string gameXrReport();
 void gameObserveCamera(std::uintptr_t,std::uint64_t,std::uint64_t,
                        bool(*)(void*,std::uintptr_t,void*,std::size_t),void*);
 #endif
+#if defined(RDRVR_CAMERA_BRIDGE)&&defined(RDRVR_PASS_RESOURCES)
+// Heading of the last rendered gameplay VR view (250 ms), atan2(c.x,c.z) of its back axis = the radar's player heading convention.
+bool gameViewHeading(std::uint64_t now,float& theta) noexcept;
+#endif
 #ifdef RDRVR_STEREO_BRIDGE
 void gameConfigureViewports(ViewportApi) noexcept;
 void gameSceneFinished() noexcept;

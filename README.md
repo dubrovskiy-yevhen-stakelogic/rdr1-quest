@@ -1,6 +1,6 @@
 # Red Dead Redemption VR for Quest
 
-Version `0.2.0 alpha`. Source code and build tools for the Quest VR mod. See
+Version `0.3.0 alpha`. Source code and build tools for the Quest VR mod. See
 [CHANGELOG.md](CHANGELOG.md) for what changed and for the known issues.
 
 An unofficial VR mod for the Android version of Red Dead Redemption. It runs
@@ -46,8 +46,8 @@ the headset in a well-lit room.
 
 The installer identifies the engine variant by the SHA-256 of `librdr.so`,
 independently of the Rockstar/Netflix package name, and shows the variant and
-engine ID. Version 0.2.0 builds engine variant 1. Engine variant 2 has not been
-updated for 0.2.0 yet, so its build stops with a request to report it. An
+engine ID. Version 0.3.0 builds engine variant 1. Engine variant 2 has not been
+updated for 0.3.0 yet, so its build stops with a request to report it. An
 unknown variant is stopped with a request to report the ID to the author; the
 installer never applies another variant's hooks or replaces the game engine.
 
@@ -131,7 +131,7 @@ which deletes its saved games. Copy them to the PC first with
 | Whistle for the horse | X |
 | Satchel (items, skins, outfits) | VR menu > SATCHEL, or hold X for half a second; stick and A inside, B goes back, grips switch tabs |
 | Use, mount, dismount | Y |
-| Dead Eye | R3 with a gun in hand, or left trigger + R3 |
+| Dead Eye | R3 with a gun in hand, or left trigger + R3. With **BUTTONS > GUN DEAD EYE** off, R3 always crouches on foot and Dead Eye is left trigger + R3 |
 | Cock the hammer (REALISTIC) | Right stick down, or drag the hammer back with the free hand |
 | Recenter | Hold L3 + R3 |
 | Draw from a holster | Grip at the holster |
@@ -256,6 +256,7 @@ New rows in the VR menu and their defaults:
 | SCOPE LENS | FULL ZOOM | ON |
 | SCOPE LENS | FULL ZOOM DIST | 12 CM |
 | BUTTONS | REINS GESTURES | ON |
+| BUTTONS | GUN DEAD EYE | ON |
 | CHEATS | DUEL ON LOOK, NO WANTED | OFF |
 | CHEATS | CLEAR WANTED | |
 

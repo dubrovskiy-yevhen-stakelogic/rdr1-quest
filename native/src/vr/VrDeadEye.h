@@ -24,6 +24,8 @@
 //  - R3 with a firearm in a VR hand = the game's own DEADEYE press (pad R3); R3 again while it runs = the stock "end it"; LT + R3 stays;
 //    R3 without a gun = crouch. Game input -> the game's own Dead Eye: stats / missions / tutorials count it.
 //  - the holsters KEEP their force-aim bit while Dead Eye runs (never newly set, never dropped by the Dead Eye gate);
+//  - the two-hand foregrip stays open while Dead Eye runs and it is the only refusal (VrHolsters.h foregripGate): the barrel bend and TWO HAND FIRE
+//    keep working, sockets and draws stay closed;
 //  - the VR gun keeps aiming in Dead Eye (VrWeapon gates: aim; the engine's tracked / painted shots stay native) - real-time hand aim,
 //    the world in slow motion;
 //  - DEAD EYE TIME HALF (default): the VR aim is not slowed, so the meter drains 2x (every drop of player+0x3c0 while it runs is

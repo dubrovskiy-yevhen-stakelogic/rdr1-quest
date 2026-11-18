@@ -343,6 +343,16 @@ inline bool cloudCapsule(const Vec3* points,unsigned n,Capsule& out) noexcept {
     }
     out=c;return true;
 }
+// A horse's (race 1) body for the hands: the bone cloud above 45 % of its height (back, neck, head; the legs left out), as cloudCapsule.
+inline bool upperCloudCapsule(const Vec3* points,unsigned n,Capsule& out) noexcept {
+    float lo=1e9f,hi=-1e9f;unsigned used=0;
+    for(unsigned i=0;i<n;++i)if(finite(points[i])){lo=std::min(lo,points[i].y);hi=std::max(hi,points[i].y);++used;}
+    if(used<2||!(hi>lo))return cloudCapsule(points,n,out);
+    const float cut=lo+.45f*(hi-lo);
+    std::array<Vec3,128> up{};unsigned k=0;
+    for(unsigned i=0;i<n&&k<up.size();++i)if(finite(points[i])&&points[i].y>=cut)up[k++]=points[i];
+    return k>=2?cloudCapsule(up.data(),k,out):cloudCapsule(points,n,out);
+}
 // Last resort: an upright capsule above the actor's feet (the mover capsule is coarse; used only without any skeleton).
 inline Capsule actorCapsule(Vec3 feet) noexcept {Capsule c{};c.a=feet+Vec3(0,.35f,0);c.b=feet+Vec3(0,1.45f,0);c.radius=.25f;c.zone=1;c.kind=7;return c;}
 
@@ -370,6 +380,7 @@ inline bool limbZone(int zone) noexcept {return zone>=5&&zone<=8;}
 struct DamageConfig {
     float torso{.55f},limb{.35f},lethal{1000.f},fastSpeed{4.f},fastMultiplier{1.3f};
     float fistKo{.34f},fistKoStrong{.5f},fistStrongSpeed{3.5f};
+    float slapKo{.06f}; // an open-hand slap (hand physics): KO points = maxKO * slapKo
     bool backstab{false}; // knife from behind (face=1) is lethal
 };
 // Knife: flag 4 (lethal melee), damage = maxHP * k; head/neck/heart (and backstab) = 1000 (TargetKillTask template, the engine
@@ -450,5 +461,39 @@ inline bool build(unsigned char* m,Vec3 v,Vec3 p,int comp) noexcept {
     msg::put<float>(m,scale,1.f);m[bullet]=0;return true;
 }
 } // namespace impulse
+
+// ---- the fist gate: a closed grip is a fist only once it is a deliberate one ----
+// The grip over fistGrip (.65) closed while the controller moved under fistCloseMps, or held over it for fistHoldNs: a grip squeezed
+// past .65 for a few samples in a fast open-hand swing never makes a fist (no strike). Per hand, fed every tape sample in order (a
+// sample already seen returns its verdict). Diagnostics: the grip's lowest value over the last 300 ms, how long the fist has been
+// closed, the speed when it closed.
+inline constexpr float fistGrip=.65f,fistCloseMps=1.f;inline constexpr std::uint64_t fistHoldNs=180'000'000ull,fistMinNs=300'000'000ull;
+struct FistGate {
+    std::uint64_t lastNs{},closedNs{},prevNs{};Vec3 prev{};float speed{},closeMps{};bool closed{},have{},open{},verdict{};
+    std::array<float,48> grips{};std::array<std::uint64_t,48> ns{};unsigned next{};
+    // true = a fist on this sample. pos = the controller's position (metres, any fixed frame), valid = tracked.
+    bool step(float grip,Vec3 pos,bool valid,std::uint64_t t) noexcept {
+        if(t&&t==lastNs)return verdict;
+        lastNs=t;
+        if(valid&&finite(pos)){
+            if(!have)speed=0.f; // the speed is unknown until the next sample
+            else if(t>prevNs){const double dt=double(t-prevNs)*1e-9;if(dt>=.002&&dt<=.1){const float v=(pos-prev).length()/float(dt);if(std::isfinite(v))speed=v;}
+                else if(dt>.1)speed=0.f;}
+            prev=pos;prevNs=t;have=true;}
+        else have=false;
+        const float g=std::isfinite(grip)?grip:0.f;
+        grips[next]=g;ns[next]=t;next=(next+1u)%unsigned(grips.size());
+        if(!(g>fistGrip)){closed=false;open=false;verdict=false;return false;}
+        if(!closed){closed=true;closedNs=t;closeMps=speed;open=closeMps<fistCloseMps;}
+        if(!open&&t>=closedNs&&t-closedNs>=fistHoldNs)open=true;
+        verdict=open;return verdict;
+    }
+    // A closed grip still waiting for its hold (counted per sample by the caller).
+    bool waiting() const noexcept {return closed&&!open;}
+    float closedMs(std::uint64_t t) const noexcept {return closed&&t>=closedNs?float(double(t-closedNs)/1e6):0.f;}
+    float minGrip(std::uint64_t t) const noexcept {
+        float m=1e9f;for(std::size_t i=0;i<grips.size();++i)if(ns[i]&&ns[i]<=t&&t-ns[i]<=fistMinNs)m=std::min(m,grips[i]);
+        return m<1e8f?m:-1.f;}
+};
 
 } // namespace rdrvr::vr::melee::math

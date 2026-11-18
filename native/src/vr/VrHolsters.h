@@ -33,6 +33,10 @@
 #include "VrFireDiagnostics.h"
 #include "VrDeadEye.h"   // DEAD EYE: force aim kept while it runs (counter)
 #include "VrDuelControl.h" // VR DUEL: the holster grab is the draw, the real gun shoots
+#include "VrKeepGun.h"     // KEEP GUN: the held gun stays in the hand when Dead Eye / a duel ends
+#include "VrVehicleSeat.h" // a wagon / stagecoach seat: VR weapons as on a horse
+#include "VrGrabLink.h"    // GRAB: a grip press of an empty hand at a prop is the hand-physics grab (never LB / RB)
+#include "VrWheel.h"       // WHEEL: engine put-aways counted against the last LB release (vr.wheel.putAways)
 #include "runtime/ControllerInput.h"
 #include <algorithm>
 #include <array>
@@ -44,6 +48,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <type_traits>
@@ -134,7 +139,7 @@ inline constexpr std::size_t itemState=0x1c,itemOwnerGuid=0x20,itemType=0x30,ite
 inline constexpr std::size_t playerLocks=0x104,playerLock1=0x10c,playerLock2=0x10d,playerStates=0x410,playerFoot=0x5d4,playerActive=0x5f1,
     playerGuid=0x5f4,playerBlock=0x5f8,statesDeadEye=0x20;
 inline constexpr std::size_t actorHealth=0x60,actorInventory=0x70,actorFlags=0x118,actorBlock=0x120,healthValue=0x20;
-inline constexpr std::uint32_t footOnFoot=2,footHorse=5;
+inline constexpr std::uint32_t footOnFoot=2,footVehicle=3,footHorse=5;
 
 // ---- slots (invBaseType::EquipPositions) and sockets (metres; right / up / forward from the upright head) ----
 enum Slot : int {SlotMelee=0,SlotSidearm=1,SlotThrown=2,SlotLasso=3,SlotSniper=4,SlotLongarm=5,SlotShotgun=6};
@@ -175,6 +180,8 @@ inline constexpr float lassoEnterAmplitude=.30f;inline constexpr std::uint32_t l
 // arg[1] the catching hand, arg[2] 0 air / 1 closed hand / 2 ground, arg[3] the flight generation.
 enum Op : std::uint16_t {OpDraw=1,OpPutAway=2,OpTransfer=3,OpPhantomSet=4,OpPhantomClear=5,OpDrawKeep=6,OpThrow=7,OpCatch=8};
 enum PutAwayReason : std::int32_t {PutAwaySlot=0,PutAwayHoldRelease=1};
+// OpDraw arg[2]: 0 = a socket grab; DrawRestore = KEEP GUN (VrKeepGun.h) draws the item the engine put away back, never animated.
+enum DrawReason : std::int32_t {DrawGrab=0,DrawRestore=1};
 
 // ---- configuration (VR page rows HOLSTERS / WEAPON GRIP / HOLSTER MARKERS / TWO HAND AIM / DUAL WIELD; any thread) ----
 enum class GripMode : std::uint8_t {Hold,Toggle};
@@ -193,6 +200,18 @@ inline Config config() noexcept {
 // ---- state published by the main thread (poll / executor), read by the input brain and the weapon hooks ----
 inline std::atomic<bool> killedByProperty{},engineConfigured{},engineReady{},inventoryValid{},contextAllowed{};
 inline std::atomic<const char*> engineState{"NOT_CONFIGURED"},blockReason{"NO SAMPLE"};
+// Two-hand foregrip gate, published by the main thread. It equals contextAllowed except in Dead Eye: ForegripDeadEye means Dead Eye is the
+// only refusal, so the support hand keeps and can take the barrel while sockets, guard, melee, force aim and draws stay closed. Any other
+// refusal, a duel of either route and an unreadable context close it. One atomic, so the brain never reads a gap at the Dead Eye edges.
+enum ForegripGate : int {ForegripClosed,ForegripOpen,ForegripDeadEye};
+inline constexpr ForegripGate foregripGateOf(bool allowed,bool deadEye,bool enabled,bool contextKnown,bool duel,bool otherGatesPass) noexcept {
+    if(allowed)return ForegripOpen;
+    return deadEye&&enabled&&contextKnown&&!duel&&otherGatesPass?ForegripDeadEye:ForegripClosed;
+}
+inline std::atomic<int> foregripGate{ForegripClosed};
+inline std::atomic<const char*> foregripWhy{"NO SAMPLE"},foregripLastDrop{""};
+inline std::atomic<bool> deadEyeRunning{}; // sagPlayerStates+0x20 != 0 in the last poll
+inline std::atomic<bool> deadEyeForegrip{true}; // debug.rdrvr.vr.holsters.deadeye.foregrip 0: Dead Eye closes the foregrip like any other refusal
 inline std::atomic<std::uint32_t> ownedMask{},grabMask{};
 inline std::atomic<int> currentSlot{-1},holdHand{-1};
 inline std::atomic<bool> holdOurs{};
@@ -283,6 +302,10 @@ inline std::atomic<bool> sniperFreeFire{true};
 inline std::atomic<std::uint64_t> sniperFreeFrames{};
 inline std::atomic<std::uint64_t> sniperZoomWrites{},sniperZoomSkips{}; // GameXr vrSniperFireZoom
 inline std::atomic<std::uint64_t> oneHandBlocked{}; // TWO HAND FIRE: frames a one-handed long gun trigger was held back
+// Foregrip report. gateDrops: grips dropped because the gate closed. In Dead Eye: brain frames, frames with a long gun, frames with support,
+// grips held at its start, of those held unbroken to its end / not, grips taken during it, free-hand squeezes at the gun masked instead of a transfer.
+inline std::atomic<std::uint64_t> foregripGateDrops{},foregripGateDropsDeadEye{},deadEyeFrames{},deadEyeLongGunFrames{},deadEyeSupportFrames{},
+    deadEyeGripsAtStart{},deadEyeGripsKept{},deadEyeGripsLost{},deadEyeGripsTaken{},deadEyeTransfersMasked{};
 inline std::atomic<int> heldKind{-1};
 // hand h opened on a physical throwable throw and its put-away has not landed yet (set at that release, cleared by
 // serviceHolster when the intent ends / the hand no longer holds a throwable / took a new item; 8 s at most) - GameXr reins input: that
@@ -351,6 +374,7 @@ inline std::atomic<const HammerSinks*> hammerSinks{};
 inline std::array<std::atomic<std::uint64_t>,2> hammerContactNs{};
 inline std::atomic<std::uint64_t> hammerHoldGuardUntilNs{},hammerAimNs{},hammerTransferBlockNs{300'000'000};inline std::atomic<bool> hammerCocked{};
 inline std::atomic<std::uint64_t> hammerReleaseDeferred{},hammerTransferSuppressed{},hammerRearmLatched{};
+inline std::atomic<std::uint64_t> armMaskBlocked{}; // SOFT RE-ARM: frames a trigger held across a scene-camera change was withheld
 inline std::atomic<std::uint64_t> triggerEdges{},triggerForwarded{},ltBlockedFrames{},rtBlockedMelee{},rtBlockedCylinder{},rtBlockedRearm{},
     bMaskedFrames{};
 // ---- triggers of EMPTY VR hands ----
@@ -514,6 +538,14 @@ inline bool handHolding(unsigned hand) noexcept {
 // XR thread (ControllerActions theater chord): the holster brain owns a grip - a held weapon, a foregrip support or a
 // hand over a live socket. Consuming (zeroing) the grips then would read as a release: HOLD put-away, support dropped.
 inline bool gripsEngaged() noexcept {
+    // GRAB: a hand holding a prop or at a grab / join candidate (the chord would zero both grips: the hold reads an open hand)
+    if(::rdrvr::vr::grablink::chordGuard.load(std::memory_order_relaxed)&&::rdrvr::vr::grablink::grabBusy(nowNs())){
+        ::rdrvr::vr::grablink::chordGrabBusy.fetch_add(1,std::memory_order_relaxed);return true;}
+    // A grip the holsters captured (a grab, a socket, a guard, ...) stays theirs until it opens: the chord never zeroes it (that zero
+    // would read as an open hand and drop the mask; the closed grip would then reach the game as LB / RB)
+    if(::rdrvr::vr::grablink::holdLatch.load(std::memory_order_relaxed)&&::rdrvr::vr::grablink::capturedMask.load(std::memory_order_relaxed)&&
+       ::rdrvr::vr::grablink::capturedFresh(nowNs())){
+        ::rdrvr::vr::grablink::chordCapturedBusy.fetch_add(1,std::memory_order_relaxed);return true;}
     if(!config().enabled||!engineReady.load(std::memory_order_acquire))return false;
     if(holdHand.load(std::memory_order_relaxed)>=0||supportHand.load(std::memory_order_relaxed)>=0||phantomHand.load(std::memory_order_relaxed)>=0)return true;
     // FIST BLOCK: a boxing guard (both grips squeezed hard for seconds) must never toggle the manual theater
@@ -541,6 +573,48 @@ inline void noteMenu(bool open,std::uint64_t now) noexcept {if(open)menuSeenNs.s
 // Input brain (input thread only).
 class InputBrain {
     std::array<bool,2> latched_{true,true},captured_{},preMasked_{};
+    // HOLD-END GRIP LATCH: chordCapture_ = the capture of hand h came from a squeeze the theater chord zeroed (not published in
+    // grablink::capturedMask: the chord keeps its own squeeze); the hold-end watch per hand (grablink::GripLatchRec)
+    std::array<bool,2> chordCapture_{},wasHolding_{};
+    struct HoldEndWatch {bool on{};::rdrvr::vr::grablink::GripLatchRec r{};};
+    std::array<HoldEndWatch,2> holdEnd_{};
+    // openRaw_ = bit h: this frame's sample (valid, fresh, no menu) has grip h at gripOpen or less with no chord zero; openedHeld_ = a
+    // capture whose grip opened since (a suspended frame keeps captured_ for the resume, release() never runs there): no longer published
+    std::uint8_t openRaw_{};std::array<bool,2> openedHeld_{};
+    void publishCaptured() noexcept {
+        std::uint8_t m=0;
+        for(unsigned h=0;h<2;++h){if(!captured_[h])openedHeld_[h]=false;else if((openRaw_>>h)&1u)openedHeld_[h]=true;
+            if(captured_[h]&&!chordCapture_[h]&&!openedHeld_[h])m|=std::uint8_t(1u<<h);}
+        ::rdrvr::vr::grablink::capturedMask.store(m,std::memory_order_relaxed);::rdrvr::vr::grablink::capturedNs.store(nowNs(),std::memory_order_relaxed);}
+    void finishHoldEnd(unsigned h,std::uint64_t now,bool opened) noexcept {
+        auto& w=holdEnd_[h];if(!w.on)return;
+        if(opened)w.r.openMs=std::int32_t(std::min<std::uint64_t>(now>=w.r.ns?(now-w.r.ns)/1'000'000ull:0u,0x7fffffffull));
+        ::rdrvr::vr::grablink::noteGripLatch(w.r);w=HoldEndWatch{};}
+    // Every usable frame (both loops), before the hand's branches: a hold of this hand that ended opens a watch row; the row closes on
+    // the first raw open of the grip (a chord-zeroed sample is not an open).
+    void watchHoldEnd(unsigned h,const ControllerSample& in,std::uint64_t now) noexcept {
+        const bool holding=::rdrvr::vr::grablink::holding(h);
+        if(wasHolding_[h]&&!holding){
+            finishHoldEnd(h,now,false);auto& w=holdEnd_[h];w.on=true;w.r=::rdrvr::vr::grablink::GripLatchRec{};w.r.ns=now?now:1;w.r.hand=std::uint8_t(h);
+            w.r.end=::rdrvr::vr::grablink::lastEnd[h].load(std::memory_order_relaxed);w.r.grip=in.grips[h];w.r.captured=captured_[h]?1:0;}
+        wasHolding_[h]=holding;
+        auto& w=holdEnd_[h];if(!w.on)return;
+        const bool zeroed=(in.chordGrips>>h)&1u;
+        if(zeroed)++w.r.chordZeroed;
+        if(in.grips[h]<=gripOpen&&!zeroed){finishHoldEnd(h,now,true);return;}
+        if(captured_[h]||preMasked_[h])++w.r.maskedFrames;
+        if(now>=w.r.ns&&now-w.r.ns>10'000'000'000ull)finishHoldEnd(h,now,false);
+    }
+    // A squeeze the theater chord zeroed in this sample is the chord's: never a release (the zero is not an opened hand); a hand the
+    // holsters did not own yet is captured (masked until it opens, no command) - lever grabholdlatch.
+    bool chordOwns(unsigned h,const ControllerSample& in) noexcept {
+        if(!((in.chordGrips>>h)&1u)||!::rdrvr::vr::grablink::holdLatch.load(std::memory_order_relaxed))return false;
+        ::rdrvr::vr::grablink::chordZeroSamples[h].fetch_add(1,std::memory_order_relaxed);
+        if(!captured_[h]){latched_[h]=true;captured_[h]=true;chordCapture_[h]=true;preMasked_[h]=false;pressSequence_[h]=0;
+            ::rdrvr::vr::grablink::chordOwnedPresses[h].fetch_add(1,std::memory_order_relaxed);}
+        else latched_[h]=true;
+        gripClosed(h);return true;
+    }
     std::array<bool,2> reinsLatch_{}; // this squeeze held the reins at some point - masked until the grip opens
     std::array<bool,2> mountedGripEdge_{};std::uint64_t lastFrameNs_{}; // report
     std::array<int,2> inside_{-1,-1};
@@ -581,8 +655,13 @@ class InputBrain {
     // the support hand lets go only after its grip stayed open 150 ms or its
     // tracking was lost 400 ms (a relaxed hold / an occluded front controller does not drop it)
     std::array<std::uint64_t,2> supportOpenNs_{};std::uint64_t supportLostNs_{};
+    bool deadEyeWas_{},deadEyeGripBroke_{};int deadEyeGripHand_{-1}; // the running Dead Eye and the grip held at its start (report)
+    int lastSupport_{-1},restoreSupport_{-1};std::uint64_t lastSupportDropNs_{},restoreSupportNs_{}; // KEEP GUN: the support grip a restore brings back
+    std::uint32_t restoreHeldId_{};std::uint64_t restoreHeldNs_{}; // KEEP GUN: the duel request whose wait clock the VR duel route holds
     void setSupport(int hand) noexcept {
-        if(support_==hand)return;support_=hand;supportHand.store(hand,std::memory_order_relaxed);
+        if(support_==hand)return;if(hand<0&&deadEyeWas_)deadEyeGripBroke_=true;
+        if(hand<0&&support_>=0){lastSupport_=support_;lastSupportDropNs_=lastFrameNs_;}
+        support_=hand;supportHand.store(hand,std::memory_order_relaxed);
         attachmentGeneration.fetch_add(1,std::memory_order_relaxed);if(hand>=0)supportEngaged.fetch_add(1,std::memory_order_relaxed);
     }
     // HOLD: after a menu, recenter, focus loss or blocked release the held weapon stays until the holding hand squeezes again
@@ -608,7 +687,7 @@ class InputBrain {
     void suspend(std::uint64_t now,bool keepCaptures,bool await=true) noexcept {
         latched_={true,true};inside_={-1,-1};preMasked_={};setSupport(-1);dropGuard(); // No guard across a suspension
         dwellSlot_={-1,-1};
-        if(!keepCaptures)captured_={};
+        if(!keepCaptures){captured_={};chordCapture_={};}
         if(await)startAwait();
         for(unsigned h=0;h<2;++h)insidePublished[h].store(-1,std::memory_order_relaxed);
         if(!suspended_)publishEmpty(now);suspended_=true;suspendedFrames.fetch_add(1,std::memory_order_relaxed);publishHeld();
@@ -685,7 +764,7 @@ class InputBrain {
         reinsLatch_[h]=false; // the reins squeeze ended
         // SPIN: a hand the spin keeps (ARMING.. CATCHING) never releases its engine item here (its exits post their own command)
         if(hold==int(h)&&spin::keeps(int(h))){spin::bump(spin::stats.supHoldRelease);return;}
-        latched_[h]=false;preMasked_[h]=false;dwellSlot_[h]=-1; // LASSO: an open grip ends a pending dwell
+        latched_[h]=false;preMasked_[h]=false;dwellSlot_[h]=-1;chordCapture_[h]=false; // LASSO: an open grip ends a pending dwell
         if(cfg.grip==GripMode::Hold&&hold==int(h))throwable_.cancelRelease(); // THROWABLE: the hand let go = a put-away, not an aimed throw
         if(captured_[h]){
             captured_[h]=false;
@@ -709,7 +788,7 @@ class InputBrain {
                 bool tossed=false;
                 if(tr==2){tossed=in.triggers[h]<=releaseTriggerGuard&&toss_.begin(h,in,tossEst_,now);if(!tossed)throwable::bump(throwable::stats.tossRefused);}
                 const auto seq=tr>=0?0u:tryThrow(h,in,cfg,allowed,false,current,now);
-                noteEvent(EvRelease,current,int(h),tr==1?"THROWABLE":tossed?"TOSS":seq?"THROW":"GRIP_OPEN",now);
+                {const char* why=tr==1?"THROWABLE":tossed?"TOSS":seq?"THROW":"GRIP_OPEN";noteEvent(EvRelease,current,int(h),why,now);keepgun::noteRelease(int(h),why,in.grips[h],now);}
                 beginHolster(h,now);
                 if(tr==1||(tr==0&&throwable_.pendingFor(h,now))){thrownPutAwayNs[h].store(now?now:1,std::memory_order_relaxed);throwIntent_[h]=true;} // physical / after an aimed throw
                 if(tr==1)holdReleases.fetch_add(1,std::memory_order_relaxed); // serviceHolster waits for the launch
@@ -750,6 +829,8 @@ class InputBrain {
         if(!T::active()){T::guard(T::GuardMenu);return 0;}
         if(cfg.grip!=GripMode::Hold){T::guard(T::GuardNotHold);return 0;}
         if(!allowed){T::guard(T::GuardNotAllowed);return 0;}
+        // A vehicle seat: no flight (Facts::context needs the on-foot state), a fast release is a plain put-away.
+        if(vehicleseat::weaponSeatNow.load(std::memory_order_relaxed)){vehicleseat::throwsRefused.fetch_add(1,std::memory_order_relaxed);T::guard(T::GuardNotAllowed);return 0;}
         if(T::busy()){T::guard(T::GuardBusy);return 0;}
         if(phantom?!T::slotThrowable(slotHint):toss?!T::slotThrowable(throwable::slotThrown):!T::kindThrowable(heldKind.load(std::memory_order_relaxed))){
             T::guard(T::GuardNotThrowable);return 0;}
@@ -776,7 +857,7 @@ class InputBrain {
     // The HOLD grip of a throwable opened: 1 = a real throw was posted, 2 = a hand toss (tryThrow toss), 0 = no throw.
     int throwableRelease(unsigned h,const ControllerSample& in,bool allowed,int current,std::uint64_t now) noexcept {
         namespace T=throwing;
-        if(!allowed)return 0;
+        if(!allowed){throwable::noteNotAllowed(h,throwable_.kindOf(holdHand.load(std::memory_order_relaxed),heldKind.load(std::memory_order_relaxed),now),now);return 0;}
         T::ReleaseEstimator xr{};const bool tape=T::fromTape(h,in.referenceSpace,now,xr,T::config.tapeMaxAgeNs);
         if(!tape)throwable::bump(throwable::stats.noTape);
         const auto e=(tape?xr:est_[h]).estimate(T::config.windowNs,std::fmax(.8f*throwable::minSpeed(),.5f),T::config.releaseWindowNs);
@@ -789,7 +870,9 @@ class InputBrain {
         const bool inSocket=current>=0&&current<slotCount&&inside_[h]==current&&detail::poseOk(in.grip[h])&&
             detail::distance({in.grip[h].position[0],in.grip[h].position[1],in.grip[h].position[2]},sockets_[std::size_t(current)])<=socketGuardRadius;
         tossEst_=e; // the toss flies this release
-        return throwable_.physical(h,in,e,otherFree,riding,inSocket,throwable_.kindOf(hold,heldKind.load(std::memory_order_relaxed),now),now);
+        // the estimate's horizontal speed along the head's yaw forward (the THROWN forward exception; NaN before the first head pose)
+        const float fwd=bodyValid_?detail::dot(e.v,detail::yawRotate(headYaw_,{0.f,0.f,-1.f})):std::numeric_limits<float>::quiet_NaN();
+        return throwable_.physical(h,in,e,otherFree,riding,inSocket,throwable_.kindOf(hold,heldKind.load(std::memory_order_relaxed),now),now,fwd);
     }
     // ---- TOSS (VrThrowable.h TossBrain): the gentle toss of the held throwable, caught by either hand ----
     throwable::TossBrain toss_{};throwing::ReleaseEstimator::Estimate tossEst_{};
@@ -837,7 +920,7 @@ class InputBrain {
         if(slotHint>=0&&slotHint<slotCount&&inside_[h]==slotHint&&detail::poseOk(in.grip[h])&&
            detail::distance({in.grip[h].position[0],in.grip[h].position[1],in.grip[h].position[2]},sockets_[std::size_t(slotHint)])<=socketGuardRadius)return false;
         if(e.v[1]<-T::config.downDot*throwing::math::length(e.v))return false;
-        if(!T::active()||cfg.grip!=GripMode::Hold||!allowed||T::busy()||!T::kindThrowable(heldKind.load(std::memory_order_relaxed)))return false;
+        if(!T::active()||cfg.grip!=GripMode::Hold||!allowed||vehicleseat::weaponSeatNow.load(std::memory_order_relaxed)||T::busy()||!T::kindThrowable(heldKind.load(std::memory_order_relaxed)))return false;
         if(in.triggers[h]>releaseTriggerGuard||(trigEdgeNs_[h]&&now>=trigEdgeNs_[h]&&now-trigEdgeNs_[h]<200'000'000ull))return false;
         const auto shot=T::lastShotNs.load(std::memory_order_relaxed);
         if(shot&&now>=shot&&now-shot<250'000'000ull)return false;
@@ -900,6 +983,7 @@ class InputBrain {
             latched_[h]=false;preMasked_[h]=false;dwellSlot_[h]=-1;captured_[h]=false;
             if(hold==int(h)&&holdOurs.load(std::memory_order_relaxed)&&cfg.grip==GripMode::Hold){
                 const std::uint32_t seq=o.post==spin::PostThrow&&allowed?spinPostThrow(h,o.release,current,now):0u;
+                keepgun::noteRelease(int(h),seq?"SPIN_THROW":"SPIN_EXIT",in.grips[h],now);
                 beginHolster(h,now);
                 if(seq){throwPending_[h]=seq;throwPostNs_[h]=now;holdReleases.fetch_add(1,std::memory_order_relaxed);}
                 else serviceHolster(h,0.f,cfg,hold,current,allowed,now);
@@ -910,9 +994,10 @@ class InputBrain {
         return o.owned;
     }
     std::array<bool,2> wantHolster_{};std::array<std::uint64_t,2> holsterNextNs_{},openSinceNs_{};std::array<std::uint32_t,2> holsterAttempts_{};
+    std::array<bool,2> holsterWaited_{}; // KEEP GUN: this intent waited for a closed gate
     void beginHolster(unsigned h,std::uint64_t now) noexcept {
         if(wantHolster_[h])return;
-        wantHolster_[h]=true;holsterNextNs_[h]=now;holsterAttempts_[h]=0;holsterIntents.fetch_add(1,std::memory_order_relaxed);
+        wantHolster_[h]=true;holsterNextNs_[h]=now;holsterAttempts_[h]=0;holsterWaited_[h]=false;holsterIntents.fetch_add(1,std::memory_order_relaxed);
     }
     // Every frame (and from release()): the engine item still in hand h after its HOLD grip opened -> post the put-away (first: the DUAL
     // promote of the other hand's phantom), again every holsterRetryNs while it stays; done when the hand no longer holds it.
@@ -951,7 +1036,13 @@ class InputBrain {
             holsterCancelled.fetch_add(1,std::memory_order_relaxed);return;}
         if(waitThrow)return;
         if(throwable_.holdsHolster(h,now))return; // THROWABLE: no put-away before the engine launched (it would cancel the throw clip)
-        if(!allowed){holsterWaitFrames.fetch_add(1,std::memory_order_relaxed);return;}
+        if(!allowed){holsterWaitFrames.fetch_add(1,std::memory_order_relaxed);holsterWaited_[h]=true;return;}
+        // KEEP GUN: an intent that waited for the gate (Dead Eye, cover, ...) runs only on a grip that still reads open now; a grip back
+        // above gripOpen at the gate's end is a held gun (the hand relaxed while it could not holster), the same as a RESQUEEZE
+        if(!throwIntent_[h]&&!thrown&&!reinsHand&&keepgun::waitedIntentKeeps(keepgun::enabled.load(std::memory_order_relaxed),holsterWaited_[h],grip,gripOpen)){
+            wantHolster_[h]=false;holsterWaited_[h]=false;throwPending_[h]=0;captured_[h]=true;latched_[h]=true;preMasked_[h]=false;
+            pressSequence_[h]=holdSequence.load(std::memory_order_relaxed);if(hold==int(h))awaitFirstGrip_=false;
+            noteEvent(EvAdopt,current,int(h),"WAITED_HELD",now);holsterCancelled.fetch_add(1,std::memory_order_relaxed);keepgun::bump(keepgun::waitedKept);return;}
         if(now<holsterNextNs_[h])return;
         const int ph=phantomHand.load(std::memory_order_relaxed),ps=phantomSlot.load(std::memory_order_relaxed);
         std::uint32_t seq{};bool posted=false;
@@ -977,6 +1068,7 @@ class InputBrain {
         if(!openSinceNs_[h]){openSinceNs_[h]=now;return;}
         if(now-openSinceNs_[h]<settle)return;
         noteEvent(EvRelease,currentSlot.load(std::memory_order_relaxed),int(h),gameDrawAwait_?"GAME_DRAW_OPEN":"OPEN_HAND",now);
+        keepgun::noteRelease(int(h),gameDrawAwait_?"GAME_DRAW_OPEN":"OPEN_HAND",in.grips[h],now);
         openSinceNs_[h]=0;awaitFirstGrip_=false;openHandHolsters.fetch_add(1,std::memory_order_relaxed);
         if(gameDrawAwait_){gameDrawAwait_=false;adoptOpenHolsters.fetch_add(1,std::memory_order_relaxed);}
         beginHolster(h,now);
@@ -1026,6 +1118,7 @@ class InputBrain {
             const bool down=in.triggers[t]>=(emptyDown_[t]?.45f:.55f);const bool edge=down&&!emptyDown_[t];emptyDown_[t]=down;
             const bool padDown=(pad.buttons&bit)||pad.triggers[t]>triggerActive;
             bool cut=withhold&&!(t==1&&strikeOnly);
+            if(pad.armMask&runtime::armMaskTrigger(t)){cut=true;armMaskBlocked.fetch_add(1,std::memory_order_relaxed);} // SOFT RE-ARM: a carried-over squeeze
             if(emptyLatch_[t]){if(!padDown&&!down)emptyLatch_[t]=false;else cut=true;}
             if(cut){
                 if(padDown||down){emptyLatch_[t]=true;emptyTriggerFrames.fetch_add(1,std::memory_order_relaxed);}
@@ -1059,7 +1152,7 @@ class InputBrain {
             contextAllowed.load(std::memory_order_relaxed);
         std::array<guard::HandIn,2> hands{};
         for(unsigned h=0;h<2;++h){auto& x=hands[h];x.valid=detail::poseOk(in.grip[h])&&detail::poseOk(in.aim[h]);
-            x.empty=hold!=int(h)&&ph!=int(h)&&support_!=int(h)&&!(captured_[h]&&pressSequence_[h]);
+            x.empty=hold!=int(h)&&ph!=int(h)&&support_!=int(h)&&!(captured_[h]&&pressSequence_[h])&&!::rdrvr::vr::grablink::holdingAt(h,now);
             if(!x.valid)continue;x.pos={in.grip[h].position[0],in.grip[h].position[1],in.grip[h].position[2]};
             x.aimForward=detail::forwardOf(in.aim[h]);x.grip=in.grips[h];}
         const auto o=guard_.update(enabled,{head.position[0],head.position[1],head.position[2]},headYaw_,hands,now);
@@ -1080,11 +1173,13 @@ class InputBrain {
     bool physDown_{}; // Holding trigger pressed (raw, .55/.45 hysteresis) for the press-edge telemetry
     // DUAL: phantom-hand trigger edges and swap-fire (the phantom firearm becomes the engine item, then this press fires).
     bool physDownPh_{},swapPress_{};std::uint32_t lastPhantomGeneration_{},swapSeq_{};int swapHand_{-1};std::uint64_t swapNs_{},swapLandNs_{};
-    void routePhantom(const ControllerSample& in,int hold,std::uint64_t now) noexcept {
+    void routePhantom(const ControllerSample& in,int hold,std::uint64_t now,std::uint8_t armMask) noexcept {
         const int ph=phantomHand.load(std::memory_order_acquire);const auto generation=phantomGeneration.load(std::memory_order_relaxed);
         if(ph<0||ph>1||ph==hold){physDownPh_=false;lastPhantomGeneration_=generation;return;}
         const unsigned o=unsigned(ph);
         if(generation!=lastPhantomGeneration_){lastPhantomGeneration_=generation;physDownPh_=in.triggers[o]>=.55f;return;} // carried-over squeeze
+        // SOFT RE-ARM: a squeeze held across a scene-camera change (runtime armMask) is no edge until it is released once
+        if(armMask&runtime::armMaskTrigger(o)){physDownPh_=in.triggers[o]>=.45f;armMaskBlocked.fetch_add(1,std::memory_order_relaxed);return;}
         const bool down=in.triggers[o]>=(physDownPh_?.45f:.55f);
         if(down&&!physDownPh_){
             offhandTriggerEdges.fetch_add(1,std::memory_order_relaxed);
@@ -1148,7 +1243,7 @@ class InputBrain {
             gateActive_=false;gateBlock_=nullptr;gateVerdict_=-1;pendingEdgeNs_=0;
             swapPress_=false;
         }
-        const bool swapArmed=settleSwap(in,hold,now);routePhantom(in,hold,now);
+        const bool swapArmed=settleSwap(in,hold,now);routePhantom(in,hold,now,pad.armMask);
         // LASSO: while the lasso is the engine item in a VR hand and the module runs, the lasso brain owns
         // pad RT and LT of BOTH hands (holding trigger withheld, RT only as the brain's launch pulse, never in CAUGHT / RECOVER / a minigame
         // other than the trigger prompts). The brain is also called with the lasso out of hand so that it drops to OFF.
@@ -1224,6 +1319,8 @@ class InputBrain {
          const bool oneHand=!menu&&settings().twoHandFire()&&(cs==SlotSniper||cs==SlotLongarm||cs==SlotShotgun)&&support_!=int(o);
          if(oneHand&&in.triggers[h]>triggerRearm)oneHandLatch_=true;else if(in.triggers[h]<=triggerRearm)oneHandLatch_=false;
          if(oneHand||oneHandLatch_){block="ONE_HAND";if(fire>triggerActive)oneHandBlocked.fetch_add(1,std::memory_order_relaxed);}}
+        // SOFT RE-ARM: a squeeze carried across a scene-camera change (runtime armMask) is no shot until it is released once, whatever the preset
+        if(!block&&(pad.armMask&runtime::armMaskTrigger(h))){block="NOT_REARMED";rtHeldFrames.fetch_add(1,std::memory_order_relaxed);armMaskBlocked.fetch_add(1,std::memory_order_relaxed);}
         if(block){}
         else if(casualPreset){} // Preserve the physical held state above; no VR firearm gate or pulse shaping.
         else if(sniperFree){if(!rtArmed_){block="NOT_REARMED";rtHeldFrames.fetch_add(1,std::memory_order_relaxed);}} // SNIPER: the rearm latch only
@@ -1313,7 +1410,9 @@ class InputBrain {
             // a squeeze latched during the
             // mount animation (on foot rules) would go on as a native LB / RB: on a horse (the reins brain live, or the MOUNTED layout in the last
             // 300 ms) no grip ever reaches the game - draws on a horse are the holsters' own commands
-            const bool onHorse=maskReins&&(::rdrvr::vr::reins::masksNativeGrip()||::rdrvr::vr::reins::mountedLayout(lastFrameNs_));
+            // A vehicle seat with VR weapons has no reins: an empty grip no socket took stays native (LB wheel, RB @GENERIC.BRAKE)
+            const bool seatNative=vehicleseat::weaponSeatNow.load(std::memory_order_relaxed)&&vehicleseat::nativeGrips.load(std::memory_order_relaxed);
+            const bool onHorse=maskReins&&(::rdrvr::vr::reins::masksNativeGrip()||(::rdrvr::vr::reins::mountedLayout(lastFrameNs_)&&!seatNative));
             if(captured_[h]||preMasked_[h]||(lasso::holstersActive()&&lasso::ownsHand(h))||(maskReins&&::rdrvr::vr::reins::holds(h))||reinsLatch_[h]||onHorse)
                 pad.buttons&=~detail::gripBit(h);
             // the index finger on a rein squeezes the trigger too - LT / RT on a horse = aim / fire, the game draws the revolver. A reins hand's
@@ -1342,6 +1441,29 @@ class InputBrain {
         lastPadLt.store(pad.triggers[0],std::memory_order_relaxed);
     }
     std::array<int,2> dwellSlot_{{-1,-1}};std::array<std::uint64_t,2> dwellStart_{};
+    // KEEP GUN (VrKeepGun.h): the engine put away the item of a hand whose grip never opened, at the end of Dead Eye / a duel -> the same
+    // slot is drawn back into that hand (OpDraw DrawRestore: instant, the usual draw gates) once the holsters' gate is open.
+    void serviceRestore(const ControllerSample& in,const Config& cfg,int hold,int ph,bool allowed,std::uint32_t grabbable,bool deadEye,std::uint64_t now) noexcept {
+        keepgun::Request r{};if(!keepgun::pending(r))return;
+        if((r.hand!=0&&r.hand!=1)||r.slot<0||r.slot>=slotCount){keepgun::consume(r.id);return;}
+        if(!keepgun::enabled.load(std::memory_order_relaxed)||!keepgun::restoreOn.load(std::memory_order_relaxed)){keepgun::consume(r.id);keepgun::bump(keepgun::offRequests);return;}
+        const unsigned h=unsigned(r.hand);
+        keepgun::HandFacts f{};f.holdMode=cfg.grip==GripMode::Hold;f.latched=latched_[h];f.captured=captured_[h];f.pressSequence=pressSequence_[h];
+        f.otherJob=hold>=0||ph==int(h)||support_==int(h)||spin::keeps(int(h))||wantHolster_[h]||!cfg.enabled;f.poseValid=detail::poseOk(in.grip[h]);
+        const bool gate=allowed&&(grabbable>>unsigned(r.slot)&1u)&&!deadEye&&!duelctl::live();
+        if(r.context==keepgun::ContextDuel&&duelctl::live()){restoreHeldId_=r.id;restoreHeldNs_=now;keepgun::bump(keepgun::duelHeldFrames);}
+        keepgun::Request clock=r;clock.ns=keepgun::clockStart(r,restoreHeldId_==r.id?restoreHeldNs_:0,now,keepgun::duelHoldCapNs);
+        const auto d=keepgun::decide(clock,f,gate,now,keepgun::restoreWaitNs);
+        keepgun::lastDecision.store(keepgun::decisionNames[std::size_t(d)],std::memory_order_relaxed);
+        if(d==keepgun::DecideWait){keepgun::bump(keepgun::waitFrames);return;}
+        if(d!=keepgun::DecidePost){keepgun::consume(r.id);keepgun::bump(d==keepgun::DecideOpened?keepgun::opened:d==keepgun::DecideBusy?keepgun::busy:keepgun::expired);return;}
+        std::uint32_t seq{};
+        if(!post(OpDraw,r.slot,h,DrawRestore,1000,now,seq))return; // the queue was full: the next frame tries again
+        keepgun::consume(r.id);keepgun::bump(keepgun::posted);
+        captured_[h]=true;latched_[h]=true;preMasked_[h]=false;pressSequence_[h]=f.holdMode?seq:0;
+        noteEvent(EvGrab,r.slot,int(h),"KEEP_RESTORE",now);
+        if(lastSupport_>=0&&lastSupport_!=int(h)&&now>=lastSupportDropNs_&&lastSupportDropNs_+keepgun::supportWindowNs>=r.ns){restoreSupport_=lastSupport_;restoreSupportNs_=now;}
+    }
     // A socket grab that becomes a draw. Rule 1: the lasso socket is always a plain OpDraw (never kept as / next
     // to a phantom); rule 2: while the lasso is the engine item no phantom is set (refusal buzz).
     void socketDraw(unsigned h,int inside,int hold,int ph,int phs,bool phantom,bool dual,bool lassoEngine,const Config& cfg,int current,std::uint64_t now) noexcept {
@@ -1374,6 +1496,7 @@ public:
     void frame(const ControllerSample* input,const Pose* head,bool world,std::uint64_t now,PadState& pad) noexcept {
         using namespace detail;
         inputFrames.fetch_add(1,std::memory_order_relaxed);lastFrameNs_=now;
+        struct PublishOnExit {InputBrain& b;~PublishOnExit(){b.publishCaptured();}} publishOnExit{*this}; // every return path
         const Config cfg=config();
         const bool gated=!cfg.enabled||!engineReady.load(std::memory_order_acquire)||!mainthread::executorInstalled();
         const int hold=holdHand.load(std::memory_order_acquire);
@@ -1381,6 +1504,9 @@ public:
         const bool menu=menuNs&&(now<menuNs||now-menuNs<menuFreezeNs);
         const bool usable=world&&input&&runtime::validController(*input)&&now>=input->publishedNs&&now-input->publishedNs<=inputMaxAgeNs&&
             input->referenceSpace&&input->continuity;
+        openRaw_=0; // the published capture mask's open hands (publishCaptured): any fresh valid sample outside the menu (its zeroed grips)
+        if(!menu&&input&&runtime::validController(*input)&&now>=input->publishedNs&&now-input->publishedNs<=inputMaxAgeNs)
+            for(unsigned h=0;h<2;++h)if(input->grips[h]<=gripOpen&&!((input->chordGrips>>h)&1u))openRaw_|=std::uint8_t(1u<<h);
         // Record raw edges even when they never reach route(). These are observed context states, not engine verdicts.
         if(input)for(unsigned h=0;h<2;++h){const bool down=input->triggers[h]>=(diagnosticDown_[h]?.45f:.55f);
             if(down&&!diagnosticDown_[h]&&(gated||!usable||!pad.ready||menu))
@@ -1407,15 +1533,17 @@ public:
             if(headOnly&&input->epoch==epoch_&&input->referenceSpace==space_&&input->continuity==continuity_){
                 const int current=currentSlot.load(std::memory_order_relaxed);const bool allowed=contextAllowed.load(std::memory_order_relaxed);
                 noteThrowInput(*input,now);
-                for(unsigned h=0;h<2;++h){serviceHolster(h,input->grips[h],cfg,hold,current,allowed,now);
+                for(unsigned h=0;h<2;++h){watchHoldEnd(h,*input,now);serviceHolster(h,input->grips[h],cfg,hold,current,allowed,now);
                     if(spinStep(h,*input,cfg,hold,current,allowed,now,nullptr,true))continue; // SPIN: owned hands stay owned (no entries)
                     if(input->grips[h]>gripOpen){gripClosed(h);continue;}
+                    if(chordOwns(h,*input))continue;
                     if(!deferHoldRelease(h,*input,cfg,hold,now))release(h,*input,cfg,hold,current,allowed,now);}
             }
             if(usable&&pad.ready){route(*input,hold,pad,now,menu);routeB(*input,hold,pad,now);applyMasks(pad,hold,*input);publishPad(*input,hold,pad,now);}
             lastNs_=now;return;
         }
         const ControllerSample& in=*input;
+        for(unsigned h=0;h<2;++h)keepgun::gripNow[h].store(in.grips[h],std::memory_order_relaxed); // KEEP GUN: engine put-away forensics
         if(epoch_!=in.epoch||space_!=in.referenceSpace||continuity_!=in.continuity){ // recenter / new space / focus: re-latch
             epoch_=in.epoch;space_=in.referenceSpace;continuity_=in.continuity;bodyValid_=false;
             latched_={true,true};inside_={-1,-1};setSupport(-1);startAwait();
@@ -1434,6 +1562,7 @@ public:
             tg.referenceSpace&&tg.referenceSpace==in.referenceSpace&&(tg.ns>=now?tg.ns-now:now-tg.ns)<=250'000'000ull;
         const int current=currentSlot.load(std::memory_order_relaxed);
         const bool allowed=contextAllowed.load(std::memory_order_relaxed);
+        const int fgGate=foregripGate.load(std::memory_order_relaxed);const bool deadEyeGrip=fgGate==ForegripDeadEye;
         const std::uint32_t grabbable=allowed?grabMask.load(std::memory_order_relaxed):0u;
         const bool ours=holdOurs.load(std::memory_order_relaxed);
         // LASSO grade H: the lasso as the engine item (DUAL rules), the not-owned dead zone, teach-once
@@ -1448,22 +1577,35 @@ public:
         const bool longGun=hold>=0&&current>=0&&current<slotCount&&slotSpecs[std::size_t(current)].twoHanded;
         V3 foregrip{},barrel{};bool foregripValid=false,barrelValid=false; // + the barrel axis (support along it, free-hand mask)
         if(longGun&&valid[unsigned(hold)]&&poseOk(in.aim[unsigned(hold)])){barrel=forwardOf(in.aim[unsigned(hold)]);barrelValid=true;}
-        if(cfg.twoHand&&allowed&&barrelValid){
+        if(cfg.twoHand&&fgGate!=ForegripClosed&&barrelValid){
             foregrip=add(hand[unsigned(hold)],mul(barrel,foregripReach));foregripValid=true;
         }
         // DUAL: the phantom (second item) and its hand; the transfer zone around an item held in the other hand.
         const bool dual=dualActive();
         const int ph=phantomHand.load(std::memory_order_acquire),phs=phantomSlot.load(std::memory_order_relaxed);
         const bool phantom=ph>=0&&ph<=1&&phs>=0&&phs<slotCount;
+        const bool deadEyeNow=deadEyeRunning.load(std::memory_order_relaxed);
+        if(deadEyeNow!=deadEyeWas_){
+            if(deadEyeNow){deadEyeGripHand_=support_;if(support_>=0)deadEyeGripsAtStart.fetch_add(1,std::memory_order_relaxed);}
+            else if(deadEyeGripHand_>=0)(support_==deadEyeGripHand_&&!deadEyeGripBroke_?deadEyeGripsKept:deadEyeGripsLost).fetch_add(1,std::memory_order_relaxed);
+            deadEyeWas_=deadEyeNow;deadEyeGripBroke_=false;
+        }
         {const bool lost=support_>=0&&!valid[unsigned(support_)];
          if(!lost)supportLostNs_=0;else if(!supportLostNs_)supportLostNs_=now;
-         if(support_>=0&&(!foregripValid||support_==hold||support_==ph||(lost&&now-supportLostNs_>=400'000'000ull))){supportLostNs_=0;setSupport(-1);}}
+         if(support_>=0&&(!foregripValid||support_==hold||support_==ph||(lost&&now-supportLostNs_>=400'000'000ull))){
+             if(!foregripValid&&cfg.twoHand&&fgGate==ForegripClosed){foregripGateDrops.fetch_add(1,std::memory_order_relaxed);
+                 if(deadEyeNow)foregripGateDropsDeadEye.fetch_add(1,std::memory_order_relaxed);
+                 foregripLastDrop.store(foregripWhy.load(std::memory_order_relaxed),std::memory_order_relaxed);}
+             supportLostNs_=0;setSupport(-1);}}
+        if(deadEyeNow){deadEyeFrames.fetch_add(1,std::memory_order_relaxed);if(barrelValid)deadEyeLongGunFrames.fetch_add(1,std::memory_order_relaxed);
+            if(support_>=0)deadEyeSupportFrames.fetch_add(1,std::memory_order_relaxed);}
         if(const auto rs=reloadBrainSink.load(std::memory_order_acquire)){ // RELOAD: before the guard / grab loop
             ReloadFacts rf{};rf.in=&in;rf.head=head;rf.hold=hold;rf.phantom=phantom?ph:-1;rf.support=support_;rf.sockets=sockets_;rf.captured=captured_;
             rf.latched=latched_;rf.referenceSpace=in.referenceSpace;rf.now=now;rf.resumed=wasSuspended||(lastNs_&&now>lastNs_+100'000'000ull);
             rf.bodySockets=bodySocketsUsed_;rf.fixedSockets=fixedSockets_;try{rs(rf);}catch(...){}
         }
         updateGuard(in,*head,hold,phantom?ph:-1,now);
+        serviceRestore(in,cfg,hold,ph,allowed,grabbable,deadEyeNow,now); // KEEP GUN: an item the engine put away goes back into the closed hand
         if(toss_.flying()){ // TOSS: who may catch (magnet) - the throwing hand, an empty other hand that is not captured
             std::uint32_t free=0;
             for(unsigned h=0;h<2;++h)if(valid[h]&&(int(h)==toss_.hand()?hold==int(h):(hold!=int(h)&&ph!=int(h)&&support_!=int(h)&&!captured_[h]&&
@@ -1473,6 +1615,7 @@ public:
         const bool ridingNow=::rdrvr::vr::reins::masksNativeGrip()||::rdrvr::vr::reins::mountedLayout(now); // as throwableRelease
         for(unsigned h=0;h<2;++h){
             const float g=in.grips[h];
+            watchHoldEnd(h,in,now);
             serviceHolster(h,g,cfg,hold,current,allowed,now);openHandCheck(h,in,cfg,hold,now); // Release = holster, always
             // RELOAD: the free hand of an open cylinder (+ 300 ms after any close) is
             // captured by the reload: no socket, transfer, catch, guard or native grip; a fresh squeeze latches + captures (pressSequence 0) and
@@ -1483,7 +1626,7 @@ public:
                     inside_[h]=-1;insidePublished[h].store(-1,std::memory_order_relaxed);catchInside_[h]=false;magnetNear_[h]=false;dwellSlot_[h]=-1;
                     ::rdrvr::vr::reins::publishHolsterTarget(h,false,true,now); // REINS: the reload owns this free hand - never a rein grab
                     reloadCaptures.fetch_add(1,std::memory_order_relaxed);
-                    if(g<=gripOpen){release(h,in,cfg,hold,current,allowed,now);continue;}
+                    if(g<=gripOpen){if(!chordOwns(h,in))release(h,in,cfg,hold,current,allowed,now);continue;}
                     gripClosed(h);
                     if(latched_[h]&&!captured_[h]){captured_[h]=true;pressSequence_[h]=0;} // already squeezed when the ownership began: masked until it opens
                     preMasked_[h]=!latched_[h];
@@ -1499,6 +1642,7 @@ public:
             bool transferThrowable=false; // ... a throwable (its zone beats a socket under the hand)
             bool transferLasso=false; // LASSO DUAL rule 2: never a transfer of the lasso (the cowboy grip at the coil)
             bool transferHammer=false; // HAMMER: transfer refused right after a swipe; the press stays captured (masked, buzz)
+            bool transferMasked=false; // Dead Eye: a long gun with an open foregrip never changes hands; the squeeze takes the barrel or stays masked
             if(transferActive()&&valid[h]&&hold!=int(h)&&ph!=int(h)){
                 const unsigned x=1u-h;
                 if((hold==int(x)||(phantom&&ph==int(x)))&&valid[x]&&poseOk(in.aim[x])){
@@ -1516,6 +1660,7 @@ public:
                     if(d<=transferRadius.load(std::memory_order_relaxed))transferFrom=int(x);else transferThrowable=false;
                     if(transferFrom>=0&&spin_.blocksRt(transferFrom)){transferFrom=-1;spin::bump(spin::stats.transferRefused);}
                 }
+                if(transferFrom>=0&&transferFrom==hold&&deadEyeGrip&&foregripValid){transferFrom=-1;transferMasked=true;}
                 if(transferFrom<0)transferThrowable=false;
                 if(transferFrom>=0&&lassoEngine&&transferFrom==hold){transferFrom=-1;transferLasso=true;}
                 // HAMMER: no transfer of the revolver right after this hand touched its hammer (a swipe ends there)
@@ -1558,14 +1703,18 @@ public:
                         if(inside<0)backDead=true;}
                 }else backZone_[h]=-1;
                 if(inside<0&&!deadZone&&!backDead){const std::uint32_t ownedNow=ownedMask.load(std::memory_order_relaxed)&~mask;
-                    for(int k=0;k<slotCount&&!backDead;++k)if((ownedNow>>unsigned(k)&1u)&&zoneDistance(k,hand[h])<=enterRadiusOf(k)&&!(k==SlotLasso&&lassoH))backDead=true;}
+                    // In a vehicle seat the owned lasso's socket is one of these too (not grabbable there)
+                    const bool lassoDead=vehicleseat::weaponSeatNow.load(std::memory_order_relaxed);
+                    for(int k=0;k<slotCount&&!backDead;++k)if((ownedNow>>unsigned(k)&1u)&&zoneDistance(k,hand[h])<=enterRadiusOf(k)&&!(k==SlotLasso&&lassoH&&!lassoDead))backDead=true;}
                 // WHISTLE: an EMPTY hand at the mouth (eye + 7 cm forward - 8 cm down, 15 cm) squeezing the grip = the whistle
                 if(inside<0&&!deadZone&&!backDead&&hold!=int(h)&&ph!=int(h)&&support_!=int(h)&&head){
                     const auto f=forwardOf(*head);
                     const V3 m{head->position[0]+f[0]*.07f,head->position[1]+f[1]*.07f-.08f,head->position[2]+f[2]*.07f};
                     if(distance(hand[h],m)<.15f)mouth=true;
                 }
-                if(inside>=0&&inside!=was&&(!latched_[h]||in.grips[h]<=gripOpen)&&!spin_.blocksRt(int(h))){ // SPIN: no slot pulses for a spinning hand
+                // GRAB: no slot pulses for a free hand beside the heavy furniture the other hand holds (its draws are masked)
+                const bool heavyQuiet=::rdrvr::vr::grablink::heavyOther(h,now)&&hold!=int(h)&&ph!=int(h)&&support_!=int(h);
+                if(inside>=0&&inside!=was&&(!latched_[h]||in.grips[h]<=gripOpen)&&!spin_.blocksRt(int(h))&&!heavyQuiet){ // SPIN: no slot pulses for a spinning hand
                     if(lassoH&&inside==SlotLasso){haptics::pulse(h,lassoEnterAmplitude,lassoEnterUs,now,haptics::SourceSlotEnter);lasso::bump(lasso::stats.lassoZoneEnters);}
                     else if(beltZone(inside))haptics::pulse(h,beltEnterAmplitude,beltEnterUs,now,haptics::SourceSlotEnter);
                     else haptics::pulse(h,haptics::enterAmplitude,haptics::enterUs,now,haptics::SourceSlotEnter);}
@@ -1578,6 +1727,8 @@ public:
             if(barrelValid&&int(h)!=hold&&int(h)!=ph&&valid[h]){const V3& g0=hand[unsigned(hold)];
                 const float t=std::fmin(std::fmax(dot(sub(hand[h],g0),barrel),.25f),.60f);barrelD=distance(hand[h],add(g0,mul(barrel,t)));}
             const bool nearForegrip=foregripValid&&barrelD<=supportRadius,nearLongGun=foregripValid&&barrelD<=nearRadius; // TWO HAND AIM off: native
+            // Dead Eye empties the socket mask, which turns every owned socket into a dead zone: the barrel wins where the two overlap
+            if(deadEyeGrip&&nearForegrip)backDead=false;
             // THROW: catch zone of an empty hand (air: sphere around the gun, extrapolated <= 60 ms; ground: a cylinder above it);
             // the throwing hand only after the grace. A magnet tick once per approach.
             bool catchZone=false,catchEnter=false;
@@ -1603,11 +1754,14 @@ public:
             // REINS (a reach for the rifle barrel / a hip draw swinging forward must not take the rein): what a press here means to
             // the holsters, for the reins brain's next update - a socket / dead zone (such a press is never armed as a rein grab outside
             // the reins zone) or the foregrip / a transfer / a catch (never grabbed as a rein)
-            ::rdrvr::vr::reins::publishHolsterTarget(h,inside>=0||deadZone||backDead,nearForegrip||transferFrom>=0||transferHammer||catchZone||tossZone,now);
+            ::rdrvr::vr::reins::publishHolsterTarget(h,inside>=0||deadZone||backDead,nearForegrip||transferFrom>=0||transferHammer||transferMasked||catchZone||tossZone,now);
             if(spinStep(h,in,cfg,hold,current,allowed,now,head,false))continue; // SPIN: the gun on the trigger finger (before the release branch)
             if(!valid[h]){latched_[h]=true;preMasked_[h]=false;continue;}
-            if(g<=gripOpen){if(!deferHoldRelease(h,in,cfg,hold,now))release(h,in,cfg,hold,current,allowed,now);continue;}
+            if(g<=gripOpen){if(!chordOwns(h,in)&&!deferHoldRelease(h,in,cfg,hold,now))release(h,in,cfg,hold,current,allowed,now);continue;}
             gripClosed(h);
+            // KEEP GUN: the support grip held through a restore takes the barrel again without a new squeeze
+            if(restoreSupport_==int(h)&&(!keepgun::within(now,restoreSupportNs_,keepgun::restoreWaitNs)||!captured_[h]||!latched_[h]))restoreSupport_=-1;
+            if(restoreSupport_==int(h)&&support_<0&&nearForegrip&&g>=gripClose){setSupport(int(h));restoreSupport_=-1;keepgun::bump(keepgun::supportsRestored);}
             if(tossOwn&&tossZone&&latched_[h]&&g>=gripClose){tossCatch(h,true,cfg,current,now);continue;} // a closed throwing hand at the item
             // THROW: a hand already closed when the flying gun arrives catches it (no other capture holds it)
             if(catchEnter&&tg.state==std::uint32_t(throwing::StateFlying)&&throwing::config.closedCatch&&latched_[h]&&!captured_[h]&&g>=gripClose){
@@ -1624,7 +1778,14 @@ public:
             // REINS runs on a horse, any empty grip with no socket / foregrip / transfer target (those are masked above anyway) is masked
             // from its first frame (the 0.55..0.65 ramp would leak LB / RB; RB on a horse = draw the revolver)
             const bool reinsPre=::rdrvr::vr::reins::claims(h)||(::rdrvr::vr::reins::masksNativeGrip()&&inside<0&&!nearForegrip&&transferFrom<0);
-            preMasked_[h]=!latched_[h]&&(inside>=0||nearForegrip||transferFrom>=0||transferHammer||catchZone||tossZone||tossOwn||guardMask_[h]||deadZone||backDead||mouth||nearLongGun||reinsPre);
+            const bool grabReady=::rdrvr::vr::grablink::readyAt(h,now); // GRAB: the hand-physics hand is at a prop it can hold
+            // GRAB (two hands): this hand within the join distance of the prop the other hand holds; a free hand beside held heavy furniture
+            // (within heavymaskcm of it)
+            const bool joinReady=::rdrvr::vr::grablink::joinAt(h,now);
+            const bool heavyFree=::rdrvr::vr::grablink::heavyOther(h,now)&&hold!=int(h)&&ph!=int(h)&&support_!=int(h);
+            // GRAB: a hand that holds a prop (its re-latch is captured below: never LB / RB)
+            const bool heldNow=::rdrvr::vr::grablink::heldLatch.load(std::memory_order_relaxed)&&::rdrvr::vr::grablink::holdingAt(h,now);
+            preMasked_[h]=!latched_[h]&&(inside>=0||nearForegrip||transferFrom>=0||transferHammer||transferMasked||catchZone||tossZone||tossOwn||guardMask_[h]||deadZone||backDead||mouth||nearLongGun||reinsPre||grabReady||joinReady||heavyFree||heldNow);
             if(dwellSlot_[h]>=0){ // LASSO DUAL rule 3: a deliberate 300 ms dwell inside the zone with the grip closed, then the normal grab
                 if(inside!=dwellSlot_[h]||!lasso::holstersActive())dwellSlot_[h]=-1;
                 else if(now>=dwellStart_[h]&&now-dwellStart_[h]>=lassoDwellNs){const int k=dwellSlot_[h];dwellSlot_[h]=-1;lasso::bump(lasso::stats.socketGrabDwelled);
@@ -1632,24 +1793,44 @@ public:
             }
             if(latched_[h]||g<gripClose)continue;
             latched_[h]=true;preMasked_[h]=false; // fresh press
-            if(tossZone||tossOwn){tossCatch(h,tossZone,cfg,current,now);continue;} // TOSS: the catch wins (the throwing hand: masked when away)
-            if(catchZone){postCatch(h,tg,false,cfg,now);continue;} // THROW: the catch wins over sockets / foregrip / transfer
-            if(backDead){captured_[h]=true;pressSequence_[h]=0;backMasked.fetch_add(1,std::memory_order_relaxed); // Empty back, no long gun owned
+            // GRAB diagnostics: which branch took this latch, the grip and the ready stamp's age then
+            const float insideS=inside>=0?zoneDistance(inside,hand[h])/enterRadiusOf(inside):-1.f;
+            const float handsCm=valid[0]&&valid[1]?distance(hand[0],hand[1])*100.f:-1.f;
+            const auto took=[&](::rdrvr::vr::grablink::LatchBranch b){::rdrvr::vr::grablink::noteLatch(h,b,g,now,inside,insideS,handsCm);
+                if(holdEnd_[h].on&&holdEnd_[h].r.firstLatch<0)holdEnd_[h].r.firstLatch=std::int8_t(b);};
+            // GRAB: a hand that holds a prop latched again (its grip dipped and closed): captured, no command (the hold reads the grip itself)
+            if(heldNow){took(::rdrvr::vr::grablink::LatchHeld);captured_[h]=true;pressSequence_[h]=0;continue;}
+            if(tossZone||tossOwn){took(::rdrvr::vr::grablink::LatchToss);tossCatch(h,tossZone,cfg,current,now);continue;} // TOSS: the catch wins (the throwing hand: masked when away)
+            if(catchZone){took(::rdrvr::vr::grablink::LatchCatch);postCatch(h,tg,false,cfg,now);continue;} // THROW: the catch wins over sockets / foregrip / transfer
+            // GRAB (two hands): a join candidate is grabbed (before every socket: a chair held low sits in the belt zones); a free hand
+            // beside held heavy furniture draws nothing (masked, refusal buzz, no LB / RB)
+            // (a prop of its own within grabcm still goes to the grab branch below, ahead of the sockets)
+            switch(::rdrvr::vr::grablink::preLatch(joinReady,heavyFree&&!grabReady,true)){
+            case ::rdrvr::vr::grablink::PreJoin:took(::rdrvr::vr::grablink::LatchJoin);captured_[h]=true;pressSequence_[h]=0;::rdrvr::vr::grablink::press(h,now);
+                noteEvent(EvGrab,-1,int(h),"HAND_JOIN",now);continue;
+            case ::rdrvr::vr::grablink::PreHeavyMask:took(::rdrvr::vr::grablink::LatchHeavyMask);captured_[h]=true;pressSequence_[h]=0;noteEvent(EvRefuse,-1,int(h),"HEAVY_HELD",now);
+                haptics::pulse(h,haptics::refuseAmplitude,haptics::refuseUs,now,haptics::SourceRefuse);continue;
+            case ::rdrvr::vr::grablink::PreNone:break;}
+            if(backDead){took(::rdrvr::vr::grablink::LatchBackEmpty);captured_[h]=true;pressSequence_[h]=0;backMasked.fetch_add(1,std::memory_order_relaxed); // Empty back, no long gun owned
                 noteEvent(EvRefuse,backZone_[h],int(h),"BACK_EMPTY",now);
                 haptics::pulse(h,haptics::refuseAmplitude,haptics::refuseUs,now,haptics::SourceRefuse);continue;}
-            if(mouth){captured_[h]=true;pressSequence_[h]=0;::rdrvr::vr::controls::whistleRequest.store(true,std::memory_order_relaxed);
+            if(mouth){took(::rdrvr::vr::grablink::LatchMouth);captured_[h]=true;pressSequence_[h]=0;::rdrvr::vr::controls::whistleRequest.store(true,std::memory_order_relaxed);
                 mouthWhistles.fetch_add(1,std::memory_order_relaxed);haptics::pulse(h,haptics::enterAmplitude,haptics::enterUs,now,haptics::SourceSlotEnter);continue;}
             if(deadZone){ // LASSO: the not-owned lasso socket - masked, refusal buzz, note NOT OWNED (no weapon wheel)
-                captured_[h]=true;pressSequence_[h]=0;lasso::bump(lasso::stats.notOwnedMasked);lasso::noteNotOwned(now);lasso::lastRefusal.store("NOT_OWNED",std::memory_order_relaxed);
+                took(::rdrvr::vr::grablink::LatchNotOwned);captured_[h]=true;pressSequence_[h]=0;lasso::bump(lasso::stats.notOwnedMasked);lasso::noteNotOwned(now);lasso::lastRefusal.store("NOT_OWNED",std::memory_order_relaxed);
                 haptics::pulse(h,haptics::refuseAmplitude,haptics::refuseUs,now,haptics::SourceRefuse);continue;}
             // a claim the brain does not hold yet (zone race, one update stale target) never beats the two-hand foregrip /
             // a DUAL transfer (a free hand at the barrel taking the rein would lose two-hand aim on a horse); .reins.holster 0 = the claim goes first
             const bool reinsYield=!::rdrvr::vr::reins::holds(h)&&::rdrvr::vr::reins::holsterFirst.load(std::memory_order_relaxed)&&
-                ((nearForegrip&&support_<0)||transferFrom>=0);
+                ((nearForegrip&&support_<0)||transferFrom>=0||transferMasked);
             if(::rdrvr::vr::reins::claims(h)&&!reinsYield){ // REINS (before the sockets): masked until it opens, the reins brain owns it
-                captured_[h]=true;pressSequence_[h]=0;noteEvent(EvGrab,-1,int(h),"REINS",now);continue;}
+                took(::rdrvr::vr::grablink::LatchReins);captured_[h]=true;pressSequence_[h]=0;noteEvent(EvGrab,-1,int(h),"REINS",now);continue;}
+            // GRAB first (lever grabfirst, default off), and always for a free hand beside held heavy furniture: a prop within grabcm of the
+            // palm is a stronger intent than a socket zone of 24..43 cm
+            if(::rdrvr::vr::grablink::grabBeforeSocket(grabReady,heavyFree||::rdrvr::vr::grablink::grabFirst.load(std::memory_order_relaxed))){
+                took(::rdrvr::vr::grablink::LatchGrab);captured_[h]=true;pressSequence_[h]=0;::rdrvr::vr::grablink::press(h,now);noteEvent(EvGrab,-1,int(h),"HAND_GRAB",now);continue;}
             if(inside>=0){
-                captured_[h]=true;std::uint32_t seq{};
+                took(::rdrvr::vr::grablink::LatchSocket);captured_[h]=true;std::uint32_t seq{};
                 if(hold==int(h)&&(throwable_.pendingFor(h,now)||thrownPutAway(h,now))){
                     // a socket press of the throwing hand before its put-away landed (only reachable on a horse: on foot the
                     // RESQUEEZE takes it) - no put-away / promote / draw (each cancels the throw clip; a draw would be holstered by the
@@ -1660,7 +1841,7 @@ public:
                     if(dual&&phantom&&ph!=int(h)){ // DUAL: ... and the phantom of the other hand becomes the engine item (promote)
                         if(post(OpDrawKeep,phs,unsigned(ph),2,1000,now,seq,-1)){putAwayPresses.fetch_add(1,std::memory_order_relaxed);promoteRequests.fetch_add(1,std::memory_order_relaxed);}
                     }else if(post(OpPutAway,current,h,PutAwaySlot,1000,now,seq))putAwayPresses.fetch_add(1,std::memory_order_relaxed);
-                    pressSequence_[h]=0;noteEvent(EvRelease,current,int(h),"SOCKET_PRESS",now);
+                    pressSequence_[h]=0;noteEvent(EvRelease,current,int(h),"SOCKET_PRESS",now);keepgun::noteRelease(int(h),"SOCKET_PRESS",g,now);
                 }else if(phantom&&ph==int(h)&&inside==phs){ // DUAL: the phantom's own socket: back to the holster
                     if(post(OpPhantomClear,phs,h,ClearSocket,1000,now,seq))putAwayPresses.fetch_add(1,std::memory_order_relaxed);
                     pressSequence_[h]=0;
@@ -1673,9 +1854,9 @@ public:
                 }else socketDraw(h,inside,hold,ph,phs,phantom,dual,lassoEngine,cfg,current,now);
                 if(hold==int(h))awaitFirstGrip_=false;
             }else if(nearForegrip&&support_<0){
-                captured_[h]=true;setSupport(int(h));
+                took(::rdrvr::vr::grablink::LatchForegrip);captured_[h]=true;setSupport(int(h));if(deadEyeGrip)deadEyeGripsTaken.fetch_add(1,std::memory_order_relaxed);
             }else if(transferFrom>=0){ // DUAL: take the item out of the other hand (engine item: OpTransfer; phantom: OpPhantomSet move)
-                captured_[h]=true;std::uint32_t seq{};const unsigned x=unsigned(transferFrom);const bool fromPhantom=phantom&&ph==transferFrom;
+                took(::rdrvr::vr::grablink::LatchTransfer);captured_[h]=true;std::uint32_t seq{};const unsigned x=unsigned(transferFrom);const bool fromPhantom=phantom&&ph==transferFrom;
                 if(post(fromPhantom?OpPhantomSet:OpTransfer,fromPhantom?phs:current,h,fromPhantom?1:0,1000,now,seq,int(x))){
                     transfersRequested.fetch_add(1,std::memory_order_relaxed);pressSequence_[h]=cfg.grip==GripMode::Hold?seq:0;
                     if(transferThrowable)throwable::bump(throwable::stats.transferZone);
@@ -1686,22 +1867,27 @@ public:
                 }
             }else if(transferHammer){
                 // game either (it would be LB weapon wheel / RB cover): masked until it opens, a refusal buzz; a squeeze after the block transfers
-                captured_[h]=true;pressSequence_[h]=0;hammerTransferSuppressed.fetch_add(1,std::memory_order_relaxed);
+                took(::rdrvr::vr::grablink::LatchHammer);captured_[h]=true;pressSequence_[h]=0;hammerTransferSuppressed.fetch_add(1,std::memory_order_relaxed);
                 haptics::pulse(h,haptics::refuseAmplitude,haptics::refuseUs,now,haptics::SourceRefuse);
             }else if(awaitFirstGrip_&&hold==int(h)&&ours&&cfg.grip==GripMode::Hold){
-                captured_[h]=true;pressSequence_[h]=holdSeq;awaitFirstGrip_=false;resumes.fetch_add(1,std::memory_order_relaxed);
+                took(::rdrvr::vr::grablink::LatchAdopt);captured_[h]=true;pressSequence_[h]=holdSeq;awaitFirstGrip_=false;resumes.fetch_add(1,std::memory_order_relaxed);
                 if(gameDrawAwait_){gameDrawAwait_=false;adoptSqueezed.fetch_add(1,std::memory_order_relaxed);}
                 noteEvent(EvAdopt,current,int(h),"SQUEEZE",now);
             }else if(phantom&&ph==int(h)&&cfg.grip==GripMode::Hold&&!pressSequence_[h]&&phantomSequence.load(std::memory_order_relaxed)){
                 // DUAL: after a menu / recenter / blocked release the phantom hand re-adopts its item on the next squeeze
-                captured_[h]=true;pressSequence_[h]=phantomSequence.load(std::memory_order_relaxed);phantomResumes.fetch_add(1,std::memory_order_relaxed);
+                took(::rdrvr::vr::grablink::LatchPhantom);captured_[h]=true;pressSequence_[h]=phantomSequence.load(std::memory_order_relaxed);phantomResumes.fetch_add(1,std::memory_order_relaxed);
+            }else if(grabReady){ // GRAB: the hand-physics hand holds the prop it is at - masked until it opens, no command
+                took(::rdrvr::vr::grablink::LatchGrab);captured_[h]=true;pressSequence_[h]=0;::rdrvr::vr::grablink::press(h,now);noteEvent(EvGrab,-1,int(h),"HAND_GRAB",now);
             }else if(guardMask_[h]){ // FIST BLOCK: a raised empty fist - masked, no command (the guard / the physical fist use it)
-                captured_[h]=true;pressSequence_[h]=0;guard::bump(guard::maskedPresses);
-            }else if(nearLongGun){ // The free hand at a held long gun (missed the barrel) - masked, no command, never a put-away
-                captured_[h]=true;pressSequence_[h]=0;freeHandMasked.fetch_add(1,std::memory_order_relaxed);noteEvent(EvRefuse,current,int(h),"FREE_HAND_MASKED",now);
+                took(::rdrvr::vr::grablink::LatchGuard);captured_[h]=true;pressSequence_[h]=0;guard::bump(guard::maskedPresses);
+            }else if(nearLongGun||transferMasked){ // The free hand at a held long gun (missed the barrel) - masked, no command, never a put-away
+                took(::rdrvr::vr::grablink::LatchLongGun);captured_[h]=true;pressSequence_[h]=0;freeHandMasked.fetch_add(1,std::memory_order_relaxed);noteEvent(EvRefuse,current,int(h),"FREE_HAND_MASKED",now);
+                if(transferMasked)deadEyeTransfersMasked.fetch_add(1,std::memory_order_relaxed);
             }else if(::rdrvr::vr::reins::masksNativeGrip()){ // REINS on a horse: no native LB / RB from an empty grip
-                captured_[h]=true;pressSequence_[h]=0;noteEvent(EvRefuse,-1,int(h),"REINS_MASK",now);
+                took(::rdrvr::vr::grablink::LatchReinsMask);captured_[h]=true;pressSequence_[h]=0;noteEvent(EvRefuse,-1,int(h),"REINS_MASK",now);
             }else{
+                took(::rdrvr::vr::grablink::LatchNative);
+                if(holdEnd_[h].on)::rdrvr::vr::grablink::holdEndNativeLeak[h].fetch_add(1,std::memory_order_relaxed);
                 if(transferLasso)lasso::bump(lasso::stats.transferRefusedLasso); // LASSO: the throw hand at the coil (the grip is the lasso's: masked)
                 nativeGripPresses.fetch_add(1,std::memory_order_relaxed);noteEvent(EvGrab,-1,int(h),"NATIVE_LB_RB",now);
             }
@@ -1813,6 +1999,8 @@ using RefreshRenderFn=void(*)(void* item);                                      
 struct PlayerBlocks {
     bool alive{},controlDisabled{},deadEye{},riding{},ridingVehicle{},vehicleTransition{},duel{},duelRaw{},mountedWeapon{},mountingHorse{},
          blindFiring{},cover{},linkedAnimation{},usingGringo{};
+    // engine::WeaponContext: the vehicle seat of player state 3
+    bool weaponSeat{},seatSwap{};std::int32_t vehicleType{-1},seatIndex{-1};unsigned seatClass{};
 };
 // Adapter over engine::WeaponContextReader::inspectPlayer (integration). False = context unreadable.
 using ContextFn=bool(*)(void* user,std::uintptr_t player,std::uintptr_t actor,std::uint32_t actorGuid,PlayerBlocks& out);
@@ -1852,6 +2040,9 @@ class EngineSide {
     // Weapon keep / force aim (main thread only).
     bool forceOurs_{},foreignSeen_{},prevOurs_{};std::uintptr_t prevHand_{};int prevHold_{-1};float prevTimer_{};int prevAimBits_{-1},prevState_{-1};
     std::uint64_t lastOurPutAwayNs_{};
+    // KEEP GUN (VrKeepGun.h): the Dead Eye flag and the duel of the last poll, when each ended, the hold press of the last poll,
+    // the last drop of the mod's force aim, the last restore request.
+    bool eyeWas_{},duelWas_{};std::uint64_t eyeEndNs_{},duelEndNs_{},forceDropNs_{},lastRestoreRequestNs_{};std::uint32_t prevSeq_{};
     std::uintptr_t noDrawItem_{};std::uint64_t noDrawNs_{},noDrawTryNs_{}; // a game draw while riding with the reins goes back
     const char* prevGate_{}; // The context gate reason of the previous poll (nullptr = open)
     int lastThrownSlot_{-1}; // The slot of the last flight (holsteredBox skips it right after the flight)
@@ -1890,13 +2081,14 @@ class EngineSide {
         noteEvent(EvRefuse,cmdSlot_,int(hand&1u),dualRefusalNames[why],now);
         haptics::pulse(hand&1u,haptics::refuseAmplitude,haptics::refuseUs,now,haptics::SourceRefuse);
     }
+    static bool inWeaponSeat(const Sample& s,const PlayerBlocks& b) noexcept {return s.foot==footVehicle&&b.ridingVehicle&&b.weaponSeat;}
     // Every successful poll while a phantom lives: Dead Eye / cover keep it (melee is gated anyway).
     void checkPhantom(const Sample& s,std::uint64_t now) noexcept {
         if(!dualActive()||!config().enabled){clearPhantom(ClearKill);return;}
         phantomTicks.fetch_add(1,std::memory_order_relaxed);
-        const auto& b=blocks_;const bool riding=s.foot==footHorse||(blocksValid_&&b.riding);
-        if(s.gameState!=3||!s.playerFlags||!s.alive||s.locked||(s.foot!=footOnFoot&&s.foot!=footHorse)||(riding&&!phantomFirearmSlot(phantom_.slot))||
-           (blocksValid_&&(b.controlDisabled||b.ridingVehicle||b.vehicleTransition||b.duel||b.mountedWeapon||b.mountingHorse||b.linkedAnimation||b.usingGringo))){
+        const auto& b=blocks_;const bool seat=blocksValid_&&inWeaponSeat(s,b);const bool riding=s.foot==footHorse||(blocksValid_&&b.riding)||seat;
+        if(s.gameState!=3||!s.playerFlags||!s.alive||s.locked||(s.foot!=footOnFoot&&s.foot!=footHorse&&!seat)||(riding&&!phantomFirearmSlot(phantom_.slot))||
+           (blocksValid_&&(b.controlDisabled||(b.ridingVehicle&&!b.weaponSeat)||b.vehicleTransition||b.duel||b.mountedWeapon||b.mountingHorse||b.linkedAnimation||b.usingGringo))){
             clearPhantom(ClearContext);return;}
         const int k=phantom_.slot;
         if(k<0||k>=slotCount||s.rawItems[std::size_t(k)]!=phantom_.item){clearPhantom(ClearSlotChanged,false);return;}
@@ -1921,6 +2113,18 @@ class EngineSide {
             api_.setHoldMode(reinterpret_cast<void*>(s.player),false,2);keepCalls.fetch_add(1,std::memory_order_relaxed);}
         if(api_.setForceAim)api_.setForceAim(reinterpret_cast<const void*>(s.player),false);
         forceOurs_=false;forceAimOurs.store(false,std::memory_order_relaxed);forceAimCleared.fetch_add(1,std::memory_order_relaxed);
+        forceDropNs_=nowNs();
+    }
+    // KEEP GUN report: the VR-held item left the hand (cause = the event reason; engine = the engine put it away itself).
+    void noteLeave(const char* cause,int slot,int hand,bool engine,std::uint64_t now,bool restore=false) noexcept {
+        keepgun::Leave l{};l.ns=now;l.cause=cause;l.slot=slot;l.hand=hand;l.engine=engine;l.restore=restore;
+        l.context=keepgun::contextAt(now,eyeWas_,eyeEndNs_,duelctl::live()&&duelctl::engineState.load(std::memory_order_relaxed)>=4,duelEndNs_,keepgun::windowNs);
+        if(hand==0||hand==1){const auto h=unsigned(hand);
+            l.release=keepgun::releaseWhy[h].load(std::memory_order_relaxed);l.sinceReleaseMs=keepgun::msSince(now,keepgun::releaseNs[h].load(std::memory_order_relaxed));
+            l.grip=engine?keepgun::gripNow[h].load(std::memory_order_relaxed):keepgun::releaseGrip[h].load(std::memory_order_relaxed);}
+        l.sinceForceDropMs=keepgun::msSince(now,forceDropNs_);l.sinceDeadEyeEndMs=keepgun::msSince(now,eyeEndNs_);l.sinceDuelEndMs=keepgun::msSince(now,duelEndNs_);
+        l.aimBits=prevAimBits_;l.timer=prevTimer_;
+        keepgun::noteLeave(l);
     }
     // every successful poll while a throwable is in a VR hand - the
     // aniAim state / arm-up / fuse flag / throw-scheduled bit, the actor flags and the reticle byte aniAim::ScheduleThrow refuses on, and the
@@ -1963,10 +2167,29 @@ class EngineSide {
             else if(prevGate_){e.kind="GATED";engineHolstersGated.fetch_add(1,std::memory_order_relaxed);}
             else{e.kind="OTHER";engineHolstersOther.fetch_add(1,std::memory_order_relaxed);}
             engineHolsters.fetch_add(1,std::memory_order_relaxed);{std::lock_guard lock(engineHolsterMutex);lastEngineHolster=e;}
+            ::rdrvr::vr::wheel::noteEnginePutAway(now); // WHEEL: a put-away right after an LB release = the select-state-4 holster
             { // GONE = the engine put the VR-held item away itself (slot = where it hangs now); a game draw soon after goes to this hand
                 int gk=-1;for(int k=0;k<slotCount&&gk<0;++k)if(s.rawItems[std::size_t(k)]==prevHand_)gk=k;
                 noteEvent(EvGone,gk,prevHold_,e.kind,now,std::uint32_t(prevAimBits_&0xff)|(std::uint32_t(prevState_&0xff)<<8)|(prevOurs_?1u<<16:0u));
                 if(prevOurs_){recentHand_=prevHold_;recentNs_=now;}
+                // KEEP GUN: around the end of Dead Eye / a duel the same slot goes back into the same hand if its grip never opened
+                const int ctx=keepgun::contextAt(now,s.deadEye,eyeEndNs_,duelctl::live()&&duelctl::engineState.load(std::memory_order_relaxed)>=4,duelEndNs_,keepgun::windowNs);
+                keepgun::bump(keepgun::engineLeaves);
+                if(ctx==keepgun::ContextDeadEye||ctx==keepgun::ContextDeadEyeEnd)keepgun::bump(keepgun::engineLeavesDeadEye);
+                else if(ctx!=keepgun::ContextNone)keepgun::bump(keepgun::engineLeavesDuel);
+                const bool gun=gk==SlotSidearm||gk==SlotSniper||gk==SlotLongarm||gk==SlotShotgun; // firearms only (the lasso / thrown / knife keep their own rules)
+                // a script's force holster (inventory flags) is never undone
+                const bool forced=(s.invFlags&(forceHolsterSoft|forceHolsterHard))!=0;
+                const bool restore=ctx!=keepgun::ContextNone&&prevOurs_&&gun&&(prevHold_==0||prevHold_==1)&&config().enabled&&!forced;
+                if(forced&&ctx!=keepgun::ContextNone&&prevOurs_&&gun)keepgun::bump(keepgun::forcedHolsters);
+                // one restore per window: the same item put away again right after its restore stays in the holster (no draw / put-away loop)
+                const bool repeat=restore&&keepgun::within(now,lastRestoreRequestNs_,keepgun::windowNs);
+                if(repeat)keepgun::bump(keepgun::repeats);
+                else if(restore&&keepgun::enabled.load(std::memory_order_relaxed)&&keepgun::restoreOn.load(std::memory_order_relaxed)){
+                    keepgun::Request r{};r.slot=gk;r.hand=prevHold_;r.holdSequence=prevSeq_;r.ns=now;r.context=ctx;keepgun::post(r);keepgun::bump(keepgun::requests);
+                    lastRestoreRequestNs_=now;}
+                else if(restore)keepgun::bump(keepgun::offRequests);
+                noteLeave(e.kind,gk,prevHold_,true,now,restore);
             }
             if(prevSpinKept_||spin::keeps(prevHold_)){spin::bump(spin::stats.engineHolsterWhileKept); // The engine put the spinning gun away itself
                 spin::lastGoneAimBits.store(prevAimBits_,std::memory_order_relaxed);spin::lastGoneTimer.store(prevTimer_,std::memory_order_relaxed);}
@@ -2003,6 +2226,10 @@ class EngineSide {
         // DEAD EYE (VrDeadEye.h): the engine cancels a running Dead Eye the frame bit1 drops (UpdateWeaponSpecialMove 0x269a660), and
         // the gates above all read "DEAD EYE" (reason / heldFirearm) - the mod's own force aim is KEPT while it runs (never newly set)
         if(!want&&forceOurs_&&inHand&&s.deadEye&&config().enabled&&s.gameState==3&&s.alive){want=true;::rdrvr::vr::deadeye::bump(::rdrvr::vr::deadeye::forceAimKept);}
+        // KEEP GUN tail: the same bit stays for keepgun::tailNs after Dead Eye / a duel ends while the item stays in the VR hand (the gates
+        // still read the old context for 1..10 polls; bit1 off = the RDR1-mode auto-holster of UpdateWeaponSelection, VrKeepGun.h)
+        if(!want&&config().enabled&&keepgun::tailKeeps(keepgun::enabled.load(std::memory_order_relaxed),forceOurs_,inHand,s.gameState==3,s.alive&&s.playerFlags,
+            s.locked,now,eyeEndNs_,duelEndNs_,keepgun::tailNs.load(std::memory_order_relaxed))){want=true;keepgun::bump(keepgun::tailPolls);}
         if(want&&!forceOurs_){
             if(s.aimBits&aimBitForce){if(!foreignSeen_){foreignSeen_=true;forceAimForeign.fetch_add(1,std::memory_order_relaxed);}} // a script owns it
             else{api_.setForceAim(player,true);forceOurs_=true;forceAimOurs.store(true,std::memory_order_relaxed);forceAimSet.fetch_add(1,std::memory_order_relaxed);}
@@ -2012,6 +2239,7 @@ class EngineSide {
         engineAimBits.store(s.aimBits,std::memory_order_relaxed);engineHoldTimer.store(s.holdTimer,std::memory_order_relaxed);
         engineSelectState.store(s.selectState,std::memory_order_relaxed);engineZoom.store(s.zoom,std::memory_order_relaxed);
         prevHand_=s.handItem;prevHold_=hold;prevOurs_=holdOurs.load(std::memory_order_relaxed);prevTimer_=s.holdTimer;prevAimBits_=s.aimBits;prevState_=s.selectState;
+        prevSeq_=holdSequence.load(std::memory_order_relaxed);
         prevGate_=reason;
         prevSpinKept_=spinKept;
     }
@@ -2111,19 +2339,22 @@ class EngineSide {
         try{return api_.context&&api_.context(api_.contextUser,s.player,s.actor,s.guid,out);}catch(...){return false;}
     }
     // nullptr = the strict draw/put-away gate passes.
-    Refusal gate(const Sample& s,const PlayerBlocks& b,int slot,bool draw) const noexcept {
+    Refusal gate(const Sample& s,const PlayerBlocks& b,int slot,bool draw,bool ignoreDeadEye=false) const noexcept {
         if(s.gameState!=3)return RefuseNotInGame;
         if(!s.playerFlags)return RefuseNoPlayer;
         if(!s.alive||!b.alive)return RefuseDead;
         if(s.locked||b.controlDisabled)return RefuseLocked;
-        if(s.deadEye||b.deadEye)return RefuseDeadEye;  // holsters are inactive in Dead Eye (never cancel it)
+        if(!ignoreDeadEye&&(s.deadEye||b.deadEye))return RefuseDeadEye;  // holsters are inactive in Dead Eye (never cancel it)
         if(b.cover)return RefuseCover;
-        if(b.ridingVehicle||b.vehicleTransition||(s.foot!=footOnFoot&&s.foot!=footHorse))return RefuseNotOnFoot;
+        // A vehicle seat passes only as PlayerBlocks::weaponSeat, and not while a move between seats runs (the engine does not refuse a draw there).
+        const bool seat=inWeaponSeat(s,b);
+        if((b.ridingVehicle&&!b.weaponSeat)||b.vehicleTransition||(seat&&b.seatSwap)||(s.foot!=footOnFoot&&s.foot!=footHorse&&!seat))return RefuseNotOnFoot;
         if(b.duel||b.mountedWeapon||b.mountingHorse||b.blindFiring||b.linkedAnimation||b.usingGringo)return RefuseContext;
         // LASSO: the lasso may be drawn in the saddle (the engine's CanDrawWeaponOfType only refuses it on a train)
         // long guns and thrown items too (RDR1 uses them from the saddle; the game's own CanDrawWeaponOfType still decides)
         if(draw&&(b.riding||s.foot==footHorse)&&slot!=SlotSidearm&&slot!=SlotSniper&&slot!=SlotLongarm&&slot!=SlotShotgun&&slot!=SlotThrown&&
            !(slot==SlotLasso&&lasso::holstersActive()))return RefuseMounted;
+        if(draw&&seat&&slot!=SlotSidearm&&slot!=SlotSniper&&slot!=SlotLongarm&&slot!=SlotShotgun&&slot!=SlotThrown)return RefuseMounted;
         if(draw&&(s.invFlags&forceHolsterHard))return RefuseForceHolster;
         return RefuseCount;
     }
@@ -2163,6 +2394,7 @@ class EngineSide {
             namespace T=throwing;
             if(!T::active())return refuseThrow(c,hand,T::RefuseOff,now);
             if(T::busy())return refuseThrow(c,hand,T::RefuseBusy,now);
+            if(vehicleseat::weaponSeatNow.load(std::memory_order_relaxed)){vehicleseat::throwsRefused.fetch_add(1,std::memory_order_relaxed);return refuseThrow(c,hand,T::RefuseGate,now);}
             if(!phantom_.item||phantom_.hand!=int(hand))return refuseThrow(c,hand,T::RefuseNotInHand,now);
             if(!T::slotThrowable(phantom_.slot))return refuseThrow(c,hand,T::RefuseNotSidearm,now);
             T::Prepared pr{};
@@ -2188,6 +2420,8 @@ class EngineSide {
             if(!T::active())return refuseThrow(c,hand,T::RefuseOff,now);
             if(T::busy())return refuseThrow(c,hand,T::RefuseBusy,now);
             if(gate(s,b,SlotSidearm,false)!=RefuseCount)return refuseThrow(c,hand,T::RefuseGate,now);
+            // A vehicle seat: the flight's own context rule (on foot only) would end it at once; the brain's holster intent puts the gun away.
+            if(inWeaponSeat(s,b)){vehicleseat::throwsRefused.fetch_add(1,std::memory_order_relaxed);return refuseThrow(c,hand,T::RefuseGate,now);}
             if(!s.handItem||holdHand.load(std::memory_order_relaxed)!=int(hand))return refuseThrow(c,hand,T::RefuseNotInHand,now);
             if(expected_&&now-expectedNs_<drawConfirmNs)return Result::Retry; // a draw is landing
             if(switching(s))return Result::Retry;
@@ -2252,6 +2486,8 @@ class EngineSide {
         if(c.op==OpDraw){
             if(slot<0||slot>=slotCount){refuse(RefuseEmptySlot,hand,now);return Result::Done;}
             if(const auto r=gate(s,b,slot,true);r!=RefuseCount){refuse(r,hand,now);return Result::Done;}
+            // KEEP GUN: a restore never draws against a script's soft force holster either (a socket grab may)
+            if(c.arg[2]==DrawRestore&&(s.invFlags&forceHolsterSoft)){refuse(RefuseForceHolster,hand,now);keepgun::bump(keepgun::forcedHolsters);return Result::Done;}
             if(!(s.slotEnabled>>unsigned(slot)&1u)){refuse(RefuseSlotDisabled,hand,now);return Result::Done;}
             const auto item=s.items[std::size_t(slot)],type=s.types[std::size_t(slot)];
             if(!item){refuse(s.rawItems[std::size_t(slot)]?RefuseNotWeapon:RefuseEmptySlot,hand,now);return Result::Done;}
@@ -2268,10 +2504,10 @@ class EngineSide {
                 if(phantom_.item)clearPhantom(ClearReplace);
                 if(s.foot==footHorse||(blocksValid_&&blocks_.riding))lasso::bump(lasso::stats.mountedLassoGrabs);}
             // VR DUEL: never an animated draw (DuelMachine state 3 slaves a running draw animation to the whole duel timer, aniAim::SetRemainingDrawTime)
-            if(!api_.selectItem(reinterpret_cast<void*>(s.inventory),reinterpret_cast<void*>(item),true,api_.animatedDraw&&!duelctl::live(),true)){refuse(RefuseSelectFailed,hand,now);return Result::Done;}
+            if(!api_.selectItem(reinterpret_cast<void*>(s.inventory),reinterpret_cast<void*>(item),true,api_.animatedDraw&&!duelctl::live()&&c.arg[2]!=DrawRestore,true)){refuse(RefuseSelectFailed,hand,now);return Result::Done;}
             expected_=item;expectedNs_=now;setHold(int(hand),true,c.sequence);draws.fetch_add(1,std::memory_order_relaxed);
-            if(slot==SlotSidearm)duelctl::noteGrab(); // VR DUEL: the grab is the draw
-            noteEvent(EvDrawn,slot,int(hand),"SELECT",now);
+            if(slot==SlotSidearm&&c.arg[2]!=DrawRestore)duelctl::noteGrab(); // VR DUEL: the grab is the draw
+            noteEvent(EvDrawn,slot,int(hand),c.arg[2]==DrawRestore?"KEEP_RESTORE":"SELECT",now);
             haptics::pulse(hand,haptics::grabAmplitude,haptics::grabUs,now,haptics::SourceGrab);
             return Result::Done;
         }
@@ -2286,6 +2522,7 @@ class EngineSide {
             api_.putAwayWeapon(reinterpret_cast<void*>(s.player),reinterpret_cast<void*>(s.inventory));
             expected_=0;putAways.fetch_add(1,std::memory_order_relaxed);
             noteEvent(EvPutAway,s.handSlot,int(hand),c.arg[2]==PutAwayHoldRelease?"HOLD_RELEASE":"SLOT_PRESS",now);
+            noteLeave(c.arg[2]==PutAwayHoldRelease?"HOLD_RELEASE":"SLOT_PRESS",s.handSlot,int(hand),false,now);
             haptics::pulse(hand,haptics::returnAmplitude,haptics::returnUs,now,haptics::SourceReturn);
             return Result::Done;
         }
@@ -2399,11 +2636,13 @@ public:
         if(why){
             pollFailures.fetch_add(1,std::memory_order_relaxed);inventoryValid.store(false,std::memory_order_relaxed);
             blockReason.store(why,std::memory_order_relaxed);contextAllowed.store(false,std::memory_order_relaxed);duelActive.store(false,std::memory_order_relaxed);
+            foregripGate.store(ForegripClosed,std::memory_order_relaxed);foregripWhy.store(why,std::memory_order_relaxed);deadEyeRunning.store(false,std::memory_order_relaxed);
             ownedMask.store(0,std::memory_order_relaxed);grabMask.store(0,std::memory_order_relaxed);currentSlot.store(-1,std::memory_order_relaxed);
+            vehicleseat::publish(false,-1,-1,vehicleseat::SeatNone,-1,false);
             if(const int hh=holdHand.load(std::memory_order_relaxed);hh>=0&&!expected_){ // Remember the hold across the gap
                 gap_=Gap{hh,holdOurs.load(std::memory_order_relaxed),holdSequence.load(std::memory_order_relaxed),lastHandItem_,frame.now};
                 if(gap_.ours){recentHand_=hh;recentNs_=frame.now;}
-                noteEvent(EvGone,-1,hh,"POLL_FAIL",frame.now);setHold(-1,false,0);lastHandItem_=0;}
+                noteEvent(EvGone,-1,hh,"POLL_FAIL",frame.now);noteLeave("POLL_FAIL",-1,hh,true,frame.now);setHold(-1,false,0);lastHandItem_=0;}
             prevHand_=0;prevHold_=-1; // No put-away forensics across an unreadable gap
             if(phantom_.item)clearPhantom(ClearContext,false); // DUAL: inventory unreadable (load, death screen, ...)
             {lasso::PlayerLink pl{};pl.ns=frame.now;lasso::playerBox.store(pl);} // LASSO: no player this poll
@@ -2411,9 +2650,21 @@ public:
             throwing::machine.observeInvalid(frame.now); // Nothing to keep in the air - the gun is in its holster
             duelctl::poll(false); // VR DUEL: the route ends with the machine
         }else{
-            // Expensive context (cover, duel, mounted gun, ...) every 10th poll; cheap bits every poll.
-            if(!blocksValid_||pollIndex_%10u==1u){PlayerBlocks b{};blocksValid_=readBlocks(s,b);if(blocksValid_)blocks_=b;}
+            // KEEP GUN: the end of Dead Eye (fresh flag) and of a duel (the VR route, or the stock duel in the last context read)
+            const bool eyeFell=eyeWas_&&!s.deadEye;eyeWas_=s.deadEye;
+            if(eyeFell){eyeEndNs_=frame.now;keepgun::bump(keepgun::deadEyeEnds);}
+            const bool duelNow=duelctl::live()||(blocksValid_&&blocks_.duel),duelFell=duelWas_&&!duelNow;duelWas_=duelNow;
+            if(duelFell){duelEndNs_=frame.now;keepgun::bump(keepgun::duelEnds);}
+            // Expensive context (cover, duel, mounted gun, ...) every 10th poll; cheap bits every poll; at once on those ends (the old
+            // block would still read Dead Eye / the duel for up to 9 polls).
+            const bool edgeRead=(eyeFell||duelFell)&&keepgun::enabled.load(std::memory_order_relaxed);if(edgeRead)keepgun::bump(keepgun::tailEdgeReads);
+            if(!blocksValid_||pollIndex_%10u==1u||edgeRead){PlayerBlocks b{};blocksValid_=readBlocks(s,b);if(blocksValid_)blocks_=b;}
             duelActive.store(blocksValid_&&blocks_.duel&&s.gameState==3&&s.alive,std::memory_order_relaxed);
+            const bool seatKnown=blocksValid_&&s.foot==footVehicle&&blocks_.ridingVehicle,seatNow=seatKnown&&blocks_.weaponSeat;
+            vehicleseat::publish(seatNow&&config().enabled,std::int32_t(s.foot),seatKnown?blocks_.vehicleType:-1,seatKnown?blocks_.seatClass:unsigned(vehicleseat::SeatNone),
+                seatKnown?blocks_.seatIndex:-1,seatKnown&&blocks_.seatSwap);
+            vehicleseat::seatBlocks.store(seatKnown?(s.locked||blocks_.controlDisabled?1u:0u)|(blocks_.mountedWeapon?2u:0u)|(blocks_.linkedAnimation?4u:0u)|(blocks_.blindFiring?8u:0u)|
+                (blocks_.cover?16u:0u)|(blocks_.duel?32u:0u)|(blocks_.usingGringo?64u:0u)|(blocks_.mountingHorse?128u:0u)|(blocks_.vehicleTransition?256u:0u):0u,std::memory_order_relaxed);
             const char* reason=nullptr;
             if(s.gameState!=3)reason="NOT IN GAME";else if(!s.playerFlags)reason="NOT PLAYER";else if(!s.alive)reason="DEAD";
             else if(s.locked)reason="CONTROL LOCKED";else if(s.deadEye)reason="DEAD EYE";else if(!blocksValid_)reason="CONTEXT UNAVAILABLE";
@@ -2424,9 +2675,16 @@ public:
             // and throws from the saddle, so the back slots and THROWN are grabbable mounted too (the knife stays on foot).
             if(s.foot==footHorse||blocks_.riding)grab&=(1u<<SlotSidearm)|(1u<<SlotSniper)|(1u<<SlotLongarm)|(1u<<SlotShotgun)|(1u<<SlotThrown)|
                 (lasso::holstersActive()?1u<<SlotLasso:0u);
+            // A vehicle seat: the horse's slots without the lasso (the knife stays on foot)
+            if(seatNow)grab&=(1u<<SlotSidearm)|(1u<<SlotSniper)|(1u<<SlotLongarm)|(1u<<SlotShotgun)|(1u<<SlotThrown);
             if(s.invFlags&forceHolsterHard)grab=0;
             if(duelctl::live())grab&=duelctl::grabMaskFor(1u<<SlotSidearm); // VR DUEL: only the sidearm, from the standoff (engine state 2) on
             contextAllowed.store(!reason,std::memory_order_relaxed);blockReason.store(reason?reason:"OK",std::memory_order_relaxed);
+            {const bool eye=s.deadEye||(blocksValid_&&blocks_.deadEye);const bool eyeDuel=(blocksValid_&&blocks_.duelRaw)||duelctl::live();
+             const bool eyeLever=deadEyeForegrip.load(std::memory_order_relaxed);const Refusal eyeGate=gate(s,blocks_,SlotSidearm,false,true);
+             const ForegripGate fg=foregripGateOf(!reason,eye,eyeLever,blocksValid_,eyeDuel,eyeGate==RefuseCount);
+             foregripGate.store(fg,std::memory_order_relaxed);deadEyeRunning.store(s.deadEye,std::memory_order_relaxed);
+             foregripWhy.store(fg!=ForegripClosed?"OK":!eye?reason:!eyeLever?"LEVER_OFF":!blocksValid_?"CONTEXT UNAVAILABLE":eyeGate!=RefuseCount?refusalNames[eyeGate]:"DUEL",std::memory_order_relaxed);}
             ownedMask.store(s.owned,std::memory_order_relaxed);grabMask.store(reason?0u:grab,std::memory_order_relaxed);
             currentSlot.store(s.handItem?s.handSlot:-1,std::memory_order_relaxed);inventoryValid.store(true,std::memory_order_relaxed);
             for(int k=0;k<slotCount;++k)if(namedItems_[std::size_t(k)]!=s.items[std::size_t(k)]){
@@ -2461,6 +2719,10 @@ public:
                     // is put away (below, once the switch animation allows). Our own socket draws (expected_) never come here.
                     setHold(-1,false,0);noDrawItem_=s.handItem;noDrawNs_=frame.now;noDrawTryNs_=0;
                     noteEvent(EvAdopt,s.handSlot,-1,"REINS_NO_DRAW",frame.now);
+                }else if(seatNow&&(s.handSlot==SlotMelee||s.handSlot==SlotLasso)){
+                    // A vehicle seat keeps the knife and the lasso out: the weapon wheel's draw is put away below, as the reins' is.
+                    setHold(-1,false,0);noDrawItem_=s.handItem;noDrawNs_=frame.now;noDrawTryNs_=0;
+                    noteEvent(EvAdopt,s.handSlot,-1,"SEAT_NO_DRAW",frame.now);
                 }else{ // The game's own draw is adopted into our HOLD (gameDrawSequenceFlag): opening that hand holsters it
                     const bool adopt=adoptGameDraws.load(std::memory_order_relaxed)&&config().enabled;
                     // into the hand that held a weapon just before (the engine swapped / re-drew it), else the right hand (wheel, script)
@@ -2482,7 +2744,8 @@ public:
                 else if(!switching(s)&&(!noDrawTryNs_||frame.now-noDrawTryNs_>=300'000'000ull)){noDrawTryNs_=frame.now;
                     dropForceAim(s,false);lastOurPutAwayNs_=frame.now;prevHand_=0;
                     api_.putAwayWeapon(reinterpret_cast<void*>(s.player),reinterpret_cast<void*>(s.inventory));putAways.fetch_add(1,std::memory_order_relaxed);
-                    noteEvent(EvPutAway,s.handSlot,-1,duelctl::live()?"DUEL_NO_DRAW":"REINS_NO_DRAW",frame.now);}}
+                    noteEvent(EvPutAway,s.handSlot,-1,duelctl::live()?"DUEL_NO_DRAW":seatNow?"SEAT_NO_DRAW":"REINS_NO_DRAW",frame.now);
+                    noteLeave(duelctl::live()?"DUEL_NO_DRAW":seatNow?"SEAT_NO_DRAW":"REINS_NO_DRAW",s.handSlot,-1,false,frame.now);}}
             if(phantom_.item)checkPhantom(s,frame.now);
             weaponKeep(s,reason,frame.now);
             duelctl::poll(s.handItem&&holdHand.load(std::memory_order_relaxed)>=0,s.actor,s.gameState==3&&s.alive); // VR DUEL: a gun in a VR hand in state 2 = the draw; the route ends with the machine
@@ -2569,6 +2832,18 @@ inline bool startupEnabled() noexcept {
         if(!g.empty()){char* e{};const float ms=std::strtof(g.c_str(),&e);
             if(e!=g.c_str()&&std::isfinite(ms)&&ms>=0.f&&ms<=10000.f)gameDrawOpenNs.store(std::uint64_t(double(ms)*1e6),std::memory_order_relaxed);}
     }
+    {const auto f=property("debug.rdrvr.vr.holsters.deadeye.foregrip");if(!f.empty())deadEyeForegrip.store(f[0]!='0',std::memory_order_relaxed);}
+    { // KEEP GUN (VrKeepGun.h): debug.rdrvr.vr.holsters.keepgun 0 = off, .keepgun.restore 0 = no redraw, .keepgun.tailms <0..3000>
+        const auto k=property("debug.rdrvr.vr.holsters.keepgun");if(!k.empty())keepgun::enabled.store(k[0]!='0',std::memory_order_relaxed);
+        const auto r=property("debug.rdrvr.vr.holsters.keepgun.restore");if(!r.empty())keepgun::restoreOn.store(r[0]!='0',std::memory_order_relaxed);
+        const auto t=property("debug.rdrvr.vr.holsters.keepgun.tailms");
+        if(!t.empty()){char* e{};const float ms=std::strtof(t.c_str(),&e);
+            if(e!=t.c_str()&&std::isfinite(ms)&&ms>=0.f&&ms<=3000.f)keepgun::tailNs.store(std::uint64_t(double(ms)*1e6),std::memory_order_relaxed);}
+    }
+    {const auto off=[](const std::string& v){return !v.empty()&&v[0]=='0';};
+        vehicleseat::weaponsOn.store(!off(property("debug.rdrvr.vr.holsters.seat")),std::memory_order_relaxed);
+        vehicleseat::driverOn.store(!off(property("debug.rdrvr.vr.holsters.seatdriver")),std::memory_order_relaxed);
+        vehicleseat::nativeGrips.store(!off(property("debug.rdrvr.vr.holsters.seatgrips")),std::memory_order_relaxed);}
     const auto value=property("debug.rdrvr.vr.holsters");const bool on=value.empty()||value[0]!='0'; // same rule as VrSettings.h
     killedByProperty.store(!on,std::memory_order_relaxed);
     if(!on)engineState.store("DISABLED_BY_PROPERTY",std::memory_order_relaxed);return on;
@@ -2665,6 +2940,17 @@ inline std::string report() {
         mainthread::executorInstalled()?"true":"false",c.enabled?"true":"false",c.grip==GripMode::Toggle?"TOGGLE":"HOLD",
         c.markers==MarkerMode::Always?"ALWAYS":c.markers==MarkerMode::Off?"OFF":"NEAR",c.twoHand?"true":"false",
         inventoryValid.load()?"true":"false",contextAllowed.load()?"true":"false",blockReason.load());out+=b;
+    { // state = sagPlayer+0x5d4 (2 foot, 3 vehicle seat, 5 horse); layout MOUNTED alone cannot tell a horse from a wagon
+        namespace S=vehicleseat;
+        std::snprintf(b,sizeof b,"\"seat\":{\"state\":%d,\"vehicleType\":%d,\"vehicle\":\"%s\",\"seat\":\"%s\",\"index\":%d,\"swap\":%s,\"weapons\":%s,"
+            "\"nativeGrips\":%s,\"lever\":%s,\"driverLever\":%s,\"polls\":%llu,\"throwsRefused\":%llu,\"blocks\":[",
+            S::playerState.load(),S::vehicleType.load(),S::typeName(S::vehicleType.load()),S::seatName(S::seatClass.load()),S::seatIndex.load(),S::seatSwap.load()?"true":"false",
+            S::weaponSeatNow.load()?"true":"false",S::nativeGrips.load()?"true":"false",S::weaponsOn.load()?"true":"false",S::driverOn.load()?"true":"false",
+            (unsigned long long)S::seatPolls.load(),(unsigned long long)S::throwsRefused.load());out+=b;
+        const auto blocks=S::seatBlocks.load();bool firstBlock=true;
+        for(unsigned i=0;i<S::blockNames.size();++i)if(blocks>>i&1u){out+=firstBlock?"\"":",\"";out+=S::blockNames[i];out+="\"";firstBlock=false;}
+        out+="]},";
+    }
     out+="\"slots\":{";
     const auto owned=ownedMask.load(),grab=grabMask.load();
     for(int k=0;k<slotCount;++k){
@@ -2717,9 +3003,17 @@ inline std::string report() {
             double(gameDrawOpenNs.load())/1e6,u(gameDrawsAdopted),u(adoptClosed),u(adoptOpen),u(adoptSqueezed),u(adoptOpenHolsters));out+=b;
         std::snprintf(b,sizeof b,"\"duel\":{\"active\":%s,\"frames\":%llu,\"triggerEdges\":%llu,\"vr\":",duelActive.load()?"true":"false",
             u(duelFrames),u(duelTriggerEdges));out+=b;out+=duelctl::report();out+="},";
+        out+="\"keepGun\":";out+=keepgun::report(nowNs());out+=",";
         std::snprintf(b,sizeof b,"\"sniperFree\":{\"on\":%s,\"frames\":%llu,\"zoomWrites\":%llu,\"zoomSkips\":%llu},",sniperFreeFire.load()?"true":"false",
             u(sniperFreeFrames),u(sniperZoomWrites),u(sniperZoomSkips));out+=b;
         std::snprintf(b,sizeof b,"\"twoHandFire\":{\"on\":%s,\"blockedFrames\":%llu},",settings().twoHandFire()?"true":"false",u(oneHandBlocked));out+=b;
+        {const int fg=foregripGate.load();
+         std::snprintf(b,sizeof b,"\"foregrip\":{\"gate\":\"%s\",\"why\":\"%s\",\"deadEyeLever\":%s,\"gateDrops\":%llu,\"gateDropsInDeadEye\":%llu,\"lastGateDrop\":\"%s\","
+            "\"deadEye\":{\"running\":%s,\"frames\":%llu,\"longGunFrames\":%llu,\"supportFrames\":%llu,\"gripsAtStart\":%llu,\"gripsKept\":%llu,\"gripsLost\":%llu,"
+            "\"gripsTaken\":%llu,\"transfersMasked\":%llu}},",
+            fg==ForegripDeadEye?"DEAD_EYE":fg==ForegripOpen?"OPEN":"CLOSED",foregripWhy.load(),deadEyeForegrip.load()?"true":"false",u(foregripGateDrops),u(foregripGateDropsDeadEye),
+            foregripLastDrop.load(),deadEyeRunning.load()?"true":"false",u(deadEyeFrames),u(deadEyeLongGunFrames),u(deadEyeSupportFrames),u(deadEyeGripsAtStart),u(deadEyeGripsKept),
+            u(deadEyeGripsLost),u(deadEyeGripsTaken),u(deadEyeTransfersMasked));out+=b;}
         namespace G=guard;const auto since=G::engagedSinceNs.load(),stamp=G::stampNs.load(),now=nowNs();
         std::snprintf(b,sizeof b,"\"guard\":{\"active\":%s,\"killed\":%s,\"state\":\"%s\",\"ageMs\":%.0f,\"engagedForMs\":%.0f,\"frames\":%llu,"
             "\"armingFrames\":%llu,\"engagedFrames\":%llu,\"engages\":%llu,\"releases\":%llu,\"aborted\":%llu,\"maskedPresses\":%llu,"

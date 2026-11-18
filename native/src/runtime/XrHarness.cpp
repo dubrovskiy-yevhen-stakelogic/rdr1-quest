@@ -21,6 +21,7 @@
 #include "vr/VrMelee.h"    // MELEE: XR-rate controller tape (pushSample)
 #include "vr/VrTeleportLink.h" // TELEPORT: BLINK colour scale (fade command / word / pair id, watchdog)
 #include "vr/VrCutscene.h" // CUTSCENES: an engaged stereo cutscene shows the stereo layer like World
+#include "StereoBridge.h"     // STEREO BRIDGE: a change between two stereo views keeps tracking + the stereo mailbox
 #include "vr/VrHud.h"         // HUD: head / wrist quads of the game's HUD
 #include "vr/VrWelcome.h"      // WELCOME: first-steps message on the menu panel
 #include "vr/VrGameMsg.h"      // GAME MESSAGES: the game's help text on the stats quad
@@ -55,9 +56,11 @@ bool stereoCutscene(const PresentationMailbox* m) noexcept {
     const auto now=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     const auto st=m->snapshot(now);
     return (st.context==PresentationContext::Cutscene||st.context==PresentationContext::CameraTransition||
-            (st.context==PresentationContext::CameraOverride&&::rdrvr::vr::cutscene::overrideEligible()))&&
+            (st.context==PresentationContext::CameraOverride&&::rdrvr::vr::cutscene::overrideEligible(now)))&&
            ::rdrvr::vr::cutscene::engaged(st.revision,now);
 }
+// STEREO BRIDGE (StereoBridge.h), XR thread only: the hold timer, whether the last XR frame showed game stereo, the shot edge meter.
+bridge::Timer stereoBridge;bool lastGameStereo{};bridge::EdgeMeter shotEdges;
 // pdtMono of the XR frame whose predictedDisplayTime locateHands locates (XR thread; kept outside the
 // mirror XrHarness.h). -1 / 0 = no conversion.
 std::atomic<std::int64_t> xrPoseMonoNs{0};
@@ -308,6 +311,7 @@ void XrHarness::invalidateTracking(){
     if(haptics_)haptics_->invalidate();
     tracking_.invalidate();recenterButton_.invalidate();controllerActions_.invalidate();if(controllers_)controllers_->invalidate();
     recenterRequested_=false;if(gameViews_)gameViews_->invalidate();if(stereo_)stereo_->invalidate();if(hud_)hud_->invalidateCompleted();
+    stereoBridge.cancel(); // Focus / space / full presentation changes end a bridge
 }
 void XrHarness::requestExit() {
     controllerActions_.outputHaptics(nullptr);if(haptics_)haptics_->invalidate();
@@ -449,10 +453,12 @@ std::array<Pose,2> XrHarness::locateHands(XrTime time) {
         // HAMMER: the swipe detector at XR rate (its only owner; the stroke haptic starts in this
         // XR frame); disarmed by the menu (graphicsInput) / the 300 ms menu freeze itself. No hammer module = no sink.
         if(inputReady){if(const auto* hs=::rdrvr::vr::holsters::hammerSinks.load(std::memory_order_acquire);hs&&hs->xrSample)hs->xrSample(sample,graphicsInput);}
+        // Freeze holsters while the menu eats input: noted before the zeroed sample is published, so the input brain never reads its first
+        // zeroed grips as an open hand (a captured grip dropped, the still closed grip then a fresh L1 / R1 when the menu closes)
+        ::rdrvr::vr::holsters::noteMenu(graphicsInput,sample.publishedNs);
         if(inputReady)controllers_->publish(sample);else controllers_->invalidate();
         ControllerSample current{};HapticSample feedback{};
         const bool hapticReady=!graphicsInput&&haptics_&&controllers_->snapshot(sample.publishedNs,current)&&haptics_->snapshot(sample.publishedNs,current,feedback);
-        ::rdrvr::vr::holsters::noteMenu(graphicsInput,sample.publishedNs);                  // Freeze holsters while the menu eats input
         const auto vrPulse=::rdrvr::vr::haptics::xrFrame(sample.publishedNs,graphicsInput); // Holster pulses (dropped while the menu is open)
         if(hapticReady)for(unsigned h=0;h<2;++h)if(vrPulse.active[h])feedback.amplitude[h]=0; // a 30 ms native pulse would replace the VR pulse
         controllerActions_.outputHaptics(hapticReady?&feedback:nullptr);
@@ -501,7 +507,8 @@ void XrHarness::resetSpace(XrTime time,bool toHead) {
 }
 void XrHarness::frame() {
     if(!running_) return;
-    performance_.pump(presentation_&&(presentationGate_.world()||stereoCutscene(presentation_)));
+    const auto bridgeNow=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    performance_.pump(presentation_&&(presentationGate_.world()||stereoCutscene(presentation_)||stereoBridge.active(bridgeNow)));
     XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO}; XrFrameState frameState{XR_TYPE_FRAME_STATE};
     const auto waitBegin=diagnostics::monotonicNs(); // Always-on XR frame timing (xrHistory)
     {diagnostics::WallScope timing(diagnostics::frameTimings.xrWait);
@@ -543,16 +550,36 @@ void XrHarness::frame() {
     {static bool replayFocus=false,replayFocusSeen=false; // A recorded focus change invalidates like the live session event (events())
      if(ir::replaying()){if(replayFocusSeen&&inputFocus!=replayFocus)invalidateTracking();replayFocus=inputFocus;replayFocusSeen=true;}else replayFocusSeen=false;}
     if(presentation_){
-        const auto now=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-        if(presentationGate_.update(presentation_->snapshot(now))){
+        const auto now=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        const auto snap=presentation_->snapshot(now);
+        const auto prevContext=presentationGate_.context();const auto prevRevision=presentationGate_.revision();
+        if(presentationGate_.update(snap)){
             // Retire the prior mode's pixels/poses before returning to stereo.
             // The existing GPU mailbox keeps unfinished submissions alive.
-            if(presentationGate_.preservesInput()){
+            namespace sb=bridge;
+            const unsigned ms=sb::bridgeMs.load(std::memory_order_relaxed);
+            const auto decline=sb::classify(lastGameStereo,snap.context,::rdrvr::vr::cutscene::overrideEligible(now),::rdrvr::vr::cutscene::requested(),
+                snap.menuRevision>prevRevision,pendingSpaceChange_!=0||recenterRequested_);
+            switch(sb::changeAction(presentationGate_.preservesInput(),decline,ms)){
+            case sb::ChangeAction::RetireContent:
                 // Scope entry/exit must not release the trigger that holds it
                 // open. A new visual epoch still rejects pre-transition work.
                 tracking_.retireContent();
                 if(gameViews_)gameViews_->invalidate();if(stereo_)stereo_->invalidate();if(hud_)hud_->invalidateCompleted();
-            }else invalidateTracking();
+                stereoBridge.cancel();break;
+            case sb::ChangeAction::Bridge:
+                // Between two stereo views: input as for any context change; tracking, views and the displayed pair stay (no lost
+                // interval, no tracking-epoch change for the world replay key), the mailbox is asked until the new revision shows.
+                graphicsMenu_.invalidate();++inputEpoch_;if(haptics_)haptics_->invalidate();
+                recenterButton_.invalidate();controllerActions_.invalidate();if(controllers_)controllers_->invalidate();
+                recenterRequested_=false;if(hud_)hud_->invalidateCompleted();
+                stereoBridge.arm(now,ms,spaceEpoch_);sb::bump(sb::stats.arms);
+                sb::bump(snap.context==PresentationContext::World?sb::stats.armsExit:sb::stats.armsEnter);break;
+            case sb::ChangeAction::Invalidate:
+                if(ms)sb::noteDecline(decline);
+                invalidateTracking();stereoBridge.cancel();break;
+            }
+            shotEdges.change(prevContext,snap.context,diagnostics::monotonicNs());
             anchored_=false;
         }
     }
@@ -573,7 +600,7 @@ void XrHarness::frame() {
     XrCompositionLayerQuad cinema{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerQuad hud{XR_TYPE_COMPOSITION_LAYER_QUAD};bool hudRendered=false;
     ::rdrvr::vr::hud::Layers vrHud{}; // Only next to a world stereo projection layer (never theater / menus / loading)
-    bool rendered=false;bool diagnostic=false;bool gameFrame=false;bool gameStereo=false;
+    bool rendered=false;bool diagnostic=false;bool gameFrame=false;bool gameStereo=false;bool bridging=false;
     // On fatal render failure, teardown waits the private queue and destroys the session;
     // it does not publish a partial pair or release an unfinished image.
     if(frameState.shouldRender && !pendingSpaceChange_) {
@@ -634,7 +661,8 @@ void XrHarness::frame() {
             const auto nowNs=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
             bool stereoReady=false;
             if(stereo_)stereo_->setXrFrame(frame_); // This XR frame's id (views just published with it)
-            if(ready && stereo_ && (!presentation_||presentationGate_.world()||stereoCutscene(presentation_)))try{mailboxAsked=true;stereoReady=stereo_->render(session_,tracking_.epoch,spaceEpoch_,nowNs,stereoLayer);}
+            bridging=presentation_&&stereoBridge.active(std::uint64_t(nowNs));
+            if(ready && stereo_ && (!presentation_||presentationGate_.world()||stereoCutscene(presentation_)||bridging))try{mailboxAsked=true;stereoReady=stereo_->render(session_,tracking_.epoch,spaceEpoch_,nowNs,stereoLayer,bridging);}
                 catch(const std::exception& e){__android_log_print(ANDROID_LOG_ERROR,"RdrVrXR","stereo transfer disabled: %s",e.what());}
             if(stereoReady) {
                 for(unsigned i=0;i<2;++i) {
@@ -680,8 +708,8 @@ void XrHarness::frame() {
                             layers[i].next=&x;}
                     }
                     spaceWarpControl.lastSubmittedFrame=w.frame; // also while suspended: fresh on resume
-                    if(chain){const auto period=framePacer.periodNs(); // Count only inside the runtime's half-rate loop
-                        spaceWarpControl.noteCadence(resubmit,period>0&&frameState.predictedDisplayPeriod>period+period/2,warpNow);}
+                    if(chain){const auto period=framePacer.periodNs(); // Count only inside the runtime's half-rate loop; a bridge hold (shown where the theater used to be) is not counted
+                        spaceWarpControl.noteCadence(resubmit&&!bridging,period>0&&frameState.predictedDisplayPeriod>period+period/2,warpNow);}
                     spaceWarpControl.noteSubmit(info,skip,resubmit,info&&!resubmit?w.delta:identityPose(),frameState.predictedDisplayPeriod);
                 }
                 rendered=true;gameStereo=true;
@@ -947,7 +975,7 @@ void XrHarness::frame() {
      const auto mailboxReason=NoLayer(presentTelemetry.lastReason.load(std::memory_order_relaxed));
      NoLayer why=NoLayer::None;
      if(!rendered){
-         const bool world=!presentation_||presentationGate_.world()||stereoCutscene(presentation_);
+         const bool world=!presentation_||presentationGate_.world()||stereoCutscene(presentation_)||bridging;
          why=!frameState.shouldRender?NoLayer::ShouldNotRender:spacePending?NoLayer::Epoch:!trackingReady?NoLayer::NoTracking:
              mailboxAsked?(mailboxReason==NoLayer::None||mailboxReason==NoLayer::Stale?NoLayer::NoScreen:mailboxReason):NoLayer::NotWorld;
          presentTelemetry.noteNoLayer(world,why);
@@ -974,7 +1002,23 @@ void XrHarness::frame() {
      // stereoTransfer.latch.history (join by time).
      constexpr std::uint8_t xrFlagNewerNotReady=16; // XrHistory::Flags (FramePacing.h) ends at 8
      if(gameStereo&&mailboxAsked&&stereo_&&stereo_->lastLatch()==StereoMailbox::Latch::RepeatNewerNotReady)r.flags|=xrFlagNewerNotReady;
-     xrHistory.push(r);}
+     xrHistory.push(r);
+     if(presentation_){ // STEREO BRIDGE: end / expiry, layer kinds per context, the shot edges
+         namespace sb=bridge;
+         const bool ofRevision=newPair&&sb::revisionPairs.reached(presentationGate_.revision(),presentedPair);
+         if(gameStereo&&stale&&bridging)sb::bump(sb::stats.heldFrames);
+         if(stereoBridge.armed()){
+             const auto bnow=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+             const bool gate=presentationGate_.world()||stereoCutscene(presentation_);const auto armedNs=stereoBridge.armedNs();
+             const auto end=stereoBridge.update(bnow,spaceEpoch_,gate,ofRevision);
+             // Expired outside a stereo view: drop the held pair as the change would have (the theater shows, no later stale repeat of it)
+             if(end==sb::Timer::End::Expired&&!gate&&stereo_)stereo_->invalidate();
+             sb::noteEnd(end,bnow,armedNs);
+         }
+         sb::noteXrKind(presentationGate_.context(),unsigned(kind));
+         shotEdges.frame(diagnostics::monotonicNs(),unsigned(kind),ofRevision,presentationGate_.context(),sb::shots);
+     }
+     lastGameStereo=gameStereo;}
     spaceWarpControl.pollRuntime(instance_,session_); // /perfmetrics_meta/compositor/spacewarp_mode, 1 Hz while active
     spaceWarpMenuRuntime.store(spaceWarpControl.runtimeMode()>=0?int(spaceWarpControl.runtimeMode()):-1,std::memory_order_relaxed);
     layerMode_=gameStereo?"GAME_STEREO":gameFrame?"GAME_THEATER":diagnostic?"DIAGNOSTIC_STEREO":"NO_LAYER";

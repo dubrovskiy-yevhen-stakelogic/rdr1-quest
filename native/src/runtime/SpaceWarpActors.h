@@ -39,6 +39,7 @@ struct ActorPose {
     std::uint32_t guid{};std::int32_t race{-1};
     float m[12]{};                      // a(0..2) b(3..5) c(6..8) d(9..11): world = a*x + b*y + c*z + d (engine units)
     std::int32_t bones{-1};             // Index into the BoneSet of the same serial (-1: root only)
+    std::uint8_t skip{};                // vr/VrMotionActors.h: 1 = ragdoll (mover +0xb8c), 2 = just after one (get-up): no block (ActorRagdoll)
 };
 struct ActorSet {
     std::uint64_t serial{};             // main-thread tick that read the matrices (0 = none)
@@ -98,6 +99,8 @@ inline ActorChannel actorChannel;
 struct ActorShape {float radius,bottom,top;};
 inline ActorShape actorShape(std::int32_t race) noexcept {
     if(race==-2)return ActorShape{0.75f,0.15f,2.00f}; // The PLAYER (synthetic, SpaceWarp::prepareActorPair): arms' reach, ground excluded
+    // The PLAYER in a vehicle seat: the driver's box, footboard, roof front and the wheelers' backs (ground excluded: eyes - 1.35 m)
+    if(race==-4)return ActorShape{2.50f,0.15f,2.30f};
     // The player BODY (synthetic, same root as the player = 1.5 m under the eyes): parts only (buildActorBlock: no root claim), so the
     // bounding cylinder reaches the feet (running: ~0.2 m under the root; riding: the stirrups) without the root cylinder taking ground
     if(race==-3)return ActorShape{0.05f,-2.00f,2.00f};
@@ -107,12 +110,16 @@ inline ActorShape actorShape(std::int32_t race) noexcept {
 // basis + position, = worldFromLocal * grip) and the aim forward (world, unit). weapon = the hand holds a weapon (holsters holdHand /
 // phantomHand: the weapon's grip after the two-hand bend). The engine places the VR hands and the held weapon from the controller each
 // frame, not from any actor root, so the player block carries them as PARTS that move with the grip (SpaceWarp::prepareActorPair).
-struct SpaceWarpHand {float m[12]{};float forward[3]{};bool valid{},weapon{};};
+// front / back / radius (metres, front > 0): the held capsule fitted to the item (fitHeldCapsule); 0 = the capsule for the longest item.
+struct SpaceWarpHand {float m[12]{};float forward[3]{};bool valid{},weapon{};float front{},back{},radius{};};
 inline constexpr std::uint32_t handPartLayout=0xFFFF0001u;
 // The hand's capsule along the aim forward: an empty hand (palm + fingers) or hand + weapon (rifle stock behind the grip, barrel in
 // front; a pistol's capsule is longer than the pistol, but membership is 3D, so only surfaces within the radius of the axis are taken).
+// spacewarp.frag gives every depth pixel inside the capsule this hand's motion, so a capsule longer than the item shimmers on surfaces near it.
+inline void fitHeldCapsule(SpaceWarpHand& h,float tipLenM,float radiusM) noexcept {h.front=tipLenM+.03f;h.back=tipLenM>.45f?.30f:.08f;h.radius=radiusM;}
 inline BonePart handPart(const SpaceWarpHand& h,unsigned index,double upm) noexcept {
-    const double back=h.weapon?0.30:0.06,front=h.weapon?0.85:0.14,radius=h.weapon?0.12:0.10;
+    const bool fitted=h.weapon&&h.front>0.f;
+    const double back=fitted?h.back:h.weapon?0.30:0.06,front=fitted?h.front:h.weapon?0.85:0.14,radius=fitted?h.radius:h.weapon?0.12:0.10;
     BonePart p{};std::memcpy(p.m,h.m,sizeof p.m);p.radius=float(radius*upm);p.spec=std::uint8_t(index);p.bone=std::uint16_t(index);
     for(int i=0;i<3;++i){p.a[i]=float(h.m[9+i]-back*upm*h.forward[i]);p.b[i]=float(h.m[9+i]+front*upm*h.forward[i]);}
     return p;
@@ -144,16 +151,26 @@ inline std::uint64_t claim(std::atomic<std::uint64_t>& requests,std::atomic<std:
     while(r!=t){if(taken.compare_exchange_weak(t,r,std::memory_order_relaxed))return r;}
     return 0;
 }
-// Per actor of one eye's block: what buildActorBlock did with it (dump JSON, host tests).
-enum ActorResult : std::uint8_t {ActorWritten,ActorUnmatched,ActorJump,ActorStill,ActorOffscreen,ActorMath,ActorOverflow,ActorBehind,ActorResultCount};
+// Per actor of one eye's block: what buildActorBlock did with it (dump JSON, host tests). ragdoll = either snapshot flagged ActorPose::skip
+// (the ragdoll root's yaw follows the falling body: TeleportObject rebuilds it upright from the body's axes every update), turn = the root
+// turned more than maxTurnDeg within the pair (no animated turn does; NPC / animal / horse blocks only).
+enum ActorResult : std::uint8_t {ActorWritten,ActorUnmatched,ActorJump,ActorStill,ActorOffscreen,ActorMath,ActorOverflow,ActorBehind,ActorRagdoll,ActorTurn,
+    ActorResultCount};
 inline const char* actorResultName(unsigned r) noexcept {
-    static constexpr const char* names[ActorResultCount]{"written","unmatched","jump","still","offscreen","math","overflow","behind"};
+    static constexpr const char* names[ActorResultCount]{"written","unmatched","jump","still","offscreen","math","overflow","behind","ragdoll","turn"};
     return r<ActorResultCount?names[r]:"?";}
+// The written blocks' root turn (deg: <=2, <=5, <=10, <=20, <=45, more) and step (m: <=.05, <=.1, <=.25, <=.5, <=1, more) per pair.
+inline unsigned actorAngleBin(double deg) noexcept {return !(deg<=45.0)?5u:deg<=2.0?0u:deg<=5.0?1u:deg<=10.0?2u:deg<=20.0?3u:4u;}
+inline unsigned actorStepBin(double m) noexcept {return !(m<=1.0)?5u:m<=.05?0u:m<=.1?1u:m<=.25?2u:m<=.5?3u:4u;}
+inline constexpr double defaultMaxTurnDeg=45.0;
 // ActorTrace: bones = parts written for this actor (0 root only), boneStepM = the largest part step of the pair
 struct ActorTrace {std::uint32_t guid{};std::int32_t race{-1};std::uint8_t result{ActorUnmatched};int block{-1};float stepM{},angleDeg{};int bones{};float boneStepM{};};
 // behind = boxes entirely behind the eye, clipped = boxes cut by the near plane (rect clipped),
 // stillPinned = standing actors written anyway (debug.rdrvr.mvbones 2), bones = the part counters (left eye).
-struct ActorStats {std::uint64_t unmatched{},jump{},still{},offscreen{},math{},behind{},clipped{},stillPinned{};float maxStepM{};BoneStats bones{};};
+// ragdoll / turn = ActorRagdoll / ActorTurn (left eye), maxAngleDeg = the largest turn of a written block, angleHist / stepHist = the written
+// blocks' turn and step (actorAngleBin / actorStepBin).
+struct ActorStats {std::uint64_t unmatched{},jump{},still{},offscreen{},math{},behind{},clipped{},stillPinned{};float maxStepM{};BoneStats bones{};
+    std::uint64_t ragdoll{},turn{};float maxAngleDeg{};std::array<std::uint64_t,6> angleHist{},stepHist{};};
 // The screen rectangle (engine NDC x, y) of a box given relative to the eye (lo / hi = corner - eye position), clipped at the
 // near plane clip w >= wMin (w = view depth: every visible surface lies beyond the 5 cm near plane, so 1 cm keeps every claimable
 // pixel). The clipped box's vertices are the corners in front + the 12 edges' crossings of w = wMin; projected, they bound the visible
@@ -186,8 +203,9 @@ struct ActorEye {const float* rel{};const float* pos{};const ActorSet* actors{};
 // extremities of RUNNING actors when the snapshot lags the drawn frame by a tick).
 // cache (optional) = the eye-independent half of the parts, computed for the first eye of a pair and reused for the second
 // (SpaceWarp::produce passes one; host tests may not: then each eye computes it, same result).
+// maxTurnDeg (> 0): an NPC / animal / horse block whose root turned more than this within the pair is skipped (ActorTurn); 0 = no limit.
 inline unsigned buildActorBlock(const ActorEye& cur,const ActorEye& prev,double unitsPerMetre,bool countSkips,GpuActors& out,ActorStats& st,
-                                ActorTrace* trace=nullptr,double padSteps=0.5,BonePairCache* cache=nullptr) noexcept {
+                                ActorTrace* trace=nullptr,double padSteps=0.5,BonePairCache* cache=nullptr,double maxTurnDeg=defaultMaxTurnDeg) noexcept {
     if(!cur.rel||!cur.pos||!prev.rel||!prev.pos||!cur.actors||!prev.actors)return 0;
     const ActorSet& ca=*cur.actors;const ActorSet& pa=*prev.actors;
     if(!ca.count||!pa.count||ca.serial==pa.serial)return 0;
@@ -210,12 +228,14 @@ inline unsigned buildActorBlock(const ActorEye& cur,const ActorEye& prev,double 
         if(!b){if(countSkips)++st.unmatched;done(ActorUnmatched);continue;}
         const double dx=double(a.m[9])-b->m[9],dy=double(a.m[10])-b->m[10],dz=double(a.m[11])-b->m[11];
         const double step=std::sqrt(dx*dx+dy*dy+dz*dz)/upm;t.stepM=float(step);
+        if(a.skip||b->skip){if(countSkips)++st.ragdoll;done(ActorRagdoll);continue;}           // ragdoll / get-up: camera-only vectors
         if(!(step<=1.5)){if(countSkips)++st.jump;done(ActorJump);continue;}                    // spawn / teleport / slot reuse
         const M4 mc=matrix(a),mp=matrix(*b);M4 inv{};
         if(!invert(mc,inv)){if(countSkips)++st.math;done(ActorMath);continue;}
         const M4 d=mul(mp,inv);                                                                    // current world -> previous world
         const double tr=d[0]+d[5]+d[10],cosA=std::clamp((tr-1.0)/2.0,-1.0,1.0);
         t.angleDeg=float(std::acos(cosA)*57.29577951308232);
+        if(maxTurnDeg>0.0&&a.race>=0&&double(t.angleDeg)>maxTurnDeg){if(countSkips)++st.turn;done(ActorTurn);continue;} // a root yaw flip
         const double mx=(double(a.m[9])+b->m[9])/2,my=(double(a.m[10])+b->m[10])/2,mz=(double(a.m[11])+b->m[11])/2;
         // the actor's parts (both snapshots carry bones with the same layout), into the eye's part array after the written ones
         const BoneSet* cs=cur.bones&&cur.bones->serial==ca.serial?cur.bones:nullptr;const BoneSet* ps=prev.bones&&prev.bones->serial==pa.serial?prev.bones:nullptr;
@@ -277,6 +297,7 @@ inline unsigned buildActorBlock(const ActorEye& cur,const ActorEye& prev,double 
         std::memcpy(g.rect,rect,sizeof rect);g.shape[0]=float(boxR*boxR);g.shape[1]=float(bottom);g.shape[2]=float(boxTop);g.shape[3]=float(i);
         g.bones[0]=float(nb);g.bones[1]=float(parts);g.bones[2]=a.race==-3?-1.f:float(radius*radius);g.bones[3]=float(top); // -3: parts only
         t.block=int(n);t.bones=int(parts);done(ActorWritten);
+        if(countSkips){st.maxAngleDeg=std::max(st.maxAngleDeg,t.angleDeg);++st.angleHist[actorAngleBin(double(t.angleDeg))];++st.stepHist[actorStepBin(step)];}
         nb+=parts;++n;
     }
     // Blocks WITH parts first (stable), then the root-only ones. The pass takes the first part containing a pixel over every

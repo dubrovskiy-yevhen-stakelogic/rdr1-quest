@@ -9,6 +9,11 @@
 //      MELEE_BLOCK = pad 15, MELEE_SPECIAL = pad 3 (Y);  group 6: RELOAD = pad 1 (B), DEADEYE = pad 19 (R3), FIRE = 17,
 //      TARGET = 16, USE = 3, USE2 = 2, WHISTLE = 10 (D-pad up), LOOK_AT = 1;  camera group 2: LOOK_BACK = pad 19 (R3);
 //      HORSE group 7: JUMP = pad 2 (X), SPUR = pad 0 (A);  menus group 19: ACCEPT = 0, CANCEL = 1, ACTION_4 = 19.
+//  - DEADEYE (player input 29) is read only as a PRESS edge (value byte 0 vs byte 2 and byte 3, the same test as the sprint press
+//    0x26b3a84..0x26b3ab8): sagPlayer::UpdateFoot 0x269dfa8..0x269dfcc and sagPlayer::UpdateTargetingState 0x269e3b0..0x269e3d0 are its only
+//    readers. Camera LOOK_BACK (camera input 2) is read as HELD (byte 0 vs byte 2 only) every update by camGlueCMXGame::UpdateInputParams
+//    0x2634c20..0x2634c2c (gated by player-derived +0x104 / +0x10c / +0x10d, 0x2634bb4..0x2634bd0). So a held R3 is LOOK_BACK for the whole
+//    hold wherever that gate lets it, while Dead Eye needs only the press: the mapper sends Dead Eye presses as a short pulse.
 //    Android key -> d11 pad button (AndroidGamepad_c::GamepadButtonEvent 0x198ca7c): 96->0 A, 97->1 B, 99->2 X, 100->3 Y,
 //    19->10 D-pad up, 106->18 L3, 107->19 R3, 108->12 Start, 109->13 Select (4 BACK -> 13 too).
 //    INVENTORY = pad 13 (Select; decoded binding "INVENTORY = 13/20"): the Touch controllers have no Select, so it is the HOLD
@@ -36,6 +41,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include "VrDeadEye.h" // DEAD EYE: press counters (light header, no engine)
 #if defined(__ANDROID__)
@@ -116,25 +122,105 @@ inline constexpr std::array<const char*,4> layoutNames{"NATIVE","GAMEPLAY","FOOT
 // Native   = menus / frontend / unknown presentation: the Touch buttons are the stock pad (incl. R3 = menu ACTION_4).
 // Gameplay = world / optic / cutscene / camera override with no readable player context: stock pad, R3 only with LT.
 // Foot     = player state 2 (on foot): A jump, B reload (manual reload may consume it), X whistle, Y use,
-//            L3 sprint toggle, R3 crouch toggle, LT+R3 Dead Eye; R3 with a firearm in a VR hand / while Dead Eye runs = Dead Eye.
+//            L3 sprint toggle, R3 crouch toggle, LT+R3 Dead Eye (LT reaching the game, MapIn::ltGame); R3 with a firearm in a VR hand /
+//            while Dead Eye runs = Dead Eye.
 // INVENTORY (every layout, not in a lasso catch / minigame): X held >= inventoryHold = pad Select (d11 13) while it stays held.
 //            Foot / Mounted: X's own action (whistle / pad X) is sent as a pulse on RELEASE of a shorter press, so a hold never
 //            whistles; Native / Gameplay: X goes down at once (menus) and the hold adds Select.
 // Mounted  = any other player state (horse / wagon / vehicle): A = spur/accelerate (pad A, one press per tap,
 //            like the stock game), B = jump, the manual reload keeps B while it owns it, L3 nothing, X = X, LT+R3 Dead Eye.
+//            A vehicle seat with VR weapons (MapIn::vehicleSeat): B = pad B (@GENERIC.RELOAD); pad X there is @WAGON.SWITCH_SEAT, on X alone.
 inline Layout layoutFor(bool menuOrUnknown,bool playerRead,std::uint32_t playerMode) noexcept {
     if(menuOrUnknown)return Layout::Native;
     if(!playerRead)return Layout::Gameplay;
     return playerMode==2?Layout::Foot:Layout::Mounted;
 }
 
+// ---- R3 + LT: the LT the game gets ----
+// LT + R3 starts Dead Eye only while the game aims, i.e. while LT reaches the game. The holster filter runs AFTER this mapper
+// (NativePadDriver: controls, then filter) and keeps LT from the game while the VR hands are empty (VrHolsters.h routeEmpty), so the
+// physical LT alone is no aim: R3 then reaches the game without aim, DEADEYE is refused and pad 19 acts as camera LOOK_BACK
+// (default bindings above) for as long as R3 is held. The LT bit of the last SUBMITTED pad (noteDelivered, pad observer) tells.
+// NativePadDriver::beforeUpdate runs controls -> filter -> observer on every update that reaches submission, all on the native input
+// thread, so "the observer ran since the previous mapper sample" (padNotes advanced) means the delivered LT belongs to the previous
+// update, however long that update took.
+enum class LtGame : std::uint8_t {Physical,Off,On,Pending};
+inline constexpr std::array<const char*,4> ltGameNames{"PHYSICAL","OFF","ON","PENDING"};
+inline std::atomic<bool> r3DeliveredLt{true}; // debug.rdrvr.vr.r3lt 0 = the physical LT decides LT + R3 (no delivered-LT check)
+inline std::atomic<bool> ltDelivered{false};inline std::atomic<std::uint64_t> ltDeliveredNs{0},padNotes{};
+// Pad observer (native input thread): the buttons exactly as submitted.
+inline void noteDelivered(std::uint64_t now,std::uint32_t buttons,bool ready) noexcept {
+    ltDelivered.store(ready&&(buttons&bit::LT)!=0,std::memory_order_relaxed);ltDeliveredNs.store(now?now:1,std::memory_order_release);
+    padNotes.fetch_add(1,std::memory_order_relaxed);
+}
+// Pure. physLtPrev = the physical LT of the previous mapper update (the one the delivered sample was submitted in);
+// fresh = the pad observer ran after the previous mapper update (LtTrack: padNotes advanced).
+//  - no observer note since the previous mapper update (no observer, a failed submission): Physical;
+//  - LT up: Off;  LT went down after the last submitted pad: Pending (that pad cannot tell yet);  else the delivered LT.
+inline LtGame ltForDeadEye(bool physLt,bool physLtPrev,bool delivered,bool fresh) noexcept {
+    if(!fresh)return LtGame::Physical;
+    if(!physLt)return LtGame::Off;
+    if(!physLtPrev)return LtGame::Pending;
+    return delivered?LtGame::On:LtGame::Off;
+}
+// Keeps the previous physical LT and the observer count of the previous mapper update (input thread).
+struct LtTrack {
+    bool prev{};std::uint64_t notesSeen{};
+    LtGame sample(bool physLt,bool delivered,std::uint64_t notes) noexcept {
+        const bool fresh=notes!=0&&notes!=notesSeen;notesSeen=notes;
+        const auto g=ltForDeadEye(physLt,prev,delivered,fresh);prev=physLt;return g;}
+};
+// The LT rule of this update: the delivered LT only with the lever on and no engine item in a VR hand (holdHand < 0: the holster
+// filter's empty-hand route withholds LT); a held item keeps the physical LT (its own LT routes: ltNative, the throwable force aim).
+inline LtGame ltGameFor(bool lever,int holdHand,LtGame delivered) noexcept {return lever&&holdHand<0?delivered:LtGame::Physical;}
+// LT counts as aim for R3 / the SLOW-MO arm.
+inline bool ltAims(LtGame g,bool physLt) noexcept {return g==LtGame::Physical?physLt:g==LtGame::On;}
+
+// R3 route of a press (pure). Order: stock layouts, a running Dead Eye (end it), LT aiming, a gun in a VR hand, LT not known yet
+// (Wait: decided on the next update), then crouch on foot / nothing elsewhere; *_LT_WITHHELD = LT was held but never reached the game.
+enum class R3Route : std::uint8_t {Native,Lasso,DeadEyeEnd,DeadEyeLt,DeadEyeGun,Crouch,LtWithheldCrouch,Suppressed,LtWithheldSuppressed,Wait,Count};
+inline constexpr std::array<const char*,10> r3RouteNames{"NATIVE","LASSO","DEADEYE_END","DEADEYE_LT","DEADEYE_GUN","CROUCH",
+    "LT_WITHHELD_CROUCH","SUPPRESSED","LT_WITHHELD_SUPPRESSED","WAIT"};
+inline R3Route r3Route(Layout L,bool lassoStock,bool physLt,LtGame g,bool gun,bool active,bool mayWait=true) noexcept {
+    if(L==Layout::Native)return R3Route::Native;
+    if(lassoStock)return R3Route::Lasso;
+    if(active)return R3Route::DeadEyeEnd;
+    if(ltAims(g,physLt))return R3Route::DeadEyeLt;
+    if(gun)return R3Route::DeadEyeGun;
+    if(g==LtGame::Pending&&mayWait)return R3Route::Wait;
+    const bool withheld=physLt;
+    if(L==Layout::Foot)return withheld?R3Route::LtWithheldCrouch:R3Route::Crouch;
+    return withheld?R3Route::LtWithheldSuppressed:R3Route::Suppressed;
+}
+
+// vr.controls.r3: one entry per decided R3 press (input thread writes, report reads under r3Seq).
+struct R3Event {
+    std::uint64_t ns{};std::uint8_t layout{},route{},ltGame{};bool ltPhys{},waited{},gun{},active{};std::int8_t holdHand{-1};
+    std::int8_t crouchedAtPress{-1},crouchedAfter{-1};std::int32_t heldMs{-1};
+    float psiMaxDevDeg{-1.f},psiEndDevDeg{-1.f},stickMaxX{0.f};std::uint32_t psiSamples{};
+    std::int8_t ctxAllowed{-1};std::int16_t aimBits{-1};const char* block{}; // holster gate and engine aim bits at the press
+    std::uint8_t pulseUpdates{}; // updates the R3 bit was sent (Dead Eye pulse; held routes count up to 255)
+};
+inline constexpr std::uint64_t r3CrouchCheckDelay=ms(500);
+inline std::array<R3Event,16> r3Ring{};inline unsigned r3Next{};inline std::atomic<std::uint64_t> r3Total{};
+inline std::atomic<std::uint32_t> r3Seq{}; // odd while the input thread writes the ring
+inline std::atomic<std::uint64_t> ltWithheldR3{},r3Waits{},r3WaitDropped{},lastApplyNs{};
+inline void r3WriteBegin() noexcept {r3Seq.fetch_add(1,std::memory_order_acq_rel);}
+inline void r3WriteEnd() noexcept {r3Seq.fetch_add(1,std::memory_order_release);}
+inline float wrapPi(float a) noexcept {
+    constexpr float pi=3.14159265358979f;
+    if(!std::isfinite(a))return 0.f;
+    a=std::fmod(a+pi,2.f*pi);if(a<0.f)a+=2.f*pi;return a-pi;
+}
+
 struct Tuning {
-    float moveMin{0.25f};            // stick deflection that counts as "moving" (sprint arm / pump)
+    float moveMin{0.25f};           // stick deflection that counts as "moving" (sprint arm / pump)
     float neutralMax{0.20f};         // below this the stick is neutral
     std::uint64_t neutralHold{ms(200)};  // sprint ends after the stick is neutral this long
     std::uint64_t armWindow{ms(1500)};   // L3 clicked with a neutral stick: sprint waits this long for a deflection
     unsigned pumpDown{2},pumpUp{1};  // sprint A pump train in pad updates
     unsigned crouchPulse{2};         // L3 (CROUCH) pulse length in pad updates
+    unsigned deadEyePulse{3};        // R3 (DEADEYE) pulse length in pad updates: the game reads only the press edge of input 29
     std::uint64_t inventoryHold{ms(500)}; // X held this long = INVENTORY (pad Select)
     unsigned tapPulse{3};            // a released short X press: whistle / pad X pulse length in pad updates
 };
@@ -151,6 +237,15 @@ struct MapIn {
     // DEAD EYE (VrDeadEye.h): deadEyeGun = a firearm is in a VR hand (holsters heldFirearm) -> R3 = the game's DEADEYE press
     // (the gun in hand is the aim; LT is the free hand's trigger in VR); deadEyeActive = Dead Eye runs -> R3 = the stock "end it".
     bool deadEyeGun{},deadEyeActive{};
+    bool vehicleSeat{}; // the player sits in a vehicle seat where VR weapons work (vehicleseat::weaponSeatNow, player state 3)
+    // R3 + LT: the LT the game gets (ltForDeadEye). Physical = the physical LT decides (the default, and the r3lt lever off).
+    LtGame ltGame{LtGame::Physical};
+    // R3 ring only (never part of a decision): the VR holding hand, the mover's crouch posture (-1 unknown), the world yaw psi
+    // (VisibilityCameraBridge::worldYaw, NaN unknown) and its origin serial.
+    int holdHand{-1},crouched{-1};float psi{std::numeric_limits<float>::quiet_NaN()};std::uint64_t psiOrigin{};
+    // R3 ring only: right stick X (snap / smooth turn input, NaN unknown), the holster context gate (-1 unknown, 0 refused, 1 allowed)
+    // with its reason (static string or nullptr), the engine aim bits (player+0x3bc, -1 unknown).
+    float lookX{std::numeric_limits<float>::quiet_NaN()};int ctxAllowed{-1},aimBits{-1};const char* blockReason{};
 };
 enum class Sprint : std::uint8_t {Off,Armed,On};
 inline constexpr std::array<const char*,3> sprintNames{"OFF","ARMED","ON"};
@@ -223,14 +318,55 @@ class Mapper {
     // INVENTORY: the X press that may still become a hold (pending), its press time, whether its own action waits for the release
     // (Foot / Mounted) and which bit that release pulses (DpadUp whistle on foot / pad X).
     bool xPending_{},xDeferred_{};std::uint64_t xSince_{};std::uint32_t xTapBit_{},tapBit_{};unsigned tap_{};
+    // R3: a press waiting one update for the delivered LT (r3Wait_); the ring entry of the current press (held tracking, 500 ms crouch check)
+    bool r3Wait_{};std::uint64_t r3PressNs_{};int r3Slot_{-1},r3CheckSlot_{-1};std::uint64_t r3CheckNs_{};
+    bool r3PsiBase_{};float r3Psi0_{};std::uint64_t r3PsiOrigin_{};
+    unsigned r3Pulse_{}; // Dead Eye routes: updates left with the R3 bit (0 = the bit follows the held latch)
+    void r3Release(std::uint64_t now) noexcept {
+        if(r3Slot_>=0){auto& e=r3Ring[unsigned(r3Slot_)];r3WriteBegin();
+            e.heldMs=std::int32_t(std::min<std::uint64_t>(now>=e.ns?(now-e.ns)/1'000'000ull:0,0x7fffffffull));r3WriteEnd();}
+        r3Slot_=-1;r3PsiBase_=false;
+    }
+    void r3Record(const MapIn& in,R3Route route,bool waited) noexcept {
+        if(r3Slot_>=0)r3Release(in.now);
+        const unsigned i=r3Next;r3WriteBegin();
+        auto& e=r3Ring[i];e=R3Event{};e.ns=r3PressNs_?r3PressNs_:in.now;e.layout=std::uint8_t(in.layout);e.route=std::uint8_t(route);
+        e.ltGame=std::uint8_t(in.ltGame);e.ltPhys=(in.buttons&bit::LT)!=0;e.waited=waited;e.gun=in.deadEyeGun;e.active=in.deadEyeActive;
+        e.holdHand=std::int8_t(std::clamp(in.holdHand,-1,1));e.crouchedAtPress=std::int8_t(std::clamp(in.crouched,-1,1));
+        e.ctxAllowed=std::int8_t(std::clamp(in.ctxAllowed,-1,1));e.aimBits=std::int16_t(std::clamp(in.aimBits,-1,0x7fff));e.block=in.blockReason;
+        r3Next=(i+1u)%unsigned(r3Ring.size());r3WriteEnd();r3Total.fetch_add(1,std::memory_order_relaxed);
+        r3Slot_=int(i);r3CheckSlot_=int(i);r3CheckNs_=e.ns+r3CrouchCheckDelay;r3PsiBase_=false;
+    }
+    // Every ready update: the yaw deviation of the held press (max and latest = at the release; a 180 deg flip that comes back ends
+    // near 0, a stick turn stays), the largest right-stick X while held (a turn needs a deflection), the updates the R3 bit was sent,
+    // its release, the crouch posture 500 ms after the press.
+    void r3Track(const MapIn& in,bool held,bool sentR3) noexcept {
+        if(r3Slot_>=0&&held){
+            auto& e=r3Ring[unsigned(r3Slot_)];r3WriteBegin();
+            if(sentR3&&e.pulseUpdates<255u)++e.pulseUpdates;
+            if(std::isfinite(in.lookX)&&std::fabs(in.lookX)>e.stickMaxX)e.stickMaxX=std::fmin(std::fabs(in.lookX),1.f);
+            if(std::isfinite(in.psi)){
+                if(!r3PsiBase_||in.psiOrigin!=r3PsiOrigin_){r3PsiBase_=true;r3Psi0_=in.psi;r3PsiOrigin_=in.psiOrigin;}
+                const float dev=std::fabs(wrapPi(in.psi-r3Psi0_))*57.2957795f;
+                ++e.psiSamples;if(dev>e.psiMaxDevDeg)e.psiMaxDevDeg=dev;e.psiEndDevDeg=dev;
+            }
+            r3WriteEnd();
+        }else if(r3Slot_>=0)r3Release(in.now);
+        if(r3CheckSlot_>=0&&in.now>=r3CheckNs_){
+            auto& e=r3Ring[unsigned(r3CheckSlot_)];r3WriteBegin();e.crouchedAfter=std::int8_t(std::clamp(in.crouched,-1,1));r3WriteEnd();
+            r3CheckSlot_=-1;
+        }
+    }
     void endSprint(std::atomic<std::uint64_t>* reason) noexcept {if(sprint_!=Sprint::Off&&reason)reason->fetch_add(1,std::memory_order_relaxed);sprint_=Sprint::Off;pump_=0;neutralSince_=0;}
 public:
     Tuning tuning{};
     Sprint sprint() const noexcept {return sprint_;}
-    void reset() noexcept {latch_={};endSprint(nullptr);crouch_=0;jumpKnown_=false;xPending_=xDeferred_=false;tap_=0;}
+    void reset() noexcept {latch_={};endSprint(nullptr);crouch_=0;jumpKnown_=false;xPending_=xDeferred_=false;tap_=0;
+        r3Wait_=false;r3Slot_=r3CheckSlot_=-1;r3PsiBase_=false;r3Pulse_=0;}
     // Returns the new button word: bits outside bit::mapped are passed unchanged.
     std::uint32_t apply(const MapIn& in,std::uint32_t buttons) noexcept {
         const auto frame=updateFrame.fetch_add(1,std::memory_order_relaxed)+1;
+        lastApplyNs.store(in.now,std::memory_order_relaxed);
         const unsigned li=unsigned(in.layout)<4?unsigned(in.layout):0u;
         lastLayout.store(li,std::memory_order_relaxed);
         if(in.jumping>=0){const bool j=in.jumping>0;if(jumpKnown_&&j&&!lastJumping_)noteImpulse(frame,in.now);lastJumping_=j;jumpKnown_=true;}
@@ -238,6 +374,9 @@ public:
         if(!in.ready){
             if(sprint_!=Sprint::Off)endSprint(&sprintEndsContext);
             latch_={};crouch_=0;xPending_=xDeferred_=false;tap_=0;notReady.fetch_add(1,std::memory_order_relaxed);
+            // A press waiting for the delivered LT is dropped with the latches: counted and kept in the ring as route WAIT.
+            if(r3Wait_){r3Wait_=false;r3WaitDropped.fetch_add(1,std::memory_order_relaxed);r3Record(in,R3Route::Wait,true);}
+            r3Pulse_=0;if(r3Slot_>=0)r3Release(in.now);
             sprintState.store(0,std::memory_order_relaxed);sprintWanted.store(false,std::memory_order_relaxed);
             return buttons&~bit::mapped;
         }
@@ -266,7 +405,7 @@ public:
             try{bOwned=f(rising[1]);}catch(...){reloadErrors.fetch_add(1,std::memory_order_relaxed);}
         }
         if(rising[1]){
-            const bool jump=!bOwned&&L==Layout::Mounted&&!lassoFace; // B on a horse = jump (pad X) A = spur
+            const bool jump=!bOwned&&L==Layout::Mounted&&!lassoFace&&!in.vehicleSeat; // B on a horse = jump (pad X) A = spur
             latch_[1].out=bOwned?0:jump?bit::X:bit::B;
             if(!jump&&gameplayMap)(bOwned?reloadConsumed:reloadPassed).fetch_add(1,std::memory_order_relaxed);
         }
@@ -296,14 +435,36 @@ public:
             }else if(L==Layout::Mounted)latch_[4].out=0; // No L3 gallop on a horse (B taps)
             else latch_[4].out=bit::L3;
         }
-        // R3: crouch on foot, Dead Eye with LT / a gun in a VR hand / while it runs, look-back never in gameplay
-        if(rising[5]){
-            if(L==Layout::Native||lassoStock)latch_[5].out=bit::R3; // LASSO minigame: stock R3 (prompt code 10)
-            else if(lt||in.deadEyeGun||in.deadEyeActive){latch_[5].out=bit::R3;deadEyePresses.fetch_add(1,std::memory_order_relaxed);
-                deadeye::bump(in.deadEyeActive?deadeye::endPresses:lt?deadeye::ltPresses:deadeye::gunPresses);}
-            else if(L==Layout::Foot){latch_[5].out=0;crouch_=tuning.crouchPulse;crouchPulses.fetch_add(1,std::memory_order_relaxed);}
-            else{latch_[5].out=0;r3Suppressed.fetch_add(1,std::memory_order_relaxed);}
+        // R3: crouch on foot, Dead Eye with LT reaching the game / a gun in a VR hand / while it runs, look-back never in gameplay.
+        // The route is fixed when the press is decided (its rising edge, or one update later while the delivered LT is Pending).
+        if(rising[5]||falling[5]){r3Pulse_=0;}
+        if(rising[5]){r3PressNs_=in.now;r3Wait_=false;}
+        if(rising[5]||r3Wait_){
+            const bool waited=!rising[5];r3Wait_=false;
+            const auto route=r3Route(L,lassoStock,lt,in.ltGame,in.deadEyeGun,in.deadEyeActive,!waited);
+            switch(route){
+            case R3Route::Native:case R3Route::Lasso:latch_[5].out=bit::R3;break; // LASSO minigame: stock R3 (prompt code 10)
+            case R3Route::DeadEyeEnd:case R3Route::DeadEyeLt:case R3Route::DeadEyeGun:
+                // A pulse, not the hold: the rest of a held R3 would be camera LOOK_BACK (pad 19) whenever its gate allows
+                latch_[5].out=bit::R3;r3Pulse_=std::max(1u,tuning.deadEyePulse);deadEyePresses.fetch_add(1,std::memory_order_relaxed);
+                deadeye::bump(route==R3Route::DeadEyeEnd?deadeye::endPresses:route==R3Route::DeadEyeLt?deadeye::ltPresses:deadeye::gunPresses);
+                break;
+            case R3Route::Crouch:case R3Route::LtWithheldCrouch:
+                latch_[5].out=0;crouch_=tuning.crouchPulse;crouchPulses.fetch_add(1,std::memory_order_relaxed);
+                if(route==R3Route::LtWithheldCrouch)ltWithheldR3.fetch_add(1,std::memory_order_relaxed);
+                break;
+            case R3Route::Wait:latch_[5].out=0;r3Wait_=true;r3Waits.fetch_add(1,std::memory_order_relaxed);break;
+            default:
+                latch_[5].out=0;r3Suppressed.fetch_add(1,std::memory_order_relaxed);
+                if(route==R3Route::LtWithheldSuppressed)ltWithheldR3.fetch_add(1,std::memory_order_relaxed);
+                break;
+            }
+            if(route!=R3Route::Wait)r3Record(in,route,waited);
         }
+        // R3 bit of this update (the output loop below): the held latch, a Dead Eye pulse ends after deadEyePulse updates
+        const bool sendR3=latch_[5].held&&latch_[5].out!=0;
+        if(sendR3&&r3Pulse_&&--r3Pulse_==0)latch_[5].out=0; // this update still sends it (sendR3 captured above)
+        r3Track(in,latch_[5].held,sendR3);
         // Sprint state
         if(sprint_!=Sprint::Off&&(L!=Layout::Foot||in.teleportWalk||lassoStock))endSprint(&sprintEndsContext); // Never sprinting in TELEPORT / a lasso minigame
         if(sprint_==Sprint::Armed){
@@ -318,6 +479,7 @@ public:
         }
         std::uint32_t out=buttons&~bit::mapped;
         for(const auto& l:latch_)if(l.held)out|=l.out;
+        if(sendR3)out|=bit::R3; // also the last pulse update (latch_[5].out already cleared)
         if(bOwned)out&=~bit::B; // the reload owns B this update (whatever the press mapped it to)
         if(sprint_==Sprint::On){
             sprintOnFrames.fetch_add(1,std::memory_order_relaxed);
@@ -386,6 +548,41 @@ inline std::atomic<std::uint64_t> jumpCalls{},jumpFast{},jumpFastFailed{},jumpNa
     jumpRetimed{},jumpRetimeSkipped{},jumpOk{},jumpFailed{};
 inline std::atomic<bool> crouching{};inline std::atomic<std::uint64_t> crouchChanges{};inline std::atomic<int> jumpFlag{-1};
 
+// "r3": the LT + R3 check (lever, last delivered LT, counters) and the ring, oldest first; ageMs = before the latest mapper update.
+inline std::string r3Report() {
+    std::array<R3Event,16> ring{};unsigned next=0;bool torn=true;
+    for(int attempt=0;attempt<8&&torn;++attempt){
+        const auto s0=r3Seq.load(std::memory_order_acquire);if(s0&1u)continue;
+        ring=r3Ring;next=r3Next;std::atomic_thread_fence(std::memory_order_acquire);
+        torn=r3Seq.load(std::memory_order_relaxed)!=s0;
+    }
+    const auto now=lastApplyNs.load(std::memory_order_relaxed);const auto dn=ltDeliveredNs.load(std::memory_order_relaxed);
+    std::string out;char b[768];
+    std::snprintf(b,sizeof b,"\"r3\":{\"deliveredLtCheck\":%s,\"ltDelivered\":%s,\"deliveredAgeMs\":%lld,\"padNotes\":%llu,"
+        "\"ltWithheld\":%llu,\"waits\":%llu,\"waitDropped\":%llu,\"deadEyePulse\":%u,\"total\":%llu,\"torn\":%s,\"ring\":[",
+        r3DeliveredLt.load()?"true":"false",ltDelivered.load()?"true":"false",
+        dn&&now?(long long)((std::int64_t)(now-dn)/1'000'000):-1LL,(unsigned long long)padNotes.load(),
+        (unsigned long long)ltWithheldR3.load(),(unsigned long long)r3Waits.load(),(unsigned long long)r3WaitDropped.load(),
+        mapper.tuning.deadEyePulse,(unsigned long long)r3Total.load(),torn?"true":"false");
+    out+=b;bool first=true;
+    for(unsigned k=0;k<ring.size();++k){
+        const auto& e=ring[(next+k)%ring.size()];if(!e.ns)continue;
+        const unsigned lay=e.layout<4?e.layout:0,rt=e.route<r3RouteNames.size()?e.route:0,lg=e.ltGame<4?e.ltGame:0;
+        std::snprintf(b,sizeof b,"%s{\"ageMs\":%lld,\"layout\":\"%s\",\"route\":\"%s\",\"ltPhys\":%s,\"ltGame\":\"%s\",\"ltFresh\":%s,"
+            "\"waited\":%s,\"deadEyeGun\":%s,\"deadEyeActive\":%s,\"holdHand\":%d,\"crouchedAtPress\":%d,\"crouchedAfter500ms\":%d,"
+            "\"heldMs\":%d,\"r3Updates\":%u,\"psiMaxDevDeg\":%.1f,\"psiEndDevDeg\":%.1f,\"psiSamples\":%u,\"stickMaxX\":%.2f,"
+            "\"ctxAllowed\":%d,\"blockReason\":\"%s\",\"aimBits\":%d}",
+            first?"":",",now>=e.ns?(long long)((now-e.ns)/1'000'000ull):0LL,layoutNames[lay],r3RouteNames[rt],e.ltPhys?"true":"false",
+            ltGameNames[lg],lg!=unsigned(LtGame::Physical)?"true":"false",e.waited?"true":"false",e.gun?"true":"false",
+            e.active?"true":"false",int(e.holdHand),int(e.crouchedAtPress),int(e.crouchedAfter),int(e.heldMs),unsigned(e.pulseUpdates),
+            double(e.psiMaxDevDeg),double(e.psiEndDevDeg),unsigned(e.psiSamples),double(e.stickMaxX),int(e.ctxAllowed),e.block?e.block:"?",
+            int(e.aimBits));
+        out+=b;first=false;
+    }
+    out+="]}";
+    return out;
+}
+
 inline std::string report() {
     std::string out;char b[1024];
     const unsigned li=lastLayout.load()<4?lastLayout.load():0;const unsigned ss=sprintState.load()<3?sprintState.load():0;
@@ -423,7 +620,8 @@ inline std::string report() {
         (unsigned long long)jumpTimeouts.load(),(unsigned long long)beginsUnmatched.load(),(unsigned long long)impulsesUnmatched.load());
     out+=b;
     out+="\"latencyFrames\":{";pressToBegin.json(out,"pressToBegin");out+=",";beginToImpulse.json(out,"beginToImpulse");out+=",";
-    pressToImpulse.json(out,"pressToImpulse");out+="},";pressToImpulseMs.json(out,"pressToImpulseMs");out+="}}";
+    pressToImpulse.json(out,"pressToImpulse");out+="},";pressToImpulseMs.json(out,"pressToImpulseMs");out+="},";
+    out+=r3Report();out+="}";
     return out;
 }
 
@@ -478,9 +676,11 @@ __attribute__((noinline)) inline bool setupNewJumpHook(void* task,void* ctx,floa
 }
 inline bool propertyOn(const char* name) noexcept {char v[PROP_VALUE_MAX]{};return __system_property_get(name,v)<=0||v[0]!='0';}
 // debug.rdrvr.vr.controls 0 = stock pad layout (mapper off; the stick-click arbiter / 0.6 s recenter chord stay);
+// debug.rdrvr.vr.r3lt 0 = LT + R3 decided by the physical LT (no check that LT reaches the game);
 // debug.rdrvr.vr.fastjump 0 = no SetupNewJump hook; debug.rdrvr.vr.jumplaunch <ms> (0..500, 0 = native LaunchTime).
 inline void loadProperties() noexcept {
     controlsEnabled.store(propertyOn("debug.rdrvr.vr.controls"));fastJumpEnabled.store(propertyOn("debug.rdrvr.vr.fastjump"));
+    r3DeliveredLt.store(propertyOn("debug.rdrvr.vr.r3lt"));
     char v[PROP_VALUE_MAX]{};
     if(__system_property_get("debug.rdrvr.vr.jumplaunch",v)>0){char* end{};const long msv=std::strtol(v,&end,10);
         if(end!=v)launchSeconds.store(sanitizeLaunchSeconds(float(msv)/1000.f));}

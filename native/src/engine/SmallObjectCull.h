@@ -29,6 +29,13 @@
 // plus the CPU bracket on every 4th object). The DETAIL profiler alone does not enable it.
 // The CPU bracket runs only with histogram=2 (max of the caller's request and the property); a threshold alone does not time.
 // Projected size = bounding-sphere DIAMETER in eye pixels = 2r/d * |P11| * 1760/2.
+// Object glows (ObjectGlowTable.h): an object whose sphere touches the position of a game object glow is never skipped, at any threshold. The
+// glow marks something the game wants seen, pickups included. frame() reads the table every 4th MAIN frame with the guarded reader on the
+// visibility task and only while the cull is active; the render thread copies the published list once per frame and tests it only for objects
+// already below the threshold (at most 16 distance tests each), plus one test per object below 64 px for the report's nearest px.
+// debug.rdrvr.smallobjects.glows 0 = size test only (A/B).
+#include "ObjectGlowTable.h"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -96,6 +103,52 @@ private:
     static constexpr unsigned maxCreatures=64;static constexpr float attachSlackM=0.6f; // ped motion per frame + hand reach
     struct Ball{float c[3]{},r{};};std::array<Ball,maxCreatures> creatureNext_{},creatureNow_{};unsigned creatureNextN_{},creatureNowN_{};
     std::atomic<bool> attach_{true};std::atomic<std::uint64_t> attachedKept_{};std::atomic<unsigned> creaturesLast_{}; // report copy
+    // Published by frame() (visibility task) into the slot not in use; the render thread copies the list with the frame's camera snapshot, so
+    // depth and colour take the same decision.
+    static constexpr unsigned maxGlows=objectglow::maxPositions,glowRefreshFrames=4;
+    static constexpr float glowSlackM=.25f,glowSamplePx=64.f;
+    std::array<std::array<std::array<std::atomic<std::uint32_t>,3>,maxGlows>,2> glowSlots_{};std::array<std::atomic<unsigned>,2> glowSlotCount_{};std::atomic<unsigned> glowSlot_{};
+    std::atomic<bool> glowKeep_{true};
+    std::array<std::array<float,3>,maxGlows> frameGlow_{};unsigned frameGlowN_{},frameGlowKept_{};std::uint32_t frameGlowTests_{};float frameGlowPx_{INFINITY},frameGlowQ_{INFINITY};bool frameGlowSampled_{};
+    std::atomic<unsigned> glowEntries_{},glowCount_{},glowPriority_{},glowKeptLast_{},glowTestsLast_{};std::atomic<bool> glowNearestPriority_{};
+    std::atomic<std::uint32_t> glowNearestM_{0x7fc00000u},glowNearestPx_{0x7fc00000u};
+    std::atomic<std::uint64_t> glowKept_{},glowScans_{},glowScanNs_{},glowScanNsMax_{};
+    float glowDistanceSq(unsigned i,const float* c)const noexcept{
+        const auto& g=frameGlow_[i];const float d[3]{c[0]-g[0],c[1]-g[1],c[2]-g[2]};
+        return d[0]*d[0]+d[1]*d[1]+d[2]*d[2];}
+    bool touchesGlow(unsigned i,const float* c,float r)const noexcept{const float l=r+glowSlackM;return glowDistanceSq(i,c)<l*l;}
+    bool nearGlow(const float* c,float r)noexcept{
+        frameGlowTests_+=frameGlowN_;
+        for(unsigned i=0;i<frameGlowN_;++i)if(touchesGlow(i,c,r))return true;
+        return false;}
+    void publishGlows(const objectglow::Glow* g,unsigned n)noexcept{
+        const unsigned slot=(glowSlot_.load(std::memory_order_relaxed)+1u)&1u;
+        for(unsigned i=0;i<n;++i)for(unsigned j=0;j<3;++j)glowSlots_[slot][i][j].store(bits(g[i].pos[j]),std::memory_order_relaxed);
+        glowSlotCount_[slot].store(n,std::memory_order_relaxed);glowSlot_.store(slot,std::memory_order_release);
+    }
+    void clearGlows()noexcept{
+        publishGlows(nullptr,0);glowEntries_.store(0,std::memory_order_relaxed);glowCount_.store(0,std::memory_order_relaxed);glowPriority_.store(0,std::memory_order_relaxed);
+        glowNearestPriority_.store(false,std::memory_order_relaxed);glowNearestM_.store(0x7fc00000u,std::memory_order_relaxed);glowNearestPx_.store(0x7fc00000u,std::memory_order_relaxed);
+    }
+    // Slot 0 of the published list is the glow the report samples: a priority glow before any other, then the nearest.
+    void refreshGlows(const float* camera)noexcept{
+        const auto t0=now();
+        std::array<objectglow::Glow,maxGlows> g{};unsigned entries=0;const unsigned n=objectglow::readPositions(read_,g.data(),maxGlows,entries);
+        unsigned best=0,priority=0;float bestD=INFINITY;
+        for(unsigned i=0;i<n;++i){
+            const float d[3]{g[i].pos[0]-camera[0],g[i].pos[1]-camera[1],g[i].pos[2]-camera[2]};const float q=d[0]*d[0]+d[1]*d[1]+d[2]*d[2];
+            if(g[i].priority)++priority;
+            const bool better=(g[i].priority!=0)!=(g[best].priority!=0)?g[i].priority!=0:q<bestD;
+            if(i==0||better){best=i;bestD=q;}
+        }
+        if(n&&best)std::swap(g[0],g[best]);
+        publishGlows(g.data(),n);
+        glowEntries_.store(entries,std::memory_order_relaxed);glowCount_.store(n,std::memory_order_relaxed);glowPriority_.store(priority,std::memory_order_relaxed);
+        glowNearestPriority_.store(n&&g[0].priority,std::memory_order_relaxed);glowNearestM_.store(bits(n?std::sqrt(bestD):NAN),std::memory_order_relaxed);
+        if(!n)glowNearestPx_.store(0x7fc00000u,std::memory_order_relaxed);
+        const auto ns=now()-t0;glowScans_.fetch_add(1,std::memory_order_relaxed);glowScanNs_.fetch_add(ns,std::memory_order_relaxed);
+        if(ns>glowScanNsMax_.load(std::memory_order_relaxed))glowScanNsMax_.store(ns,std::memory_order_relaxed);
+    }
     bool nearCreature(const float* c,float r)const noexcept{
         for(unsigned i=0;i<creatureNowN_;++i){const auto& k=creatureNow_[i];const float d[3]{c[0]-k.c[0],c[1]-k.c[1],c[2]-k.c[2]},l=k.r+r+attachSlackM;
             if(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]<l*l)return true;}
@@ -118,6 +171,13 @@ private:
     static bool readAttachProperty()noexcept{ // unset/anything but "0" = keep props near creatures
 #ifdef __ANDROID__
         char v[PROP_VALUE_MAX]{};return !(__system_property_get("debug.rdrvr.smallobjects.attach",v)>0&&v[0]=='0'&&!v[1]);
+#else
+        return true;
+#endif
+    }
+    static bool readGlowProperty()noexcept{ // unset/anything but "0" = keep objects under an object glow
+#ifdef __ANDROID__
+        char v[PROP_VALUE_MAX]{};return !(__system_property_get("debug.rdrvr.smallobjects.glows",v)>0&&v[0]=='0'&&!v[1]);
 #else
         return true;
 #endif
@@ -157,13 +217,13 @@ public:
     // histogram: explicit request (0 off, 1 counts, 2 counts + timing); -1 = read the property.
     void frame(std::uintptr_t request,const void* viewport,unsigned menuPx,int histogram=-1)noexcept{
         const auto f=frames_.fetch_add(1,std::memory_order_relaxed);
-        if((f&63)==0){property_=readProperty();histogramProperty_=readHistogramProperty();attach_.store(readAttachProperty(),std::memory_order_relaxed);propertyReads_.fetch_add(1,std::memory_order_relaxed);}
+        if((f&63)==0){property_=readProperty();histogramProperty_=readHistogramProperty();attach_.store(readAttachProperty(),std::memory_order_relaxed);glowKeep_.store(readGlowProperty(),std::memory_order_relaxed);propertyReads_.fetch_add(1,std::memory_order_relaxed);}
         const bool property=property_>=0;const unsigned threshold=property?unsigned(property_):menuPx;
         const unsigned wanted=unsigned(histogram>histogramProperty_?histogram:histogramProperty_); // max(request, property), so the property can add timing
         threshold_.store(threshold,std::memory_order_relaxed);source_.store(property?1u:0u,std::memory_order_relaxed);
         histogram_.store(wanted,std::memory_order_relaxed);timing_.store(wanted>=2,std::memory_order_relaxed); // no clock pair per 4th object for the menu threshold
         active_.store(threshold>0||wanted>0,std::memory_order_relaxed);
-        if(!threshold&&!wanted)return; // nothing measured: no per-frame reads either
+        if(!threshold&&!wanted){if(glowEntries_.load(std::memory_order_relaxed))clearGlows();return;} // nothing measured: no per-frame reads either
         float rows[16]{},p11{};std::uintptr_t container{};
         const auto v=reinterpret_cast<std::uintptr_t>(viewport);
         if(!viewport||!read(v+0x40,rows,sizeof rows)||!read(v+0x1c0+0x14,&p11,4)||!read(request+0x88,&container,sizeof container))return;
@@ -171,6 +231,8 @@ public:
         if(!std::isfinite(rows[12])||!std::isfinite(rows[13])||!std::isfinite(rows[14])||!(focal>0.f)||!std::isfinite(focal)||!container)return;
         for(unsigned i=0;i<3;++i)camera_[i].store(bits(rows[12+i]),std::memory_order_relaxed);
         focal_.store(bits(focal),std::memory_order_relaxed);container_.store(container,std::memory_order_relaxed);
+        if(!glowKeep_.load(std::memory_order_relaxed)){if(glowEntries_.load(std::memory_order_relaxed))clearGlows();}
+        else if(f%glowRefreshFrames==0)refreshGlows(rows+12);
         cameraSeq_.fetch_add(1,std::memory_order_release);
     }
     bool active()const noexcept{return active_.load(std::memory_order_relaxed);}
@@ -193,7 +255,9 @@ public:
         if(seq==consumedSeq_)return excl(NoCamera);
         if(!frameSeqSet_){frameSeq_=seq;frameSeqSet_=true;
             for(unsigned i=0;i<3;++i)frameCamera_[i]=value(camera_[i].load(std::memory_order_relaxed));
-            frameFocal_=value(focal_.load(std::memory_order_relaxed));}
+            frameFocal_=value(focal_.load(std::memory_order_relaxed));
+            const unsigned slot=glowSlot_.load(std::memory_order_acquire)&1u;frameGlowN_=std::min(glowSlotCount_[slot].load(std::memory_order_relaxed),maxGlows);
+            for(unsigned i=0;i<frameGlowN_;++i)for(unsigned j=0;j<3;++j)frameGlow_[i][j]=value(glowSlots_[slot][i][j].load(std::memory_order_relaxed));}
         else if(seq!=frameSeq_)midFrameCameraChanges_.fetch_add(1,std::memory_order_relaxed); // keep this frame's snapshot
         const auto* info=static_cast<const unsigned char*>(infoPointer);
         std::uintptr_t creature,matrixSet;std::uint32_t flags;const unsigned char* drawable;
@@ -208,8 +272,13 @@ public:
         t.bucket=bucketOf(px);t.counted=true;++frame_.count[s][t.cls][t.bucket];
         const unsigned threshold=threshold_.load(std::memory_order_relaxed);
         if(t.cls==Creature&&s==0&&creatureNextN_<maxCreatures)creatureNext_[creatureNextN_++]=Ball{{centre[0],centre[1],centre[2]},radius};
+        if(frameGlowN_&&s==0&&t.cls!=Creature&&px<glowSamplePx){
+            frameGlowSampled_=true;++frameGlowTests_;
+            const float q=glowDistanceSq(0,centre),l=radius+glowSlackM;
+            if(q<l*l&&q<frameGlowQ_){frameGlowQ_=q;frameGlowPx_=px;}}
         if(threshold&&t.cls!=Creature&&px<float(threshold)){
-            if(attach_.load(std::memory_order_relaxed)&&nearCreature(centre,radius))attachedKept_.fetch_add(1,std::memory_order_relaxed); // worn/held props stay
+            if(frameGlowN_&&nearGlow(centre,radius)){glowKept_.fetch_add(1,std::memory_order_relaxed);++frameGlowKept_;} // the object under a glow stays
+            else if(attach_.load(std::memory_order_relaxed)&&nearCreature(centre,radius))attachedKept_.fetch_add(1,std::memory_order_relaxed); // worn/held props stay
             else{t.skip=true;++frame_.skipped[s][t.cls][t.bucket];skippedTotal_.fetch_add(1,std::memory_order_relaxed);return t;}}
         if(timing_.load(std::memory_order_relaxed)&&(objectCounter_++%timingStride)==0){t.timed=true;t.t0=now();}
         return t;
@@ -228,6 +297,9 @@ public:
         if(!active_.load(std::memory_order_relaxed)&&!frameSeqSet_)return; // gated off: nothing to publish
         if(!frameSeqSet_)endFramesWithoutCamera_.fetch_add(1,std::memory_order_relaxed);
         consumedSeq_=frameSeqSet_?frameSeq_:cameraSeq_.load(std::memory_order_acquire);frameSeqSet_=false;
+        if(frameGlowSampled_)glowNearestPx_.store(frameGlowPx_<glowSamplePx?bits(frameGlowPx_):0x7fc00000u,std::memory_order_relaxed);
+        glowKeptLast_.store(frameGlowKept_,std::memory_order_relaxed);glowTestsLast_.store(frameGlowTests_,std::memory_order_relaxed);
+        frameGlowKept_=0;frameGlowTests_=0;frameGlowPx_=INFINITY;frameGlowQ_=INFINITY;frameGlowSampled_=false;
         if(creatureNextN_){creatureNow_=creatureNext_;creatureNowN_=creatureNextN_;creaturesLast_.store(creatureNowN_,std::memory_order_relaxed);}creatureNextN_=0; // a frame without a depth stage keeps the last list
         const auto n=ringCount_.load(std::memory_order_relaxed);auto& row=ring_[n%ringFrames];
         for(unsigned s=0;s<2;++s){
@@ -260,6 +332,15 @@ public:
         o+=",\"skippedTotal\":"+u(skippedTotal_.load(std::memory_order_relaxed))+",\"midFrameCameraChanges\":"+u(midFrameCameraChanges_.load(std::memory_order_relaxed))+
             ",\"framesWithoutCamera\":"+u(endFramesWithoutCamera_.load(std::memory_order_relaxed))+",\"timingStride\":"+u(timingStride);
         o+=",\"attach\":";o+=attach_.load(std::memory_order_relaxed)?"true":"false";o+=",\"attachedKept\":"+u(attachedKept_.load(std::memory_order_relaxed))+",\"creaturesLast\":"+u(creaturesLast_.load(std::memory_order_relaxed));
+        // objectGlows = glows with an effect position, objectGlowEntries = table size, objectGlowPriority = glows with entry+0x20 set. NearestPx = size of the
+        // object (below 64 px) touching the sampled glow with its centre nearest to it, in the last depth stage; null = none. glowKept counts both stages.
+        o+=",\"objectGlowInstall\":\"";o+=objectglow::installNote.load(std::memory_order_relaxed);o+="\",\"glowKeep\":";o+=glowKeep_.load(std::memory_order_relaxed)?"true":"false";
+        o+=",\"objectGlows\":"+u(glowCount_.load(std::memory_order_relaxed))+",\"objectGlowEntries\":"+u(glowEntries_.load(std::memory_order_relaxed))+",\"objectGlowPriority\":"+u(glowPriority_.load(std::memory_order_relaxed));
+        o+=",\"objectGlowNearestM\":";num(o,value(glowNearestM_.load(std::memory_order_relaxed)));o+=",\"objectGlowNearestPx\":";num(o,value(glowNearestPx_.load(std::memory_order_relaxed)));
+        o+=",\"objectGlowNearestPriority\":";o+=glowNearestPriority_.load(std::memory_order_relaxed)?"true":"false";
+        o+=",\"glowKept\":"+u(glowKept_.load(std::memory_order_relaxed))+",\"glowKeptLastFrame\":"+u(glowKeptLast_.load(std::memory_order_relaxed))+",\"glowTestsLastFrame\":"+u(glowTestsLast_.load(std::memory_order_relaxed));
+        {const auto scans=glowScans_.load(std::memory_order_relaxed);o+=",\"glowScans\":"+u(scans)+",\"glowScanUsAvg\":";num(o,scans?double(glowScanNs_.load(std::memory_order_relaxed))/double(scans)/1000.0:NAN);
+         o+=",\"glowScanUsMax\":";num(o,double(glowScanNsMax_.load(std::memory_order_relaxed))/1000.0);}
         double savedNsPerFrame=0;
         for(unsigned s=0;s<2;++s){
             o+=",\"";o+=stageNames[s];o+="\":{";

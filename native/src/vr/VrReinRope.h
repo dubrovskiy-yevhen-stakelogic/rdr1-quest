@@ -72,13 +72,14 @@ inline constexpr std::array<const char*,4> stateNames{"OFF","UNAVAILABLE","NOT_F
 
 struct Stats {
     std::atomic<std::uint64_t> steps{},scans{},scanObjects{},reinsSeen{},found{},lost{},readFails{},overrides{},restores{},writes{},
-        nativeChanges{},adopted{},pinBlocked{},pinUnknown{},skippedNative{},farFrames{},bothFrames{},
+        nativeChanges{},adopted{},pinBlocked{},pinUnknown{},skippedNative{},noneRegrabs{},farFrames{},bothFrames{},
         // one-hand / NONE wishes held in a pinned BOTH, pinned +0x1c8/+0x1cc under our 0/1/2 repaired to 3, a store another
         // writer replaced at once, reins lost while overriding (+ restored then / remembered / resumed), NONE overrides left as they are,
         // frames a held hand was dropped because its arm is not IK'd to the controller
         stuckBoth{},stuckFixes{},pinRepairs{},raceWrites{},lostOverriding{},lostRestored{},ghosts{},ghostResumed{},freeLeft{},heldMasked{};
     std::atomic<int> modeNative{-1},modeCurrent{-1},modeWritten{-1},held{},heldRaw{},active{-1};
     std::atomic<bool> overriding{},freeNone{};std::atomic<std::uintptr_t> rein{};
+    std::atomic<std::uint64_t> playerReins{};std::atomic<unsigned> playerModes{}; // last scan: reins whose holder is the player, OR of 1<<their mode
     std::array<std::atomic<float>,2> wristCm{},wristCmMax{}; // |+0x210 / +0x220 - the wrist that set them| (previous frame's IK'd wrist)
 };
 inline Stats stats{};
@@ -115,6 +116,7 @@ struct Input {
     unsigned held{};  // reins::holds of the hands whose arm is IK'd to the controller: bit 0 VR left, bit 1 VR right
     unsigned heldRaw{}; // reins::holds before that mask (report)
     bool freeNone{};  // .reins.ropefree: no VR hand on the reins -> NONE (the saddle) instead of the native value
+    std::array<std::uintptr_t,3> skip{}; // reins another Rope already owns (a draft vehicle's driver holds every rein of its list)
     std::uint64_t now{};
 };
 struct Block {
@@ -125,6 +127,7 @@ struct Block {
 
 // One writer: the thread that runs the player's hook A (VrBody busy guard).
 class Rope {
+    std::atomic<bool> live_{}; // overriding_, readable off the hook thread (anyOverriding)
     std::uintptr_t rein_{};int index_{-1};std::uint64_t nextScanNs_{},lastFixNs_{};
     bool overriding_{};int native_{-1},written_{-1};
     bool haveWrist_{};int wristMode_{};std::array<std::array<float,3>,2> wrist_{}; // [0] wrist_r, [1] wrist_l after last frame's IK
@@ -150,9 +153,16 @@ class Rope {
         std::array<std::uintptr_t,maxObjects> objects{};
         if(!in.read(nullptr,mgr+off::mgrObjects,objects.data(),std::size_t(n)*8)){bump(stats.readFails);return false;}
         const std::uintptr_t vt=in.base+reinVtableOffset+vtableAddressPoint;std::uint64_t reins=0;
+        // the whole list (a draft vehicle's driver may hold several reins: sagDraftVehicleComponent::OnNewDriverSeated 0x28b7104);
+        // the first match is still the one tracked
+        int hit=-1;std::uint64_t mine=0;unsigned modes=0;Block t{};
         for(int i=0;i<n;++i){const auto o=objects[std::size_t(i)];std::uintptr_t v{};if(!o||!get(in,o,v)||v!=vt)continue;++reins;
-            if(readRein(in,o,b)&&identity(in,b)){rein_=o;index_=i;stats.reinsSeen.store(reins,std::memory_order_relaxed);bump(stats.found);return true;}}
-        stats.reinsSeen.store(reins,std::memory_order_relaxed);return false;
+            if(readRein(in,o,t)&&identity(in,t)){++mine;modes|=1u<<unsigned(t.at<std::int32_t>(off::reinMode)&7);
+                bool taken=false;for(const auto sk:in.skip)taken=taken||sk==o;if(hit<0&&!taken){hit=i;b=t;}}}
+        stats.reinsSeen.store(reins,std::memory_order_relaxed);stats.playerReins.store(mine,std::memory_order_relaxed);
+        stats.playerModes.store(modes,std::memory_order_relaxed);
+        if(hit<0)return false;
+        rein_=objects[std::size_t(hit)];index_=hit;bump(stats.found);return true;
     }
     // pin bits of the two mode-3-only held vertices (+0x1c8 / +0x1cc): 0 unknown (read failed = unsafe), 1 both clear, 2 any set.
     // SetHeldVertices 0x28a1388 / SetDistanceLod 0x28a4318 put them at n/2-2 / n/2+1 and pin the rope ends 1 / n-2 to the
@@ -167,7 +177,7 @@ class Rope {
         if(!get(in,bits+std::uintptr_t(unsigned(v2)>>5u)*4,w2)||!get(in,bits+std::uintptr_t(unsigned(v3)>>5u)*4,w3))return 0;
         return ((w2>>(unsigned(v2)&31u))&1u)||((w3>>(unsigned(v3)&31u))&1u)?2:1;
     }
-    void drop() noexcept {rein_=0;index_=-1;overriding_=false;haveWrist_=false;native_=written_=-1;stats.overriding.store(false,std::memory_order_relaxed);
+    void drop() noexcept {rein_=0;index_=-1;overriding_=false;live_.store(false,std::memory_order_relaxed);haveWrist_=false;native_=written_=-1;stats.overriding.store(false,std::memory_order_relaxed);
         stats.rein.store(0,std::memory_order_relaxed);stats.modeNative.store(-1,std::memory_order_relaxed);stats.modeCurrent.store(-1,std::memory_order_relaxed);
         stats.modeWritten.store(-1,std::memory_order_relaxed);}
     static void store(std::uintptr_t r,int v) noexcept {*reinterpret_cast<volatile std::int32_t*>(r+off::reinMode)=v;bump(stats.writes);}
@@ -204,6 +214,8 @@ class Rope {
         if(same||!young)ghost_=Ghost{};
     }
 public:
+    std::uintptr_t rein() const noexcept {return rein_;}
+    bool live() const noexcept {return live_.load(std::memory_order_relaxed);}
     void step(const Input& in) noexcept {
         if(policy<=0||!available.load(std::memory_order_acquire)||!in.read||!in.base)return;
         bump(stats.steps);stats.held.store(int(in.held&3u),std::memory_order_relaxed);stats.heldRaw.store(int(in.heldRaw&3u),std::memory_order_relaxed);
@@ -252,7 +264,18 @@ public:
         int want=-1; // the wanted mode, -1 = none (an override goes back to the native value)
         if(in.want){const unsigned m=in.held&3u;want=m==1u?1:m==2u?2:m==3u?(policy==2?1:3):in.freeNone?0:-1;}
         int target=-1,after=cur; // after = the mode UpdateConstraints will use this frame
-        if(native_<1||native_>3){if(want>=1)bump(stats.skippedNative);overriding_=false;written_=-1;} // NONE / RELEASE: not in the hands natively
+        // NONE natively while a VR hand still holds the rein (the game drops it for its own reasons - a reach for the back gun): the game's
+        // own re-attach puts it back in that hand (SetAttachToHolder, as its rein events do; at most every 200 ms) - else the rope lies
+        // on the saddle while the fist still steers. RELEASE (4) and no VR hand: the native value stays.
+        if(native_==0&&fixStuck&&((want>=1&&cur!=want)||(want<1&&overriding_&&written_>=1))&&
+           (!lastFixNs_||in.now<lastFixNs_||in.now-lastFixNs_>=200'000'000ull)){lastFixNs_=in.now;const int to=want>=1?want:0; // the hand let go: 0 again
+            using Fn=std::uint64_t(*)(void*,std::int32_t,std::uint32_t,bool,bool);
+            reinterpret_cast<Fn>(in.base+setAttachToHolderOffset)(reinterpret_cast<void*>(rein_),to,b.at<std::uint32_t>(off::reinHolderGuid),false,false);
+            bump(stats.noneRegrabs);std::int32_t back=cur;
+            if(get(in,rein_+off::reinMode,back)&&back==to){after=to;cur=to;
+                if(to>=1){if(!overriding_)bump(stats.overrides);overriding_=true;written_=to;}else{overriding_=false;written_=-1;}}}
+        if(native_==0&&overriding_&&written_>=1){} // re-attached in the VR hand (above / earlier): kept until the hand lets go
+        else if(native_<1||native_>3){if(want>=1)bump(stats.skippedNative);overriding_=false;written_=-1;} // NONE / RELEASE: not in the hands natively
         else if(want>=0)target=want;
         // no hand on the reins / leaving: the native value back (only if the mod changed it) - except our NONE: a dismount's NONE (event 7)
         // looks the same, a "restore" could put the rope into the hand of a rider walking away; the game's next event sets it anyway
@@ -278,6 +301,7 @@ public:
         if(want==3&&after==3)bump(stats.bothFrames);
         stats.modeNative.store(native_,std::memory_order_relaxed);stats.modeCurrent.store(after,std::memory_order_relaxed);
         stats.modeWritten.store(overriding_?written_:-1,std::memory_order_relaxed);stats.overriding.store(overriding_,std::memory_order_relaxed);
+        live_.store(overriding_,std::memory_order_relaxed);
         // this frame's IK'd wrists (hook A wrote them before this step): the next step's rope check
         haveWrist_=false;
         const int wr=b.at<std::int32_t>(off::reinWristR),wl=b.at<std::int32_t>(off::reinWristL);
@@ -287,7 +311,11 @@ public:
         if(!in.want&&!overriding_)drop(); // restored on the way out (dismount / REINS off / BODY off): the next mount scans again
     }
 };
-inline Rope rope{};
+// a draft vehicle (wagon / stagecoach) gives the driver EVERY rein of its list in one mode (sagDraftVehicleComponent::OnNewDriverSeated
+// 0x28b7104: EmitVerletEventToRein for each guid at +0xd14, count +0xdf0; a coach log: 3 player reins, two left in RIGHT); a horse has
+// one. One Rope per rein the player holds; ropes[0] steps last (its stats = the report)
+inline std::array<Rope,4> ropes{};
+inline bool anyOverriding() noexcept {for(const auto& r:ropes)if(r.live())return true;return false;}
 
 inline std::string report() {
     char b[1600];
@@ -297,7 +325,7 @@ inline std::string report() {
         "\"current\":%d,\"written\":%d,\"overriding\":%s},\"overrides\":%llu,\"restores\":%llu,\"writes\":%llu,\"nativeChanges\":%llu,\"adopted\":%llu,"
         "\"pinBlocked\":%llu,\"pinUnknown\":%llu,\"stuckBoth\":%llu,\"stuckFixes\":%llu,\"pinRepairs\":%llu,\"raceWrites\":%llu,\"freeLeft\":%llu,"
         "\"lostOverriding\":%llu,\"lostRestored\":%llu,\"ghosts\":%llu,\"ghostResumed\":%llu,"
-        "\"skippedNative\":%llu,\"bothFrames\":%llu,\"scans\":%llu,\"scanObjects\":%llu,\"reinsSeen\":%llu,"
+        "\"skippedNative\":%llu,\"noneRegrabs\":%llu,\"bothFrames\":%llu,\"scans\":%llu,\"scanObjects\":%llu,\"reinsSeen\":%llu,"
         "\"found\":%llu,\"lost\":%llu,\"readFails\":%llu,\"steps\":%llu,\"wristCm\":[%.1f,%.1f],\"wristCmMax\":[%.1f,%.1f],\"farFrames\":%llu}",
         stateNames[s<stateNames.size()?s:0],verifyWhy.load(),policy,stats.freeNone.load()?"true":"false",(unsigned long long)stats.rein.load(),
         stats.active.load(),stats.held.load(),stats.heldRaw.load(),(unsigned long long)stats.heldMasked.load(),
@@ -307,11 +335,14 @@ inline std::string report() {
         (unsigned long long)stats.pinUnknown.load(),(unsigned long long)stats.stuckBoth.load(),(unsigned long long)stats.stuckFixes.load(),(unsigned long long)stats.pinRepairs.load(),
         (unsigned long long)stats.raceWrites.load(),(unsigned long long)stats.freeLeft.load(),(unsigned long long)stats.lostOverriding.load(),
         (unsigned long long)stats.lostRestored.load(),(unsigned long long)stats.ghosts.load(),(unsigned long long)stats.ghostResumed.load(),
-        (unsigned long long)stats.skippedNative.load(),(unsigned long long)stats.bothFrames.load(),
+        (unsigned long long)stats.skippedNative.load(),(unsigned long long)stats.noneRegrabs.load(),(unsigned long long)stats.bothFrames.load(),
         (unsigned long long)stats.scans.load(),(unsigned long long)stats.scanObjects.load(),(unsigned long long)stats.reinsSeen.load(),
         (unsigned long long)stats.found.load(),(unsigned long long)stats.lost.load(),(unsigned long long)stats.readFails.load(),
         (unsigned long long)stats.steps.load(),double(stats.wristCm[0].load()),double(stats.wristCm[1].load()),double(stats.wristCmMax[0].load()),
         double(stats.wristCmMax[1].load()),(unsigned long long)stats.farFrames.load());
-    return b;
+    std::string out=b;
+    if(!out.empty()&&out.back()=='}'){out.pop_back();
+        out+=",\"playerReins\":"+std::to_string(stats.playerReins.load())+",\"playerModes\":"+std::to_string(stats.playerModes.load())+"}";}
+    return out;
 }
 } // namespace rdrvr::vr::reinrope

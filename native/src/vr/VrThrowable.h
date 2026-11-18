@@ -49,6 +49,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 
 namespace rdrvr::vr::throwable {
@@ -68,6 +69,10 @@ struct Config {
     // downDot .7 (= THROW's; .9 let a brisk downward put-away of dynamite leave at 3.7 m/s and blow up at John's feet);
     // THROWN_EXPLODING also never leaves more than 30 deg below the horizon (explodeDownDot .5 = sin 30)
     float gain{1.5f},maxSpeed{25.f},minSpeed{2.f},releaseSpeed{1.2f},downDot{.7f},explodeDownDot{.5f}; // physical: m/s (LOCAL), down share = a drop
+    // THROWN only (knives, tomahawks): a release past downDot still throws when its horizontal speed along the head's yaw forward alone
+    // reaches the MIN SWING and its down share is at most thrownSteepDot (.94 = 70 deg); a put-away moves toward the chest or straight
+    // down (forward speed <= 0). downFwd off = downDot alone.
+    bool downFwd{true};float thrownSteepDot{.94f};
     // an AIMED release is decided relWaitNs after the trigger let go (= the holsters' release settle): in HOLD the hand let go
     // of the item by then (grip <= openGrip = holsters gripOpen) or is clearly opening (openDrop below its peak since the trigger let go) =
     // a put-away, never a throw (a full fist lets the trigger go a frame before the grip); TOGGLE (item in an open hand) always throws
@@ -185,8 +190,37 @@ inline Stats stats;
 // throw after this throw's first press (startedOn[attempt]), noStart = the chain ended without a start; launches = Launch calls of the kind
 // (litLaunches = with the fuse flag set); lightTaps / litSeen = the trigger tap lit request / the fuse flag 0 -> 1 while held
 struct KindStats {Counter swings{},releases{},slow{},down{},socket{},glitch{},busy{},tosses{},toOther{},presses{},pressesReady{},pressesRefused{},pressesBlind{},
-    holdPresses{},started{},noStart{},launches{},litLaunches{},lightTaps{},litSeen{};std::array<Counter,4> startedOn{};};
+    holdPresses{},started{},noStart{},launches{},litLaunches{},lightTaps{},litSeen{};std::array<Counter,4> startedOn{};Counter downRescued{};};
 inline std::array<KindStats,2> perKind{};
+// SWINGS (diagnostics, input thread): every physical() verdict and the not-allowed exit of the holsters' release. v = the estimate
+// (LOCAL m/s), down = its down share (-v.y / |v|), fwd / side = its horizontal speed along / across the head's yaw forward (NaN without a
+// head), pitch = degrees above the horizon; vRt / downRt = the runtime velocity in the tape entry nearest the peak (downRt -2 = none).
+enum SwingVerdict : std::uint8_t {SwReleased=0,SwDownFwd,SwDown,SwSlow,SwToss,SwSocket,SwGlitch,SwBusy,SwToOther,SwNotAllowed,SwVerdictCount};
+inline constexpr std::array<const char*,SwVerdictCount> swingVerdictNames{"RELEASED","DOWN_FWD","DOWN","SLOW","TOSS","SOCKET","GLITCH","BUSY","TOSS_TO_OTHER",
+    "NOT_ALLOWED"};
+struct SwingRec {std::uint64_t ns{};V3 v{},vRt{};float speedPeak{},speedRelease{},down{},fwd{},side{},pitchDeg{},downRt{-2.f},peakToReleaseMs{};
+    std::uint32_t samples{};std::uint8_t kind{},verdict{},redirected{},hand{};float downPeak{};std::uint32_t pad{};};
+static_assert(sizeof(SwingRec)%8==0);
+inline std::array<T::Box<SwingRec>,16> swingRing{};inline std::atomic<std::uint32_t> swingNext{};
+// the down share histogram per kind x outcome (thrown / rescued / down) x bucket (<0, 0-.5, .5-.7, .7-.8, .8-.9, .9-1)
+inline std::array<Counter,2*3*6> downHist{};inline std::atomic<std::uint64_t> notAllowed{};
+inline constexpr unsigned downBucket(float d) noexcept {return !(d>=0.f)?0u:d<.5f?1u:d<.7f?2u:d<.8f?3u:d<.9f?4u:5u;}
+// The THROWN forward exception: true = a release over the down rule still throws (kind THROWN, lever on, forward part >= minSwing, down
+// share <= steepDot).
+inline constexpr bool thrownDownRescue(int kind,bool lever,float down,float fwdMps,float minSwing,float steepDot) noexcept {
+    return kind==kindThrown&&lever&&fwdMps==fwdMps&&down==down&&fwdMps>=minSwing&&down<=steepDot;}
+inline void noteSwing(SwingRec r) noexcept {
+    const float len=T::math::length(r.v);r.down=len>1e-6f?-r.v[1]/len:-2.f;
+    r.pitchDeg=len>1e-6f?float(std::asin(std::clamp(r.v[1]/len,-1.f,1.f))*57.29578):0.f;
+    const float hz=std::sqrt(r.v[0]*r.v[0]+r.v[2]*r.v[2]);r.side=r.fwd==r.fwd?std::sqrt(std::max(0.f,hz*hz-r.fwd*r.fwd)):r.fwd;
+    {const float l2=T::math::length(r.vRt);if(r.downRt>-1.5f&&l2>1e-6f)r.downRt=-r.vRt[1]/l2;}
+    const unsigned out=r.verdict==SwReleased?0u:r.verdict==SwDownFwd?1u:r.verdict==SwDown?2u:3u;
+    if(out<3)bump(downHist[(r.kind==kindExploding?1u:0u)*18u+out*6u+downBucket(r.down)]);
+    swingRing[swingNext.fetch_add(1,std::memory_order_relaxed)%swingRing.size()].store(r);}
+// The holsters' release left before physical() (the context did not allow a throw): counted and kept in the ring.
+inline void noteNotAllowed(unsigned h,int kind,std::uint64_t now) noexcept {
+    notAllowed.fetch_add(1,std::memory_order_relaxed);if(!throwableKind(kind))return;
+    SwingRec r{};r.ns=now;r.kind=std::uint8_t(kind);r.hand=std::uint8_t(h&1u);r.verdict=SwNotAllowed;r.fwd=std::numeric_limits<float>::quiet_NaN();noteSwing(r);}
 inline std::array<std::atomic<const char*>,2> lastBlock{}; // the last swing's outcome per kind
 // The engine aim at the last RT press per kind (refusal = aimRefusal then, "UNREAD" without a fresh read)
 struct PressNote {std::uint64_t ns{};std::int32_t state{-1},attempt{};float armUp{};std::uint32_t lit{},ready{},valid{},hold{},pad{};};
@@ -488,24 +522,33 @@ public:
     // PHYSICAL (holsters release(): the HOLD grip of a throwable opened). e = the release estimate (tape preferred); hand / other hand grip
     // poses of this sample; otherFree = the other hand can catch; riding = on a horse (no toss). Returns: 1 = thrown (posted),
     // 2 = a hand toss (the caller runs the TossBrain), 0 = no throw (a plain holster).
-    int physical(unsigned h,const ControllerSample& in,const T::ReleaseEstimator::Estimate& e,bool otherFree,bool riding,bool insideOwnSocket,int kind,std::uint64_t now) noexcept {
+    int physical(unsigned h,const ControllerSample& in,const T::ReleaseEstimator::Estimate& e,bool otherFree,bool riding,bool insideOwnSocket,int kind,std::uint64_t now,
+                 float fwdMps=std::numeric_limits<float>::quiet_NaN()) noexcept {
         if(!active())return 0;
         auto& K=perKind[kindIndex(kind)];bump(K.swings); // per kind, every outcome named (lastBlock)
-        if(e.glitch){bump(stats.glitch);bump(K.glitch);noteBlock(kind,"GLITCH");return 0;}
+        SwingRec rec{};rec.ns=now;rec.v=e.v;rec.speedPeak=e.speedPeak;rec.speedRelease=e.speedRelease;rec.fwd=fwdMps;rec.samples=e.samples;
+        rec.kind=std::uint8_t(kind);rec.redirected=e.redirected?1:0;rec.hand=std::uint8_t(h&1u);rec.downPeak=e.downPeak;
+        rec.peakToReleaseMs=e.releaseNs>=e.peakNs&&e.peakNs?float(double(e.releaseNs-e.peakNs)/1e6):-1.f;
+        if(T::tapeVelocityAt(h,in.referenceSpace,e.peakNs,rec.vRt))rec.downRt=0.f;
+        const auto verdict=[&](SwingVerdict v){rec.verdict=v;noteSwing(rec);};
+        if(e.glitch){bump(stats.glitch);bump(K.glitch);noteBlock(kind,"GLITCH");verdict(SwGlitch);return 0;}
         if(!e.valid||e.speedPeak<minSpeed()||e.speedRelease<releaseSpeed()){
             // below MIN SWING never the game's throw - a gentle
             // toss up / to the other hand is the visual toss (catchable), anything else the plain put-away
-            if(tossable(h,in,e,otherFree,riding,insideOwnSocket,now)){bump(K.tosses);noteBlock(kind,"TOSS");return 2;}
-            bump(stats.slow);bump(K.slow);noteBlock(kind,!e.valid?"NO_ESTIMATE":"SLOW");return 0;}
-        if(insideOwnSocket){bump(stats.socket);bump(K.socket);noteBlock(kind,"SOCKET");return 0;}
-        const float len=T::math::length(e.v);
-        if(e.v[1]<-config.downDot*len||(kind==kindExploding&&e.v[1]<-config.explodeDownDot*len)){bump(stats.down);bump(K.down);noteBlock(kind,"DOWN");return 0;}
-        if(!riding&&!(pendingSeq_&&!settled(now))&&tossToOther(h,in,e,otherFree)){bump(K.toOther);noteBlock(kind,"TOSS_TO_OTHER");return 2;}
+            if(tossable(h,in,e,otherFree,riding,insideOwnSocket,now)){bump(K.tosses);noteBlock(kind,"TOSS");verdict(SwToss);return 2;}
+            bump(stats.slow);bump(K.slow);noteBlock(kind,!e.valid?"NO_ESTIMATE":"SLOW");verdict(SwSlow);return 0;}
+        if(insideOwnSocket){bump(stats.socket);bump(K.socket);noteBlock(kind,"SOCKET");verdict(SwSocket);return 0;}
+        const float len=T::math::length(e.v);bool rescued=false;
+        if(e.v[1]<-config.downDot*len||(kind==kindExploding&&e.v[1]<-config.explodeDownDot*len)){
+            const float down=len>1e-6f?-e.v[1]/len:1.f;
+            if(thrownDownRescue(kind,config.downFwd,down,fwdMps,minSpeed(),config.thrownSteepDot)){rescued=true;bump(K.downRescued);}
+            else{bump(stats.down);bump(K.down);noteBlock(kind,"DOWN");verdict(SwDown);return 0;}}
+        if(!riding&&!(pendingSeq_&&!settled(now))&&tossToOther(h,in,e,otherFree)){bump(K.toOther);noteBlock(kind,"TOSS_TO_OTHER");verdict(SwToOther);return 2;}
         Request q{};q.ns=e.releaseNs?e.releaseNs:now;q.referenceSpace=in.referenceSpace;q.v=e.v;q.w=e.w;q.hand=int(h);q.mode=ModePhysical;
         q.speedPeak=e.speedPeak;q.speedRelease=e.speedRelease;
-        const auto seq=post(q,now,kind);if(!seq){bump(K.busy);noteBlock(kind,"BUSY");return 0;}
+        const auto seq=post(q,now,kind);if(!seq){bump(K.busy);noteBlock(kind,"BUSY");verdict(SwBusy);return 0;}
         releasedNs.store(now,std::memory_order_relaxed);releasedSeq.store(seq,std::memory_order_relaxed);releasedHand.store(int(h),std::memory_order_release);
-        bump(stats.physicalThrows);bump(K.releases);noteBlock(kind,"RELEASED");return 1;
+        bump(stats.physicalThrows);bump(K.releases);noteBlock(kind,rescued?"DOWN_FWD":"RELEASED");verdict(rescued?SwDownFwd:SwReleased);return 1;
     }
     // a gentle release that flies as the visual toss: towards the free other hand (tossToOther), or up / sideways from tossMinSpeed
     // (not downward = a put-away, not inside the item's own socket, never on a horse, never while a throw of this brain is pending).
@@ -546,6 +589,7 @@ inline void startup() noexcept {
     flag("debug.rdrvr.vr.throwable",config.enabled);
     flag("debug.rdrvr.vr.throwable.override",config.launchOverride);flag("debug.rdrvr.vr.throwable.visual",config.visual);
     flag("debug.rdrvr.vr.throwable.toss",config.toss);
+    flag("debug.rdrvr.vr.throwable.downfwd",config.downFwd);real("debug.rdrvr.vr.throwable.steepdot",config.thrownSteepDot,.7f,1.f);
     real("debug.rdrvr.vr.throwable.gain",config.gain,.3f,5.f,PropGain);real("debug.rdrvr.vr.throwable.maxspeed",config.maxSpeed,3.f,60.f);
     real("debug.rdrvr.vr.throwable.minspeed",config.minSpeed,.5f,10.f,PropMinSpeed);real("debug.rdrvr.vr.throwable.release",config.releaseSpeed,.2f,10.f,PropRelease);
     real("debug.rdrvr.vr.throwable.downdot",config.downDot,.5f,1.01f);real("debug.rdrvr.vr.throwable.aimspeed",config.aimSpeed,3.f,60.f,PropAimSpeed);
@@ -588,9 +632,27 @@ inline std::string report() {
     std::snprintf(b,sizeof b,"\"input\":{\"routeFrames\":%llu,\"aimStarts\":%llu,\"aimThrows\":%llu,\"aimTooShort\":%llu,\"aimCancelled\":%llu,"
         "\"physicalThrows\":%llu,\"handTosses\":%llu,\"slow\":%llu,\"glitch\":%llu,\"down\":%llu,\"socket\":%llu,\"noTape\":%llu,\"pulses\":%llu,"
         "\"pulseWaitTimeouts\":%llu,\"busy\":%llu,\"pulsesDropped\":%llu,\"aimCarried\":%llu,\"aimOpenCancels\":%llu,\"releasedHand\":%d,"
-        "\"aimHand\":%d,\"requestSeq\":%llu},",u(s.routeFrames),u(s.aimStarts),u(s.aimThrows),u(s.aimTooShort),
+        "\"aimHand\":%d,\"requestSeq\":%llu,\"notAllowed\":%llu},",u(s.routeFrames),u(s.aimStarts),u(s.aimThrows),u(s.aimTooShort),
         u(s.aimCancelled),u(s.physicalThrows),u(s.handTosses),u(s.slow),u(s.glitch),u(s.down),u(s.socket),u(s.noTape),u(s.pulses),u(s.pulseWaitTimeouts),
-        u(s.busy),u(s.pulsesDropped),u(s.aimCarried),u(s.aimOpenCancels),releasedHand.load(),aimHand.load(),(unsigned long long)requestSeq.load());out+=b;
+        u(s.busy),u(s.pulsesDropped),u(s.aimCarried),u(s.aimOpenCancels),releasedHand.load(),aimHand.load(),(unsigned long long)requestSeq.load(),
+        (unsigned long long)notAllowed.load());out+=b;
+    {// SWINGS: the forward exception's levers, the down share histogram, the last 16 verdicts (oldest first)
+     std::snprintf(b,sizeof b,"\"swings\":{\"downFwd\":%d,\"steepDot\":%.2f,\"downRescued\":[%llu,%llu],\"downHist\":{",config.downFwd?1:0,
+        double(config.thrownSteepDot),u(perKind[0].downRescued),u(perKind[1].downRescued));out+=b;
+     for(unsigned k=0;k<2;++k){std::snprintf(b,sizeof b,"%s\"%s\":{",k?",":"",k?"exploding":"thrown");out+=b;
+        for(unsigned o=0;o<3;++o){const unsigned i=k*18u+o*6u;
+            std::snprintf(b,sizeof b,"%s\"%s\":[%llu,%llu,%llu,%llu,%llu,%llu]",o?",":"",o==0?"thrown":o==1?"rescued":"down",u(downHist[i]),u(downHist[i+1]),
+                u(downHist[i+2]),u(downHist[i+3]),u(downHist[i+4]),u(downHist[i+5]));out+=b;}
+        out+="}";}
+     out+="},\"ring\":[";const auto nowNs=::rdrvr::vr::nowNs();const auto nx=swingNext.load(std::memory_order_relaxed);bool first=true;
+     for(unsigned i=0;i<swingRing.size();++i){SwingRec r{};if(!swingRing[(nx+i)%swingRing.size()].load(r)||!r.ns)continue;
+        const auto f=[](float x){return std::isfinite(x)?double(x):-99.0;};
+        std::snprintf(b,sizeof b,"%s{\"ageMs\":%.0f,\"kind\":%u,\"hand\":%u,\"verdict\":\"%s\",\"v\":[%.2f,%.2f,%.2f],\"peak\":%.2f,\"release\":%.2f,"
+            "\"down\":%.2f,\"fwd\":%.2f,\"side\":%.2f,\"pitch\":%.0f,\"redirected\":%u,\"downPeak\":%.2f,\"samples\":%u,\"peakToReleaseMs\":%.0f,"
+            "\"vRt\":[%.2f,%.2f,%.2f],\"downRt\":%.2f}",first?"":",",nowNs>=r.ns?double(nowNs-r.ns)/1e6:0.0,unsigned(r.kind),unsigned(r.hand),
+            swingVerdictNames[r.verdict<SwVerdictCount?r.verdict:SwSlow],f(r.v[0]),f(r.v[1]),f(r.v[2]),f(r.speedPeak),f(r.speedRelease),f(r.down),f(r.fwd),f(r.side),
+            f(r.pitchDeg),unsigned(r.redirected),f(r.downPeak),r.samples,f(r.peakToReleaseMs),f(r.vRt[0]),f(r.vRt[1]),f(r.vRt[2]),f(r.downRt));out+=b;first=false;}
+     out+="]},";}
     std::snprintf(b,sizeof b,"\"main\":{\"startStale\":%llu,\"ticks\":%llu,\"requestsSeen\":%llu,\"startFailures\":%llu,\"mapFailures\":%llu,\"flights\":%llu,"
         "\"flightProbeHits\":%llu,\"expired\":%llu,\"arcPublished\":%llu,\"arcHidden\":%llu,\"noShown\":%llu,\"forceAimRequests\":%llu,\"flying\":%s},",
         u(s.startStale),u(s.ticks),u(s.requestsSeen),u(s.startFailures),u(s.mapFailures),u(s.flights),u(s.flightProbeHits),u(s.expired),u(s.arcPublished),

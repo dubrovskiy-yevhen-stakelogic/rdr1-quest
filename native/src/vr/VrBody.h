@@ -38,9 +38,11 @@
 #include "VrForearm.h" // Left forearm in the grip frame -> HUD wrist map
 #include "VrCutscene.h" // Cutscene presentation -> arms gate CUTSCENE, head collapse off unless FIRST PERSON
 #include "VrRideSteadyLink.h" // RIDE STEADY: the horse under the eye (VrMotionActors)
+#include "VrSeatSteady.h" // SEAT STEADY: the vehicle seat eye offset John is carried by
 #include "VrMotionBodyLink.h" // John's AppSW parts + this frame's LOCAL -> world map (VrMotionActors)
 #include "VrHorseChains.h" // the horse part chains (legs / neck / head)
 #include "VrSeat.h" // SEAT: John's upper body seated upright under the VR head on a horse (before the arm IK)
+#include "VrHeadShow.h" // HEAD SHOW: the head joint for the render side; the fallback collapse off while the head is shown
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -120,7 +122,7 @@ inline constexpr int maxBones=256,maxCollapse=64;
 // ============================== configuration (startup properties) ==============================
 enum class HeadRoot : std::uint8_t {Neck,Head};
 struct Config {
-    bool head{true},yaw{true},arms{true},fingers{true},reassert{true},clavicle{true},derive{true},dry{false},mountedArm{true};
+    bool head{true},yaw{true},arms{true},fingers{true},reassert{true},clavicle{true},derive{true},dry{false},mountedArm{true},navLock{false};
     // head lock under the HMD (max 75 cm, linear up to the knee at 0.8 = 60 cm, the camera's lean cap),
     // holster sockets on the body.
     bool lock{true},sockets{true};float lockMaxCm{75.f};
@@ -163,12 +165,13 @@ inline bool parseFloat(const std::string& t,float lo,float hi,float& out) noexce
 }
 // debug.rdrvr.vr.body.{head,yaw,arms,fingers,reassert,clavicle,derive} 0/1, .dry 1 (solve + measure, write nothing), .headroot head,
 // .stretch <cm 0..30>, .yawtau <ms>, .yawmax <deg>, .wrist "back depth" (cm), .elbow "out down back wrist", .roll <0..1>, .clavdeg;
-// .lock 0 (no head lock under the HMD), .lockmax <cm 0..100> (75), .sockets 0 (holster sockets stay head-relative).
+// .lock 0 (no head lock under the HMD), .lockmax <cm 0..100> (75), .sockets 0 (holster sockets stay head-relative),
+// .navlock 1 (the script's nav-stick lock, player +0x108, also returns the arms to the native pose).
 inline void startup() noexcept {
     if(started.exchange(true))return;
     Config c{};
     const auto flag=[](const char* n,bool d){const auto v=H::property(n);return v.empty()?d:v[0]!='0';};
-    c.head=flag("debug.rdrvr.vr.body.head",true);c.yaw=flag("debug.rdrvr.vr.body.yaw",true);c.arms=flag("debug.rdrvr.vr.body.arms",true);c.mountedArm=flag("debug.rdrvr.vr.body.mountedarm",true);
+    c.head=flag("debug.rdrvr.vr.body.head",true);c.yaw=flag("debug.rdrvr.vr.body.yaw",true);c.arms=flag("debug.rdrvr.vr.body.arms",true);c.mountedArm=flag("debug.rdrvr.vr.body.mountedarm",true);c.navLock=flag("debug.rdrvr.vr.body.navlock",false);
     c.fingers=flag("debug.rdrvr.vr.body.fingers",true);c.reassert=flag("debug.rdrvr.vr.body.reassert",true);
     c.clavicle=flag("debug.rdrvr.vr.body.clavicle",true);c.derive=flag("debug.rdrvr.vr.body.derive",true);c.dry=flag("debug.rdrvr.vr.body.dry",false);
     c.lock=flag("debug.rdrvr.vr.body.lock",true);c.sockets=flag("debug.rdrvr.vr.body.sockets",true);
@@ -251,6 +254,7 @@ struct Frame {
     bool handsInput{true}; // false = no fresh controller sample (head / plan only: the lock and yaw keep working, the arms have no target)
     std::uint64_t headSampledNs{}; // The plan's head sample = the camera anchor key (sampledNs) the eye comes from; 0 unknown
     int hold{-1},support{-1};std::uintptr_t weapon{};bool firearm{},barrel{},placed{},alt{};
+    bool holdKnife{},bridged{}; // HAND PHYSICS: the engine item is a melee item; a turn bridge moved this plan
     A::Mat34 attachment{};A::Vec3 muzzle{},barrelDir{};
     // DUAL: the phantom (second item) in the other VR hand, its BARREL placement under the same side rule (GameXr bodyPrePhantom)
     int phantomHand{-1};std::uintptr_t phantomWeapon{};bool phantomFirearm{},phantomBarrel{},phantomPlaced{},phantomAlt{};A::Mat34 phantomAttachment{};
@@ -312,9 +316,15 @@ struct Published {
 };
 inline ::rdrvr::vr::body::Seqlock<Published> published;
 inline std::atomic<std::uintptr_t> hookActor{},collapseSkeleton{};
+// Hook C's collapse window as a sequence: odd while it holds collapseLock (the player's globals may be collapsed in place), even after.
+// The tick's head-show read is kept only when the same even value brackets it.
+inline std::atomic<std::uint32_t> collapseEpoch{};
 inline std::atomic<bool> installed{},visible{};
 inline std::atomic<const char*> installState{"NOT ATTEMPTED"};
 inline std::atomic<unsigned> gateNow{GateNotInstalled};
+// The player's lock fields as read by the last tick that found a player (report only; moverGate reads its own copy).
+struct LockBits {std::atomic<unsigned> input{},move{},lock1{},lock2{};std::atomic<int> gait{-1};};
+inline LockBits lockBits{};
 // True while the body is shown in the eyes (menu BODY ON + every hook installed): GameXr gives the eye BodyDrawFilter scopes a
 // creature that never matches (the hat node stays hidden).
 inline bool bodyVisible() noexcept {return visible.load(std::memory_order_acquire);}
@@ -330,6 +340,7 @@ struct ArmStats {
     Counter driftFrames{},driftOver1cm{},reasserted{};std::atomic<float> driftCmMax{},driftDegMax{},lastDriftCm{};
     // RIDING (rider-frame memory only): wanted but no hand pose, held, holds that ran out, blend-out frames, crossfades + their frames
     Counter mountNone{},mountHold{},mountHoldExpired{},mountBlendOut{},mountFades{},mountFadeFrames{};
+    Counter armJumps{}; // HAND PHYSICS: velArm samples whose tracking-space step was over armJumpMps (the estimate restarted)
 };
 // oscillation of a signal (cm) in 2 s windows: peak-to-peak and frequency (crossings of its 1 s running mean, 0.3 cm hysteresis).
 struct OscOut {std::atomic<float> ptpCm{},hz{},ptpMaxCm{},meanCm{},lastCm{};Counter windows{};};
@@ -357,7 +368,7 @@ struct Stats {
     Counter lockApplied{},lockClamped{},lockNoPivot{};std::atomic<float> lockLastCm{},lockCmMax{},lockWeight{};
     std::atomic<float> shoulderBelowEyeCm{},shoulderBehindEyeCm{},neckBelowEyeCm{},headAboveRootCm{};
     Counter socketPublishes{},socketItemFrames{};std::atomic<unsigned> socketMask{},socketFromItem{};
-    Counter yawPitchFrozen{};Counter ticks{},exceptions{},rigResolves{},rigFailures{};
+    Counter yawPitchFrozen{};Counter ticks{},exceptions{},rigResolves{},rigFailures{},headShowReads{},headShowReadFails{},headShowCollapsed{};
     // freeze (look down / hand at a belt holster), hold through frame drop-outs, head-only frames (no controller sample),
     // upright placement means (eye vs head joint / shoulders / neck, |pitch| < 20 deg, 2 s EMA)
     Counter freezeFrames{},freezeEnters{},freezeByPitch{},freezeByHand{},lockHeld{},headOnlyFrames{},uprightSamples{};
@@ -396,6 +407,15 @@ enum ArmSource : unsigned {SourceNone,SourceFree,SourceDerived,SourceSupport,Sou
 struct ArmMemory {float weight{};A::Vec3 lastPerp{},hingeLocal{};A::Mat34 lastTarget{};A::FingerMode lastFingers{A::FingerMode::Native};bool haveLast{};
     // the last target in the rider frame (yawFrame), the last live frame, the source + its crossfade start (rider frame), grip
     A::Mat34 lastRel{},fadeFrom{};std::uint64_t liveNs{};unsigned source{SourceNone},liveSource{SourceNone};float fadeT{1.f},lastGrip{},lastTrigger{};
+    // HAND PHYSICS: the visual stop applied to the free-hand target (translation, world units; rotation angle), its memory; the body target
+    // of the last frame (mover-relative) and its axes
+    A::Vec3 physOffset{};float physRotRad{};::rdrvr::vr::handphys::VisualMem physVisual{};::rdrvr::vr::handphys::GrabHookMem physGrab{};
+    ::rdrvr::vr::handphys::V3 physPrevRel{},physVel{},physAngVel{};::rdrvr::vr::handphys::Rows physPrevRows{};std::uint64_t physPrevNs{};
+    // the body target in the OpenXR tracking space (the frame's LOCAL -> world map inverted), its velocity there, the space and clock of
+    // the last sample, the samples since a restart (HandTarget::velArm)
+    ::rdrvr::vr::handphys::V3 physPrevLocal{},physArmVel{};std::uint64_t physArmNs{},physArmSpace{};unsigned physArmN{};
+    // GUN GLASS: the held gun's muzzle in the tracking space, its velocity there, the space and clock of the last sample, samples since a restart
+    ::rdrvr::vr::handphys::V3 physTipLocal{},physTipVel{};std::uint64_t physTipNs{},physTipSpace{};unsigned physTipN{};
     bool haveRel{},holding{},wanted{};};
 struct Saved { // what hook A wrote, for hook B
     std::uint64_t serial{};std::uintptr_t skel{};bool valid[2]{};int first[2]{},count[2]{};
@@ -451,6 +471,9 @@ inline unsigned readPlayer(PlayerRead& p) noexcept {
     alignas(8) static thread_local unsigned char pb[off::playerBlock];
     if(!block(p.player,pb,sizeof pb)||at<std::uintptr_t>(pb,0)!=ea.playerTable||pb[off::playerActive]!=1)return GateNoPlayer;
     p.guid=at<std::uint32_t>(pb,off::playerGuid);p.state=at<std::uint32_t>(pb,off::playerState);
+    lockBits.input.store(at<std::uint16_t>(pb,off::playerInputLocks),std::memory_order_relaxed);lockBits.move.store(at<std::uint16_t>(pb,off::playerMoveLocks),std::memory_order_relaxed);
+    lockBits.lock1.store(pb[off::playerLock1],std::memory_order_relaxed);lockBits.lock2.store(pb[off::playerLock2],std::memory_order_relaxed);
+    lockBits.gait.store(at<std::int32_t>(pb,off::playerScriptedGait),std::memory_order_relaxed);
     std::uintptr_t manager{},slots{};std::uint16_t n{};std::uint8_t entry[16]{};
     if(!get(ea.actorManager,0,manager)||!get(manager,0,n)||!get(ea.actorSlots,0,slots)||!slots)return GateNoPlayer;
     const std::uint32_t index=p.guid&0xffffu;
@@ -480,9 +503,13 @@ inline unsigned moverGate(const PlayerRead& p) noexcept {
     std::uint8_t gd15{},gd16{};std::uint16_t f112{};
     if(get(ea.gameData,0x15,gd15)&&get(ea.gameData,0x16,gd16)&&get(p.actor,off::actorFlags112,f112)&&gd15&&(f112&4u)&&!gd16)return GateScripted;
     if(p.state!=2)return GateNotOnFoot;
+    // Unlike the LOCO gate, +0x108 alone keeps the gate open. EnableNavStickInput(false) only zeroes the walking stick (sagPlayerInputFoot::
+    // UpdateParameters) and hides touch widgets (rage::FootContext::Update); CheckIsPlayerControlDisabled does not read it. Scripts set it for
+    // stand-and-shoot stages with aim and fire enabled, so the arms stay on the controllers with the VR-posed gun; +0x104, +0x10c, +0x10d and the
+    // gait still close the gate.
     std::uint16_t inputLocks{},moveLocks{};std::uint8_t lock1{},lock2{};std::int32_t gait{-1};
     if(get(p.player,off::playerInputLocks,inputLocks)&&get(p.player,off::playerMoveLocks,moveLocks)&&get(p.player,off::playerLock1,lock1)&&
-       get(p.player,off::playerLock2,lock2)&&get(p.player,off::playerScriptedGait,gait)&&(inputLocks||moveLocks||lock1||lock2||gait>=0))return GateLocked;
+       get(p.player,off::playerLock2,lock2)&&get(p.player,off::playerScriptedGait,gait)&&(inputLocks||(moveLocks&&config.navLock)||lock1||lock2||gait>=0))return GateLocked;
     std::uintptr_t foot{},footTable{},footPlayer{};std::uint32_t footMode{};std::uint8_t footDisabled{};
     if(ea.footTable&&get(p.player,off::playerFoot,foot)&&foot&&get(foot,0,footTable)&&footTable==ea.footTable&&get(foot,F::footPlayer,footPlayer)&&
        footPlayer==p.player&&get(foot,F::footMode,footMode)&&get(foot,F::footDisabled,footDisabled)&&(footMode||(footDisabled&1u)))return GateLadder;
@@ -698,10 +725,13 @@ inline void tick(const mt::Frame& frame) noexcept {
         // SEAT: a HORSE only (player state 5; a wagon / stagecoach seat is 3 and its mover is attached too) after the mount animation,
         // outside cutscenes / linked animations. moverGate stops at MOUNTED (the mover attachment) before the context gate, so the seat
         // reads the player blocks itself (same cache, every 4th tick).
-        if(gate==GateMounted&&on&&::rdrvr::vr::seat::config.on&&currentRig&&currentRig->seat.ok&&pl.state==5u){refreshBlocks();
-            const auto& b=lastBlocks;
+        if(gate==GateMounted&&on&&::rdrvr::vr::seat::config.on&&currentRig&&currentRig->seat.ok&&(pl.state==5u||pl.state==3u)){refreshBlocks();
+            const auto& b=lastBlocks;namespace vsx=::rdrvr::vr::vehicleseat;
             if(blocksValid&&b.linkedAnimation)p.seatCut=true;
-            p.seat=blocksValid&&b.alive&&b.riding&&!b.mountingHorse&&!b.linkedAnimation&&!b.ridingVehicle&&!b.vehicleTransition&&!b.mountedWeapon;}
+            const bool horse=pl.state==5u&&b.riding&&!b.ridingVehicle;
+            // the stagecoach / wagon DRIVER's seat (state 3): the same hold - the driving / whip animations lean the spine into the fixed seat eye
+            const bool coach=pl.state==3u&&b.ridingVehicle&&!b.riding&&!b.seatSwap&&b.vehicleType==vsx::typeStagecoach&&b.seatClass==vsx::SeatDriver;
+            p.seat=blocksValid&&b.alive&&(horse||coach)&&!b.mountingHorse&&!b.linkedAnimation&&!b.vehicleTransition&&!b.mountedWeapon;}
     }
     if(gate==GateOk&&::rdrvr::vr::cutscene::inCutscene.load(std::memory_order_relaxed))gate=GateCutscene; // Native pose in cutscenes
     if(gate==GateOk&&!on)gate=GateOff;
@@ -710,9 +740,28 @@ inline void tick(const mt::Frame& frame) noexcept {
         const bool cs=::rdrvr::vr::cutscene::inCutscene.load(std::memory_order_relaxed);if(cs)p.seat=false;
         p.seatCut=p.seatCut||cs||gate==GateRagdoll||gate==GateCutscene||gate==GateDead||gate==GateNotInGame||gate==GateNoPlayer||gate==GateNoSkeleton||
             gate==GateNoRig||gate==GateNotInstalled||gate==GateStale;}
+    { // HEAD SHOW (VrHeadShow.h): the head joint's world translation (its global row) for the render side, every gate with a readable skeleton
+        namespace hsw=::rdrvr::vr::headshow;hsw::pollLevers(t0);
+        hsw::seatOff.store(gate==GateMounted&&pl.state==3u,std::memory_order_relaxed); // coach / wagon seat: the driving / whip animation takes the head 40-70 cm from the steadied seat eye - no HEAD SHOW pops there
+        if(p.skel&&sk.globals&&currentRig&&currentRig->count==int(sk.count)&&currentRig->bones.head>=0&&currentRig->bones.head<int(sk.count)){
+            float hp[3]{};
+            // hook C collapses the neck subtree in these globals while it runs: a read inside (or across) that window is dropped
+            const auto e0=collapseEpoch.load(std::memory_order_acquire);
+            const bool got=!(e0&1u)&&detail::get(sk.globals,std::size_t(currentRig->bones.head)*64u+48u,hp);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if((e0&1u)||(got&&collapseEpoch.load(std::memory_order_relaxed)!=e0))bump(stats.headShowCollapsed);
+            else if(got&&std::isfinite(hp[0]+hp[1]+hp[2])){
+                hsw::HeadSample hs{};hs.pos[0]=hp[0];hs.pos[1]=hp[1];hs.pos[2]=hp[2];hs.ns=detail::now();hs.guid=pl.guid;
+                hs.gateClass=std::uint8_t(gate==GateOk?hsw::ClassOk:gate==GateRagdoll?hsw::ClassRagdoll:gate==GateDead?hsw::ClassDead:hsw::ClassOther);
+                hsw::head.store(hs);bump(stats.headShowReads);}
+            else bump(stats.headShowReadFails);}
+    }
     published.store(p);
     hookActor.store(p.actor,std::memory_order_release);
-    collapseSkeleton.store(p.collapse?p.skel:0,std::memory_order_release);
+    // HEAD SHOW, fallback mode only (the skinning task collapses, the shadow loses the head too): no collapse while the head is shown.
+    // HEAD SHADOW live keeps capturing the collapsed rows (the eye fill is what is switched off) so its miss counter never trips.
+    const bool headShown=::rdrvr::vr::headshow::shownNow.load(std::memory_order_relaxed)&&!headShadowLive.load(std::memory_order_relaxed);
+    collapseSkeleton.store(p.collapse&&!headShown?p.skel:0,std::memory_order_release);
     // The body is shown in the eyes only while its head can be collapsed (BODY ON, hooks in, the player's head range known);
     // debug.rdrvr.vr.body.head 0 keeps the head and therefore also keeps the body hidden.
     visible.store(on&&p.collapse,std::memory_order_release);
@@ -1141,7 +1190,8 @@ inline Lever lever(std::uint64_t now) noexcept {
     return {on.load(std::memory_order_relaxed)!=0&&!::rdrvr::vr::settings().rideShake(),float(tauMs.load(std::memory_order_relaxed))*1e-3f,
         float(maxCm.load(std::memory_order_relaxed))*.01f};
 }
-struct State{std::uintptr_t locals{};bool haveL0{};A::Mat34 writtenL0{};float baked{};bool have{};float y{},vy{};std::uint64_t ns{};
+// bakedH: the horizontal part of the shift (SEAT STEADY, the rider only; 0 for every other user)
+struct State{std::uintptr_t locals{};bool haveL0{};A::Mat34 writtenL0{};float baked{};A::Vec3 bakedH{};bool have{};float y{},vy{};std::uint64_t ns{};
     int bone{-1};std::uintptr_t boneSkel{};std::uint64_t boneNs{};int head{-1};std::uint64_t headNs{};};
 // One call: the new shift (m along up) for the shift-free reference height raw, Holt-smoothed; repeated calls within 2 ms keep the
 // filter (the post-physics + compose calls of one frame)
@@ -1157,19 +1207,21 @@ inline float target(State& s,float raw,bool want,std::uint64_t now,const Lever& 
     if(!std::isfinite(s.y)||!std::isfinite(s.vy)||std::fabs(s.y-raw)>lv.maxM){s.y=raw;s.vy=0.f;}
     return std::clamp(s.y-raw,-lv.maxM,lv.maxM);
 }
-// Moves every global by (want - baked) along up and rewrites L0 = inverse(root) * g0; g (optional) = the caller's copy of the globals
-inline bool apply(State& s,float* globals,unsigned char* locals,const A::Mat34& root,int count,const A::Vec3& upv,float want,A::Mat34* g) noexcept {
-    const float d=want-s.baked;
-    if(std::fabs(d)<1e-5f||count<=0)return false;
-    const A::Vec3 dv=upv*d;
+// Moves every global by (want - baked) along up + (wantH - bakedH) and rewrites L0 = inverse(root) * g0; g (optional) = the caller's copy
+// of the globals
+inline bool apply(State& s,float* globals,unsigned char* locals,const A::Mat34& root,int count,const A::Vec3& upv,float want,A::Mat34* g,
+                  A::Vec3 wantH={}) noexcept {
+    const float d=want-s.baked;const A::Vec3 dh=wantH-s.bakedH;
+    if((std::fabs(d)<1e-5f&&std::fabs(dh.x)<1e-5f&&std::fabs(dh.y)<1e-5f&&std::fabs(dh.z)<1e-5f)||count<=0)return false;
+    const A::Vec3 dv=upv*d+dh;
     for(int i=0;i<count;++i){float* m=globals+std::size_t(i)*16;A::Mat34 x=A::LoadMat34(m);x.d=x.d+dv;A::StoreMat34(m,x);if(g)g[i]=x;}
     float* l0p=reinterpret_cast<float*>(locals);const A::Mat34 g0=A::LoadMat34(globals);A::StoreMat34(l0p,A::InverseAffine(root)*g0);
-    s.baked=want;s.writtenL0=A::LoadMat34(l0p);s.haveL0=true;s.locals=reinterpret_cast<std::uintptr_t>(locals);return true;
+    s.baked=want;s.bakedH=wantH;s.writtenL0=A::LoadMat34(l0p);s.haveL0=true;s.locals=reinterpret_cast<std::uintptr_t>(locals);return true;
 }
 // At entry: the shift still baked into this skeleton's L0 (else the engine rebuilt the pose: nothing baked)
 inline void entry(State& s,unsigned char* locals) noexcept {
     const A::Mat34 l0=A::LoadMat34(reinterpret_cast<const float*>(locals));
-    if(!(s.haveL0&&s.locals==reinterpret_cast<std::uintptr_t>(locals)&&std::memcmp(&l0,&s.writtenL0,sizeof l0)==0)){s.baked=0.f;s.haveL0=false;}
+    if(!(s.haveL0&&s.locals==reinterpret_cast<std::uintptr_t>(locals)&&std::memcmp(&l0,&s.writtenL0,sizeof l0)==0)){s.baked=0.f;s.bakedH={};s.haveL0=false;}
 }
 inline State rider{},horse{},horseHead{};
 inline std::atomic<float> headShiftCm{0.f},headBobCm{0.f};
@@ -1301,8 +1353,19 @@ inline void horseStep(std::uintptr_t actor,std::uint64_t now) noexcept {
     {static std::uint64_t last{};const float dt=last&&now>last?std::min(float(double(now-last)*1e-9),.1f):0.f;last=now;noteBob(horseBobCm,t*100.f,dt);}
 }
 } // namespace steady
+// HAND PHYSICS: the player's mover (a Sim mover by its vtable) and its inst matrix row d, the reference of the hands' body targets.
+inline bool physMover(std::uintptr_t actor,std::uintptr_t& mover,A::Vec3& pos) noexcept {
+    using namespace detail;const auto& ea=detail::api;
+    std::uintptr_t m{};
+    {const auto lm=L::playerMover.load(std::memory_order_relaxed);if(lm&&actor&&L::playerActor.load(std::memory_order_relaxed)==actor)m=lm;}
+    if(!m&&(!actor||!get(actor,off::actorMover,m)))return false;
+    std::uintptr_t vptr{},owner{};float p[3]{};
+    if(!m||!ea.simVtable||!get(m,0,vptr)||vptr!=ea.simVtable||!get(m,L::field::moverActor,owner)||owner!=actor||!block(m+L::field::moverPos,p,sizeof p))return false;
+    if(!std::isfinite(p[0]+p[1]+p[2]))return false;
+    mover=m;pos={p[0],p[1],p[2]};return true;
+}
 inline ApplyResult applyBody(const Rig& r,float* globals,unsigned char* locals,const A::Mat34& root,int count,const Frame& f,bool frameOk,
-                             bool gateOpen,std::uint64_t now,std::uint64_t serial,const Config& c,bool mountedArm=false,int seatMode=0) noexcept {
+                             bool gateOpen,std::uint64_t now,std::uint64_t serial,const Config& c,bool mountedArm=false,int seatMode=0,std::uintptr_t actor=0) noexcept {
     ApplyResult res{};
     const float dt=ik.lastNs&&now>ik.lastNs?std::min(float(double(now-ik.lastNs)/1e9),.1f):0.f;ik.lastNs=now;
     const bool write=!c.dry;
@@ -1506,7 +1569,15 @@ inline ApplyResult applyBody(const Rig& r,float* globals,unsigned char* locals,c
         const int pb=r.bones.pelvis;
         const float refY=pb<0||pb>=count?0.f:useHorse?g[std::size_t(pb)].d.y-st::rider.baked*upv.y-hy:A::Dot(g[std::size_t(pb)].d,upv)-st::rider.baked-A::Dot(root.d,upv);
         const float t=st::target(st::rider,refY,riding&&write,now,lv);st::noteBob(st::riderBobCm,t*100.f,dt);
-        if(st::apply(st::rider,globals,locals,root,count,upv,t,g.data()))res.wrote=true;
+        // SEAT STEADY (VrSeatSteady.h): in a vehicle seat John is carried by the eye's offset from the raw seat (published by the riding
+        // sample, fresh < 150 ms), so the body stays under the steady view; refY above subtracts it with the rest of the baked shift
+        A::Vec3 seatH{};float seatV=0.f;
+        {namespace ss=::rdrvr::vr::seatsteady;
+            if(riding&&write&&ss::bodyLever.load(std::memory_order_relaxed)&&ss::shiftFresh(now)){
+                seatH={ss::shiftX.load(std::memory_order_relaxed),0.f,ss::shiftZ.load(std::memory_order_relaxed)};seatV=ss::shiftY.load(std::memory_order_relaxed);
+                if(!A::Finite(seatH)||!std::isfinite(seatV)||A::Length(seatH)>.5f||std::fabs(seatV)>.5f){seatH={};seatV=0.f;}
+                else ss::bodyFrames.fetch_add(1,std::memory_order_relaxed);}}
+        if(st::apply(st::rider,globals,locals,root,count,upv,t+seatV,g.data(),seatH))res.wrote=true;
         if(riding){st::riderNs.store(now,std::memory_order_relaxed);st::riderX.store(root.d.x,std::memory_order_relaxed);st::riderZ.store(root.d.z,std::memory_order_relaxed);
             st::riderFrames.fetch_add(1,std::memory_order_relaxed);}
         st::riderShiftCm.store(st::rider.baked*100.f,std::memory_order_relaxed);} // the shift in the skeleton now (0 once unwound)
@@ -1521,6 +1592,20 @@ inline ApplyResult applyBody(const Rig& r,float* globals,unsigned char* locals,c
     const A::Mat34 rider=yawFrame(root,upv),riderInv=A::InverseOrtho(rider);
     const std::uint64_t holdNs=std::uint64_t(double(c.mountHoldMs)*1e6);const float fadeS=c.mountFadeMs*.001f;
     HandBox box{};bool boxAny=false; // ARC: published below when an arm was solved
+    // HAND PHYSICS: one atomic load while the row is OFF and no visual offset is left. The body targets (raw controller, mover-relative)
+    // go to the substeps of the next frame; the solved bodies of this frame's substeps give the visual stop.
+    namespace hp=::rdrvr::vr::handphys;
+    const unsigned physMode=hp::liveMode.load(std::memory_order_relaxed);
+    // hookA.visualUs = the hand-physics parts of this hook only (setup, the per-hand blocks, the publish), not the arm IK between them
+    const std::uint64_t physT0=physMode!=hp::ModeOff?detail::now():0ull;std::uint64_t physNs=0;
+    hp::Levers physLev{};hp::Solved physSolved{};hp::Targets physTargets{};A::Vec3 physMoverPos{};
+    bool havePhysSolved=false,physMoverOk=false,physAny=false,physThird=false;
+    if(physMode!=hp::ModeOff){
+        if(!hp::levers.load(physLev))physLev=hp::Levers{};
+        havePhysSolved=physMode==hp::ModeOn&&hp::solved.load(physSolved)&&hp::fresh(now,physSolved.ns,60'000'000ull);
+        if(physMode==hp::ModeOn&&!havePhysSolved)hp::hookSolvedStale.fetch_add(1,std::memory_order_relaxed);
+        physMoverOk=physMover(actor,physTargets.mover,physMoverPos);physThird=::rdrvr::vr::steadylink::thirdActive(now);
+        physNs+=detail::now()-physT0;}
     // LEFT hold: the engine holds every item in its RIGHT hand (the right arm's animation grips it, the left one's does not), so the
     // left fingers get the right hand's animated pose mirrored (read before the right arm's own finger curl overwrites it).
     std::array<A::Quat,A::kFingers*A::kJoints> leftPose{};std::uint16_t leftPoseMask=0;
@@ -1547,6 +1632,7 @@ inline ApplyResult applyBody(const Rig& r,float* globals,unsigned char* locals,c
         // the arm should be driven - a missing hand pose then holds instead of ramping out (a failed frame keeps last frame's wish)
         const bool wanted=armOk&&(gateOpen||weaponArm||(riderRel&&!frameOk&&mem.wanted));mem.wanted=wanted;
         unsigned source=SourceNone;
+        hp::HandClass physClass=hp::ClassNone,boxClass=hp::ClassNone;float physTipLen=0.f;bool physTouch=false;
         if(armOk&&frameOk&&(gateOpen||weaponArm)){
             const auto& h=f.hand[std::size_t(vr)];
             // what this hand holds: the engine item or the DUAL phantom (the same rules)
@@ -1567,6 +1653,118 @@ inline ApplyResult applyBody(const Rig& r,float* globals,unsigned char* locals,c
                 job.grip=h.squeeze;job.trigger=h.trigger;have=true;
                 if(holding&&placed&&!(b.attach>=0&&alt==(side==1)))bump(stats.weaponDerivedMismatch);
             }else bump(st.noTarget);
+            // HAND PHYSICS: this hand's class and body target from the raw controller (PALM: the palm centre B and its axes S F N); the
+            // free-hand target moves to the plane the physics solved and turns with the solved body while it touches a surface
+            if(have&&h.valid&&(physMode!=hp::ModeOff||A::Length(mem.physOffset)>0.f||mem.physRotRad>0.f)){
+                const std::uint64_t physH0=physMode!=hp::ModeOff?detail::now():0ull;
+                const float upmS=std::max(f.upm,1e-3f);
+                const auto V=[](A::Vec3 x){return hp::V3{x.x,x.y,x.z};};
+                const bool palmShape=physLev.shape==hp::ShapePalm;
+                const hp::PalmFrame pf=hp::handFrame(V(h.gripPos),V(h.frame.a),V(h.frame.b),V(h.frame.c),V(h.aimFwd),vr==1,c.wristBack,c.wristDepth,f.upm);
+                const hp::V3 centre=palmShape?pf.B:V(h.gripPos+h.aimFwd*(physLev.anchorFwdM*f.upm));
+                const hp::Rows rows=pf.valid?hp::Rows{pf.S,pf.F,pf.N}:hp::Rows{hp::V3{1,0,0},hp::v::normalized(V(h.aimFwd)),hp::V3{0,0,1}};
+                const bool centreOk=hp::v::finite(centre)&&(pf.valid||!palmShape);
+                bool contact=false;const hp::HandSolved* hs=nullptr;
+                if(physMode!=hp::ModeOff){
+                    const bool gun=engineHeld&&f.firearm&&f.placed,knife=engineHeld&&f.holdKnife;
+                    hp::ClassIn ci{};ci.onFoot=hp::bodyOnFoot(gateOpen,mountedArm,seatMode,physThird);ci.bridged=f.bridged;ci.sourceFree=source==SourceFree;ci.sourceDerived=source==SourceDerived;
+                    ci.heldHere=engineHeld;ci.phantomHere=phantomHeld;ci.hold=f.hold;ci.weapon=f.weapon!=0;ci.firearm=f.firearm;ci.knife=f.holdKnife;ci.placed=f.placed;
+                    ci.otherPhantom=f.phantomHand>=0&&f.phantomHand!=vr&&f.phantomWeapon!=0;ci.otherPhantomFirearm=f.phantomFirearm;
+                    boxClass=hp::classify(ci);
+                    ci.bridged=false;physClass=hp::classify(ci); // a turn bridge moves the body with the plan
+                    physTipLen=gun?A::Length(f.muzzle-h.gripPos)/upmS:knife?hp::knifeTipM:0.f;
+                    if(physMoverOk&&centreOk){auto& pt=physTargets.hand[std::size_t(vr)];
+                        const hp::V3 rel=hp::v::sub(centre,V(physMoverPos));
+                        const float pdt=mem.physPrevNs&&now>mem.physPrevNs?float(double(now-mem.physPrevNs)*1e-9):0.f;
+                        const bool restart=!mem.physPrevNs||f.bridged;
+                        mem.physVel=hp::targetVelocity(mem.physVel,mem.physPrevRel,rel,pdt,restart);
+                        mem.physAngVel=hp::frameAngVel(mem.physPrevRows,rows,pdt,mem.physAngVel,restart);
+                        mem.physPrevRel=rel;mem.physPrevRows=rows;mem.physPrevNs=now;
+                        // the arm's own velocity: the body target in the tracking space (no stick locomotion, no turn: the map carries
+                        // those), differentiated there and turned back to world axes; a new space, no map, a 100 ms gap or a step over
+                        // armJumpMps (tracking lost and found, a recentre) restarts it
+                        hp::V3 velArm{};bool armOk=false;
+                        if(f.mapValid){const A::Vec3 l=A::TransformPoint(A::InverseAffine(f.localToWorld),A::Vec3{centre[0],centre[1],centre[2]});
+                            const hp::V3 local{l.x,l.y,l.z};
+                            const float adt=mem.physArmNs&&now>mem.physArmNs?float(double(now-mem.physArmNs)*1e-9):0.f;
+                            const bool jump=mem.physArmNs&&f.space==mem.physArmSpace&&adt<=.1f&&hp::armJump(mem.physPrevLocal,local,adt,f.upm);
+                            if(jump)bump(st.armJumps);
+                            const bool arestart=!mem.physArmNs||f.space!=mem.physArmSpace||!(adt>1e-4f)||adt>.1f||!hp::v::finite(local)||jump;
+                            mem.physArmVel=hp::targetVelocity(mem.physArmVel,mem.physPrevLocal,local,adt,arestart);
+                            mem.physArmN=arestart?0u:std::min(mem.physArmN+1u,8u);
+                            mem.physPrevLocal=local;mem.physArmNs=now;mem.physArmSpace=f.space;
+                            const A::Vec3 w=A::TransformDir(f.localToWorld,A::Vec3{mem.physArmVel[0],mem.physArmVel[1],mem.physArmVel[2]});
+                            velArm={w.x,w.y,w.z};armOk=mem.physArmN>=1u&&hp::v::finite(velArm);}
+                        else{mem.physArmNs=0;mem.physArmN=0;}
+                        if(!armOk)velArm={};
+                        pt.rel=rel;pt.vel=mem.physVel;pt.rows=rows;pt.angVel=mem.physAngVel;pt.trigger=h.trigger;pt.squeeze=h.squeeze;pt.cls=physClass;pt.valid=1;physAny=true;
+                        pt.velArm=velArm;pt.armOk=armOk?1:0;
+                        // GUN GLASS: the muzzle and the bore point level with the holding grip (supportTarget's bore), the muzzle's velocity
+                        // in the tracking space (velArm's rules), the gun handling of this frame (a shot within 250 ms, the spin keeping the
+                        // gun, the cylinder not closed or closed within recentCloseNs); the velocity and the handling only while the gun
+                        // hand's lever is not -1 (the free hand's path reads the muzzle and the bore only)
+                        pt.gun=gun?1:0;pt.source=std::uint8_t(source);pt.kind=std::int8_t(std::clamp(H::heldKind.load(std::memory_order_relaxed),-1,127));
+                        pt.tipRel={};pt.boreRel={};pt.tipVelArm={};pt.tipOk=0;pt.busy=0;
+                        if(gun){const A::Vec3 dir=A::Normalize(f.barrelDir,{0,0,1});const float len=std::max(A::Dot(f.muzzle-f.attachment.d,dir),0.f);
+                            pt.tipRel=hp::v::sub(V(f.muzzle),V(physMoverPos));pt.boreRel=hp::v::sub(V(f.muzzle-dir*len),V(physMoverPos));
+                            if(physLev.gunGlass<0){mem.physTipNs=0;mem.physTipN=0;}
+                            else{
+                            if(f.mapValid){const A::Vec3 l=A::TransformPoint(A::InverseAffine(f.localToWorld),f.muzzle);const hp::V3 local{l.x,l.y,l.z};
+                                const float tdt=mem.physTipNs&&now>mem.physTipNs?float(double(now-mem.physTipNs)*1e-9):0.f;
+                                const bool jump=mem.physTipNs&&f.space==mem.physTipSpace&&tdt<=.1f&&hp::armJump(mem.physTipLocal,local,tdt,f.upm);
+                                const bool trestart=!mem.physTipNs||f.space!=mem.physTipSpace||!(tdt>1e-4f)||tdt>.1f||!hp::v::finite(local)||jump;
+                                mem.physTipVel=hp::targetVelocity(mem.physTipVel,mem.physTipLocal,local,tdt,trestart);
+                                mem.physTipN=trestart?0u:std::min(mem.physTipN+1u,8u);mem.physTipLocal=local;mem.physTipNs=now;mem.physTipSpace=f.space;
+                                const A::Vec3 w=A::TransformDir(f.localToWorld,A::Vec3{mem.physTipVel[0],mem.physTipVel[1],mem.physTipVel[2]});
+                                pt.tipVelArm={w.x,w.y,w.z};pt.tipOk=mem.physTipN>=1u&&hp::v::finite(pt.tipVelArm)?1:0;if(!pt.tipOk)pt.tipVelArm={};}
+                            else{mem.physTipNs=0;mem.physTipN=0;}
+                            {const auto shot=::rdrvr::vr::throwing::lastShotNs.load(std::memory_order_relaxed);
+                             if(shot&&now>=shot&&now-shot<250'000'000ull)pt.busy|=hp::gunBusyShot;}
+                            if(::rdrvr::vr::spin::keeps(int(vr)))pt.busy|=hp::gunBusySpin;
+                            {const auto cc=H::cylinderClosedNs.load(std::memory_order_acquire);if(cc&&now>=cc&&now-cc<H::recentCloseNs)pt.busy|=hp::gunBusyReload;}
+                            if(const auto ps=H::cylinderPhaseSink.load(std::memory_order_acquire)){int ph=0;try{ph=ps(now);}catch(...){ph=0;}if(ph!=0)pt.busy|=hp::gunBusyReload;}}}
+                        else{mem.physTipNs=0;mem.physTipN=0;}}
+                    if(havePhysSolved&&physLev.visual&&source==SourceFree&&physClass==hp::ClassBody){
+                        hs=&physSolved.hand[std::size_t(vr)];
+                        contact=(hs->state==hp::BodyLive||hs->state==hp::BodyTravel)&&hp::fresh(now,hs->contactNs,std::uint64_t(double(physLev.holdMs)*1e6));}
+                }
+                float offsetM=0.f,rotRad=0.f;
+                if(source==SourceFree&&centreOk){
+                    // GRAB: a hand holding a prop is drawn at its solved body (the prop hangs on it), at most grabVisualM from the controller, without the
+                    // contact plane; a ball-jointed hold with the grip drive at the prop's grip this substep (the prop's own pose: the hand
+                    // body's per-substep velocity and the joint's error never reach the picture), with the controller's rotation
+                    const bool grabbed=hs&&hs->grab&&hs->state==hp::BodyLive&&hp::fresh(now,physSolved.ns,60'000'000ull);
+                    const bool atGrip=grabbed&&hs->ball&&hs->gripOk;
+                    // a heavy hold (heavy furniture or a pair, lever grabheavydraw) stays at its grip up to the break distance grabLeashM:
+                    // capped at grabVisualM the drawn hand hung between the controller and the chair, on neither
+                    const bool heavyDraw=atGrip&&hs->heavy;
+                    const float grabLeash=(heavyDraw?physLev.grabLeashM:std::min(physLev.grabLeashM,hp::grabVisualM))*f.upm;
+                    const hp::VisualOut vis=atGrip?hp::grabVisualGrip(mem.physVisual,hs->grip,centre,grabLeash):
+                        grabbed?hp::grabVisual(mem.physVisual,hs->solved,centre,hs->rows,hs->cmdRows,grabLeash,physLev.rotCapDeg*hp::pi/180.f):
+                        hp::visualPlane(mem.physVisual,contact,hs?hs->n:hp::V3{},hs?hs->plane:0.f,centre,hs?hs->rows:hp::Rows{},hs?hs->cmdRows:hp::Rows{},
+                        dt,physLev.liftM*f.upm,physLev.leashM*f.upm,physLev.visualMs*1e-3f,physLev.rotCapDeg*hp::pi/180.f,palmShape);
+                    if(atGrip){auto& gk=hp::grabHook[std::size_t(vr)&1u];gk.gripDrawn.fetch_add(1,std::memory_order_relaxed);
+                        if(heavyDraw)gk.heavyDrawn.fetch_add(1,std::memory_order_relaxed);
+                        // drawn 5 cm or more off the grip (the cap held it back toward the controller)
+                        const float off=hp::v::length(hp::v::sub(hp::v::add(centre,vis.offset),hs->grip))/std::max(f.upm,1e-3f);
+                        if(std::isfinite(off)&&off>=.05f)gk.offGrip.fetch_add(1,std::memory_order_relaxed);}
+                    // the drawn hand's frame-to-frame change while held (hp::noteGrabHook); a hold's end counted once
+                    if(grabbed)hp::noteGrabHook(unsigned(vr),mem.physGrab,grabbed,vis.offset,hp::v::sub(hs->solved,centre),hs->gripOk?hp::v::sub(hs->grip,centre):hp::v::sub(hs->solved,centre),
+                            hs->gripOk?hp::v::sub(hs->solved,hs->grip):hp::V3{},centre,V(physMoverPos),physSolved.serial,hp::v::length(vis.rot)*180.f/hp::pi,hs->lagM,f.upm);
+                    else if(mem.physGrab.grabbed)hp::noteGrabHook(unsigned(vr),mem.physGrab,false,{},{},{},{},{},{},0,0.f,0.f,f.upm);
+                    const A::Vec3 o{vis.offset[0],vis.offset[1],vis.offset[2]};rotRad=hp::v::length(vis.rot);
+                    if(rotRad>0.f){ // turn about this frame's body centre: d' = d + o + (R - I)(d - B), the axes R a, R b, R c
+                        const hp::V3 dd=hp::v::sub(V(job.target.d),centre),rd=hp::v::rotate(vis.rot,dd);
+                        const auto R=[&](A::Vec3 x){const hp::V3 y=hp::v::rotate(vis.rot,V(x));return A::Vec3{y[0],y[1],y[2]};};
+                        job.target.a=R(job.target.a);job.target.b=R(job.target.b);job.target.c=R(job.target.c);
+                        job.target.d=job.target.d+A::Vec3{rd[0]-dd[0],rd[1]-dd[1],rd[2]-dd[2]};}
+                    job.target.d=job.target.d+o;
+                    mem.physOffset=o;mem.physRotRad=rotRad;offsetM=A::Length(o)/upmS;
+                }else{mem.physOffset={};mem.physRotRad=0.f;mem.physVisual=hp::VisualMem{};}
+                physTouch=offsetM>.002f;
+                hp::noteHook(unsigned(vr),physClass,offsetM,rotRad);
+                if(physH0)physNs+=detail::now()-physH0;
+            }
             // LEFT hold (derived firearm or a hand-held item): the left animation does not grip it - the right hand's grip mirrored,
             // else a procedural grip (the index on the trigger of a firearm, curled round a knife / lasso / thrown item)
             if(have&&holding&&side==1&&c.fingers){
@@ -1618,7 +1816,9 @@ inline ApplyResult applyBody(const Rig& r,float* globals,unsigned char* locals,c
             const A::Vec3 rel=A::TransformPoint(A::InverseAffine(job.target),f.hand[std::size_t(vr)].gripPos);
             const A::Vec3 gp=A::TransformPoint(out.ik.hand,rel),wp=out.ik.hand.d;
             if(A::Finite(gp)&&A::Finite(wp)){box.ikDriven[std::size_t(vr)]=mem.weight>=1.f?1:0;box.grip[std::size_t(vr)]={gp.x,gp.y,gp.z};
-                box.wrist[std::size_t(vr)]={wp.x,wp.y,wp.z};box.clampCm[std::size_t(vr)]=clampCm;boxAny=true;}
+                box.wrist[std::size_t(vr)]={wp.x,wp.y,wp.z};box.clampCm[std::size_t(vr)]=clampCm;boxAny=true;
+                box.cls[std::size_t(vr)]=boxClass;box.touch[std::size_t(vr)]=physTouch?1:0;
+                box.tipLen[std::size_t(vr)]=physTipLen;box.offsetCm[std::size_t(vr)]=A::Length(mem.physOffset)*100.f/std::max(f.upm,1e-3f);box.trigger[std::size_t(vr)]=f.hand[std::size_t(vr)].trigger;}
         }
         if(live&&write&&vr==0&&f.hand[0].valid&&b.elbow>=0&&b.wrist>=0){ // The solved LEFT forearm relative to its controller grip
             const auto& h=f.hand[0];const A::Mat33 F=h.frame,Ft=A::Transpose(F);const float inv=1.f/std::max(f.upm,1e-3f);
@@ -1649,7 +1849,15 @@ inline ApplyResult applyBody(const Rig& r,float* globals,unsigned char* locals,c
             if(item&&A::Finite(at)){res.leftWeapon=item;res.leftAttachment=at;bump(st.itemAttach);}
         }
     }
-    if(boxAny){box.serial=serial;box.ns=now;box.referenceSpace=f.space;box.upm=f.upm;handBox.store(box);bump(handBoxPublished);}
+    if(boxAny){box.serial=serial;box.ns=now;box.referenceSpace=f.space;box.upm=f.upm;box.eye={f.eye.x,f.eye.y,f.eye.z};box.up={f.up.x,f.up.y,f.up.z};box.bridged=f.bridged?1:0;
+        handBox.store(box);bump(handBoxPublished);}
+    if(physMode!=hp::ModeOff){
+        const std::uint64_t physP0=detail::now();
+        if(physAny&&physMoverOk){physTargets.serial=serial;physTargets.ns=now;physTargets.actor=actor;
+            physTargets.moverPos={physMoverPos.x,physMoverPos.y,physMoverPos.z};physTargets.eye={f.eye.x,f.eye.y,f.eye.z};physTargets.up={upv.x,upv.y,upv.z};
+            physTargets.upm=f.upm;physTargets.bridged=f.bridged?1:0;physTargets.onFoot=hp::bodyOnFoot(gateOpen,mountedArm,seatMode,physThird)?1:0;
+            hp::targets.store(physTargets);hp::hookTargets.fetch_add(1,std::memory_order_relaxed);}
+        hp::noteHookNs(physNs+(detail::now()-physP0));}
     if(!write)bump(stats.dryFrames);
     // ---- holster sockets on the shown body ----
     if(c.sockets)publishSockets(r,g.data(),count,f,frameOk&&gateOpen,now,dt,reinterpret_cast<std::uintptr_t>(locals));
@@ -1712,7 +1920,19 @@ inline void ropeStep(std::uintptr_t actor,const Published& p,const float* global
     const unsigned drivenMask=(driven(1)?1u:0u)|(driven(0)?2u:0u);
     in.heldRaw=(rn::holds(0u)?1u:0u)|(rn::holds(1u)?2u:0u);in.held=in.heldRaw&drivenMask;
     in.want=mountedArm&&config.reinsArm&&!config.dry&&rn::armsFollow(now)&&drivenMask!=0u;
-    rr::rope.step(in);
+    // every rein the player holds (a coach driver holds all of the vehicle's); each scan skips the others' reins; a second rope scans
+    // only beside the first; ropes[0] steps last (its stats = the report)
+    for(std::size_t i=rr::ropes.size();i-->0;){
+        if(i&&!rr::ropes[i].rein()&&!(in.want&&rr::ropes[0].rein()))continue;
+        std::size_t k=0;in.skip={};
+        for(std::size_t j=0;j<rr::ropes.size();++j)if(j!=i&&rr::ropes[j].rein()&&k<in.skip.size())in.skip[k++]=rr::ropes[j].rein();
+        rr::ropes[i].step(in);}
+    // HAND LOG (reins.handLog kind 7): every change of the tracked rope's mode or of the VR hands holding it - the rope can leave a
+    // VR fist that still steers (x = native * 10 + current mode, hand = the held bits)
+    {static int lastCur=-9,lastNat=-9;static unsigned lastHeld=99u;const int cur=rr::stats.modeCurrent.load(std::memory_order_relaxed),
+        nat=rr::stats.modeNative.load(std::memory_order_relaxed);
+     if(cur!=lastCur||nat!=lastNat||in.held!=lastHeld){lastCur=cur;lastNat=nat;lastHeld=in.held;
+        rn::ropeLog.push(now,7,in.held,0.f,0.f,0.f,in.want,0u,float(nat*10+cur));}}
 }
 // this frame's LOCAL -> world map (VrMotionBodyLink.h: the one the arms were just placed with) and - with debug.rdrvr.mvbody 1 -
 // John's AppSW parts in world: the pose applyBody just wrote (head lock, seat, ride steady, IK'd arms); <10 parts = the map only.
@@ -1747,7 +1967,7 @@ inline void beforeAttachments(std::uintptr_t actor,bool postPhys=true) noexcept 
     if(!published.load(p)||p.actor!=actor||!p.rig||p.rig->generation!=p.generation||p.rig->data!=p.data)return;
     const bool bodyOn=::rdrvr::vr::settings().body()||ik.arm[0].weight>0.f||ik.arm[1].weight>0.f||ik.yawWeight>0.f||ik.acc!=0.f||
         ::rdrvr::vr::seat::state.weight>0.f; // SEAT: BODY off ramps the seat hold out too
-    if(!bodyOn&&!(postPhys&&::rdrvr::vr::reinrope::overriding()))return; // BODY off still puts an overridden rope mode back
+    if(!bodyOn&&!(postPhys&&::rdrvr::vr::reinrope::anyOverriding()))return; // BODY off still puts an overridden rope mode back
     if(busy.exchange(true,std::memory_order_acquire)){bump(stats.busy);return;}
     struct Release{~Release(){busy.store(false,std::memory_order_release);}} release;
     float* globals{};unsigned char* locals{};A::Mat34 root{};
@@ -1770,7 +1990,7 @@ inline void beforeAttachments(std::uintptr_t actor,bool postPhys=true) noexcept 
     { // The head lock only under the BODY camera (HEAD camera = the head bone itself: a lock would chase its own view)
         using namespace ::rdrvr::vr;const auto s=settings();
         f.cameraBody=s.bodyCamera()&&enabled(Feature::Camera);f.eyeUp=s.bodyEyeUpMeters();f.eyeBack=s.bodyBackMeters();}
-    const auto res=applyBody(*p.rig,globals,locals,root,int(p.count),f,frameOk,gateOpen,t0,serial,config,mountedArm,seatMode);
+    const auto res=applyBody(*p.rig,globals,locals,root,int(p.count),f,frameOk,gateOpen,t0,serial,config,mountedArm,seatMode,actor);
     scope.nativeWeapon=res.nativeWeapon;scope.leftWeapon=res.leftWeapon;scope.leftAttachment=res.leftAttachment;
     if(frameOk&&::rdrvr::vr::bodylink::wanted())publishMotionParts(*p.rig,globals,int(p.count),root,f,serial,t0); // AppSW
     ik.saved.skel=p.skel;
@@ -1906,7 +2126,8 @@ RDRVR_BODY_NOINLINE inline std::uint64_t matrixSetHook(void* set,const void* pre
     bool locked=false; // bounded: only two skin tasks of the PLAYER skeleton can meet here
     for(int spin=0;spin<200;++spin){if(!collapseLock.exchange(true,std::memory_order_acquire)){locked=true;break;}std::this_thread::yield();}
     if(!locked){bump(stats.headContended);return original(set,previous,skeleton,a,b);}
-    struct Release{~Release(){collapseLock.store(false,std::memory_order_release);}} release;
+    collapseEpoch.fetch_add(1,std::memory_order_acq_rel); // odd: the globals may be collapsed until Release
+    struct Release{~Release(){collapseEpoch.fetch_add(1,std::memory_order_release);collapseLock.store(false,std::memory_order_release);}} release;
     Published p{};bool ok=published.load(p)&&p.collapse&&p.skel==s&&p.rig&&p.rig->generation==p.generation;
     float* globals{};
     if(ok){ok=detail::raw<std::uintptr_t>(s+off::skelData)==p.data&&detail::raw<std::uint32_t>(s+off::skelCount)==p.count;
@@ -2007,17 +2228,19 @@ inline std::string report() {
     std::snprintf(b,sizeof b,"{\"enabled\":%s,\"menu\":\"%s\",\"installed\":%s,\"installState\":\"%s\",\"visible\":%s,\"hidesHands\":%s,"
         "\"hooks\":{\"attach\":\"GOT 0x2e33718 pre\",\"ik\":\"GOT 0x2e33510 post\",\"matrixSet\":\"GOT 0x2e22ad0 task\"},"
         "\"config\":{\"head\":%s,\"headRoot\":\"%s\",\"yaw\":%s,\"arms\":%s,\"fingers\":%s,\"reassert\":%s,\"clavicle\":%s,\"derive\":%s,\"dry\":%s,"
-        "\"stretchCm\":%.1f,\"yawTauMs\":%.0f,\"yawMaxDeg\":%.0f,\"wristCm\":[%.1f,%.1f],\"elbow\":[%.2f,%.2f,%.2f,%.2f],\"roll\":%.2f,\"clavicleDeg\":%.1f},",
+        "\"stretchCm\":%.1f,\"yawTauMs\":%.0f,\"yawMaxDeg\":%.0f,\"wristCm\":[%.1f,%.1f],\"elbow\":[%.2f,%.2f,%.2f,%.2f],\"roll\":%.2f,\"clavicleDeg\":%.1f,\"navLock\":%s},",
         killed(Feature::Body)?"false":"true",settings().body()?"ON":"OFF",installed.load()?"true":"false",installState.load(),bodyVisible()?"true":"false",
         status::bodyHidesHands.load()?"true":"false",c.head?"true":"false",c.headRoot==HeadRoot::Neck?"NECK":"HEAD",c.yaw?"true":"false",c.arms?"true":"false",
         c.fingers?"true":"false",c.reassert?"true":"false",c.clavicle?"true":"false",c.derive?"true":"false",c.dry?"true":"false",double(c.stretchCm),
         double(c.yawTauMs),double(c.yawMaxDeg),double(c.wristBack*100.f),double(c.wristDepth*100.f),double(c.elbowOut),double(c.elbowDown),double(c.elbowBack),
-        double(c.elbowWrist),double(c.rollShare),double(c.clavicleDeg));out+=b;
+        double(c.elbowWrist),double(c.rollShare),double(c.clavicleDeg),c.navLock?"true":"false");out+=b;
     std::snprintf(b,sizeof b,"\"gate\":{\"state\":\"%s\",\"published\":%s,\"ageMs\":%.1f,\"byGate\":{",gateNames[g<GateCount?g:0],havePub?"true":"false",
         havePub&&p.ns?double(::rdrvr::vr::nowNs()-p.ns)/1e6:-1.0);out+=b;
     {bool first=true;for(unsigned i=0;i<GateCount;++i){const auto n=stats.gates[i].load();if(!n)continue;
         std::snprintf(b,sizeof b,"%s\"%s\":%llu",first?"":",",gateNames[i],(unsigned long long)n);out+=b;first=false;}}
-    std::snprintf(b,sizeof b,"}},\"bones\":{\"state\":\"%s\",\"resolves\":%llu,\"failures\":%llu,\"count\":%d,\"depthFirst\":%s,\"indexOrder\":%s,\"head\":%d,\"neck\":%d,"
+    std::snprintf(b,sizeof b,"}},\"lockBits\":{\"input\":%u,\"move\":%u,\"lock1\":%u,\"lock2\":%u,\"gait\":%d},",lockBits.input.load(),lockBits.move.load(),
+        lockBits.lock1.load(),lockBits.lock2.load(),lockBits.gait.load());out+=b;
+    std::snprintf(b,sizeof b,"\"bones\":{\"state\":\"%s\",\"resolves\":%llu,\"failures\":%llu,\"count\":%d,\"depthFirst\":%s,\"indexOrder\":%s,\"head\":%d,\"neck\":%d,"
         "\"headEnd\":%d,\"neckEnd\":%d,\"firstBad\":[%d,%d],\"collapse\":[%d,%d,%d],\"right\":",r?r->state:"NONE",(unsigned long long)stats.rigResolves.load(),
         (unsigned long long)stats.rigFailures.load(),r?r->count:0,r&&r->bones.depthFirst?"true":"false",r&&r->bones.indexOrder?"true":"false",
         r?r->bones.head:-1,r?r->bones.neck:-1,r?r->bones.headEnd:-1,r?r->bones.neckEnd:-1,r?r->bones.firstBad:-1,r?r->bones.firstBadParent:-2,r?r->collapseFirst:-1,r?r->collapseEnd:-1,r?r->collapsePivot:-1);out+=b;
@@ -2034,7 +2257,7 @@ inline std::string report() {
             "\"none\":%llu},\"clamped\":%llu,\"clampCmMax\":%.1f,\"lastClampCm\":%.1f,\"stretched\":%llu,\"stretchCmMax\":%.1f,\"clavicle\":%llu,\"clavicleDegMax\":%.1f,"
             "\"targetErrMmMax\":%.2f,\"twistDeg\":%.1f,\"fingers\":%llu,\"poseFailed\":%llu,\"drift\":{\"frames\":%llu,\"over1cm\":%llu,\"cmMax\":%.2f,\"degMax\":%.1f,"
             "\"lastCm\":%.2f,\"reasserted\":%llu},\"hold\":{\"mirror\":%llu,\"grip\":%llu,\"itemAttach\":%llu},"
-            "\"mounted\":{\"none\":%llu,\"hold\":%llu,\"holdExpired\":%llu,\"blendOut\":%llu,\"fades\":%llu,\"fadeFrames\":%llu}}",s?",":"",s?"LEFT":"RIGHT",
+            "\"mounted\":{\"none\":%llu,\"hold\":%llu,\"holdExpired\":%llu,\"blendOut\":%llu,\"fades\":%llu,\"fadeFrames\":%llu},\"armJumps\":%llu}",s?",":"",s?"LEFT":"RIGHT",
             double(a.weight.load()),(unsigned long long)a.applied.load(),
             (unsigned long long)a.derived.load(),(unsigned long long)a.support.load(),(unsigned long long)a.free.load(),(unsigned long long)a.nativeHold.load(),
             (unsigned long long)a.noTarget.load(),(unsigned long long)a.clamped.load(),double(a.clampCmMax.load()),double(a.lastClampCm.load()),
@@ -2044,7 +2267,7 @@ inline std::string report() {
             double(a.lastDriftCm.load()),(unsigned long long)a.reasserted.load(),(unsigned long long)a.holdMirror.load(),
             (unsigned long long)a.holdGrip.load(),(unsigned long long)a.itemAttach.load(),(unsigned long long)a.mountNone.load(),
             (unsigned long long)a.mountHold.load(),(unsigned long long)a.mountHoldExpired.load(),(unsigned long long)a.mountBlendOut.load(),
-            (unsigned long long)a.mountFades.load(),(unsigned long long)a.mountFadeFrames.load());out+=b;}
+            (unsigned long long)a.mountFades.load(),(unsigned long long)a.mountFadeFrames.load(),(unsigned long long)a.armJumps.load());out+=b;}
     std::snprintf(b,sizeof b,"],\"weapon\":{\"derivedSideMismatch\":%llu,\"fingerMirror\":%s,\"leftMirror\":%s,\"support\":[%.0f,%.0f,%.1f]},"
         "\"engineIk\":{\"calls\":%llu,\"otherLR\":%llu},"
         "\"yaw\":{\"applied\":%llu,\"undo\":%llu,\"sticky\":%llu,\"weight\":%.2f,\"lastDeg\":%.1f,\"maxDeg\":%.1f},"
@@ -2123,6 +2346,9 @@ inline std::string report() {
         (unsigned long long)steady::horseSelects.load(),(unsigned long long)steady::horseSelectFails.load(),steady::horseLegSegs.load(),steady::horseNeckSegs.load(),
         (unsigned long long)steady::horsePartFrames.load(),(unsigned long long)steady::horsePartDrops.load());out+=sb;}
     const auto avg=[](const Counter& s,const Counter& n){const auto k=n.load();return k?double(s.load())/double(k)/1000.0:0.0;};
+    out+="\"headShow\":";out+=::rdrvr::vr::headshow::report(detail::now()); // HEAD SHOW (VrHeadShow.h)
+    std::snprintf(b,sizeof b,",\"headShowReads\":[%llu,%llu,%llu],",(unsigned long long)stats.headShowReads.load(),(unsigned long long)stats.headShowReadFails.load(),
+        (unsigned long long)stats.headShowCollapsed.load());out+=b;
     std::snprintf(b,sizeof b,"\"timing\":{\"aUsAvg\":%.1f,\"aUsMax\":%.1f,\"bUsAvg\":%.1f,\"bUsMax\":%.1f,\"cUsAvg\":%.1f,\"cUsMax\":%.1f,\"tickUsAvg\":%.1f,"
         "\"tickUsMax\":%.1f},\"exceptions\":%llu}",avg(stats.aNsSum,stats.aCount),double(stats.aUsMax.load()),avg(stats.bNsSum,stats.bCount),
         double(stats.bUsMax.load()),avg(stats.cNsSum,stats.cCount),double(stats.cUsMax.load()),avg(stats.tickNsSum,stats.ticks),double(stats.tickUsMax.load()),

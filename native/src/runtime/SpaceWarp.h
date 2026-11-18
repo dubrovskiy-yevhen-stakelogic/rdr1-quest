@@ -66,6 +66,8 @@
 //     vectors against the PICTURE: each pixel's surface, moved back by the dumped MV, must land on the previous pair's depth
 //     (actor vectors vs camera-only on the actor pixels, camera vectors on the rest).
 //   * debug.rdrvr.spacewarp.actorpad=<0|1> actor cylinder widening: 0 = half a root step [default], 1 = a full step
+//   * debug.rdrvr.spacewarp.actorturn=<deg> an NPC / animal / horse block whose root turns more within one pair keeps camera vectors
+//     [45; 0 = no limit] (SpaceWarpActors.h ActorTurn)
 //     (SpaceWarpActors.h buildActorBlock padSteps). Re-read at 1 Hz. Report: spaceWarp.gpu.actors.pad.
 // Per-bone motion (SpaceWarpBones.h): parts of <= 8 near actors after the actor array of each eye's
 // block (two vkCmdUpdateBuffer per eye: header + actors, then the parts at gpuBoneOffset; eye stride 16384 B); the actor rect is
@@ -105,6 +107,7 @@ struct SpaceWarpFrame {
     spacewarp::ActorSet actors{};                       // Newest main-thread actor matrices at record time
     std::array<spacewarp::SpaceWarpHand,2> hands{};     // The VR hands / held weapon (engine world grip poses at record time)
     bool riding{};                                      // The player rides (vr::reins::ridingFresh): the mount moves with the camera rig
+    bool seat{};                                        // ... in a vehicle seat: the coach box around the eyes moves with the rig (race -4)
 };
 // StereoCaptureSlot -> StereoMailbox::capture: per-eye depth written by commands queued before the
 // capture on the same queue, in `layout`.
@@ -236,8 +239,10 @@ private:
     // Dump triggers (XR thread, configure): a new non-zero value of the property bumps spacewarp::dumpRequests / dualRequests.
     int dumpProp_{},dualProp_{};bool propsSeen_{};
     std::atomic<int> actorPad_{0}; // debug.rdrvr.spacewarp.actorpad (0 half a root step, 1 a full step)
+    std::atomic<int> actorTurn_{int(spacewarp::defaultMaxTurnDeg)}; // debug.rdrvr.spacewarp.actorturn (deg, 0 = no limit)
 public:
     double actorPadSteps() const noexcept {return actorPad_.load(std::memory_order_relaxed)?1.0:0.5;}
+    double actorMaxTurnDeg() const noexcept {return double(actorTurn_.load(std::memory_order_relaxed));}
     std::atomic<int> dumpXr{};       // debug.rdrvr.spacewarp.dumpxr (read by SpaceWarp::screens at swapchain creation)
     void enableGuardForTest(bool on) noexcept {guardEnabled_.store(on?1:0,std::memory_order_relaxed);} // host GPU test (property-less)
 };
@@ -401,6 +406,8 @@ private:
     std::uint64_t actorPairs_{},actorsWritten_{},actorSameSerial_{},actorSkipUnmatched_{},actorSkipJump_{},actorSkipStill_{},actorSkipOffscreen_{},
         actorSkipMath_{},actorPairsOff_{};
     unsigned actorsMaxEye_{},actorsLastEye_[2]{};float actorMaxStepM_{};
+    // ragdoll / get-up actors and root yaw flips kept on camera vectors; the written blocks' largest turn, turn and step histograms
+    std::uint64_t actorSkipRagdoll_{},actorSkipTurn_{};float actorMaxAngleDeg_{};std::array<std::uint64_t,6> actorAngleHist_{},actorStepHist_{};
     std::array<std::uint64_t,4> actorSerialDelta_{}; // Main-thread ticks between the snapshots of consecutive pairs: 0, 1, 2, 3+
     // Bone motion: behind / clipped rects, pinned standing actors, part counters (left eye), parts written (both eyes), the eye blocks
     // (heap, made with the actor buffer: 2 x 16.5 KB never on the render thread's stack)
@@ -547,6 +554,7 @@ inline void SpaceWarpControl::configure(unsigned menuMode,std::uint64_t now) noe
         dumpProp_=dumpP;dualProp_=dualP;propsSeen_=true;
         dumpXr.store(swdetail::intProperty("debug.rdrvr.spacewarp.dumpxr",0)!=0?1:0,std::memory_order_relaxed);
         actorPad_.store(swdetail::intProperty("debug.rdrvr.spacewarp.actorpad",0)!=0?1:0,std::memory_order_relaxed);
+        actorTurn_.store(std::clamp(swdetail::intProperty("debug.rdrvr.spacewarp.actorturn",int(spacewarp::defaultMaxTurnDeg)),0,180),std::memory_order_relaxed);
     }
     // No AppSW pair is produced while OFF: a dump requested now would fire much later - drop it (two relaxed atomics per frame)
     if(!active()){spacewarp::dumpTaken.store(spacewarp::dumpRequests.load(std::memory_order_relaxed),std::memory_order_relaxed);
@@ -823,7 +831,8 @@ inline void SpaceWarp::prepareActorPair(const SpaceWarpFrame& cur,const SpaceWar
     }
     // the player body (+ the hands as its parts)
     spacewarp::M4 mc=spacewarp::identity();mc[12]=eye[0];mc[13]=eye[1]-1.5*upm;mc[14]=eye[2];
-    spacewarp::ActorPose pc{},pp{};pc.guid=pp.guid=sw::playerGuid;pc.race=pp.race=-2;
+    // a vehicle seat (both frames): the wide seat shape (race -4) - the coach rides the rig like the horse under the eyes
+    spacewarp::ActorPose pc{},pp{};pc.guid=pp.guid=sw::playerGuid;pc.race=pp.race=cur.seat&&prev.seat?-4:-2;
     if(!store(mc,pc.m)||!store(spacewarp::mul(A,mc),pp.m))return;
     // after the scanned actors' parts (a full set gives up its last entry, never `avoid`: that actor keeps its root)
     const auto add=[](spacewarp::BoneSet& s,std::uint64_t serial,const spacewarp::ActorBones& b,int avoid=-1){
@@ -873,8 +882,10 @@ inline unsigned SpaceWarp::buildActors(const SpaceWarpFrame& cur,const SpaceWarp
     spacewarp::ActorStats st{};const spacewarp::ActorSet* ca=&pairSets_[0];const spacewarp::ActorSet* pa=&pairSets_[1];
     const spacewarp::BoneSet* cb=boneSets_&&(*boneSets_)[0].count?&(*boneSets_)[0]:nullptr;const spacewarp::BoneSet* pb=boneSets_&&(*boneSets_)[1].count?&(*boneSets_)[1]:nullptr;
     const unsigned n=spacewarp::buildActorBlock({cur.relClip[e].data(),cur.position[e].data(),ca,cb},{prev.relClip[e].data(),prev.position[e].data(),pa,pb},
-        cur.unitsPerMetre,e==0,out,st,trace,spaceWarpControl.actorPadSteps(),boneCache_.get());
+        cur.unitsPerMetre,e==0,out,st,trace,spaceWarpControl.actorPadSteps(),boneCache_.get(),spaceWarpControl.actorMaxTurnDeg());
     actorSkipUnmatched_+=st.unmatched;actorSkipJump_+=st.jump;actorSkipStill_+=st.still;actorSkipOffscreen_+=st.offscreen;actorSkipMath_+=st.math;
+    actorSkipRagdoll_+=st.ragdoll;actorSkipTurn_+=st.turn;actorMaxAngleDeg_=std::max(actorMaxAngleDeg_,st.maxAngleDeg);
+    for(unsigned i=0;i<6;++i){actorAngleHist_[i]+=st.angleHist[i];actorStepHist_[i]+=st.stepHist[i];}
     actorMaxStepM_=std::max(actorMaxStepM_,st.maxStepM);
     actorSkipBehind_+=st.behind;actorClipped_+=st.clipped;actorStillPinned_+=st.stillPinned;
     boneActors_+=st.bones.actors;boneParts_+=st.bones.parts;boneUnmatched_+=st.bones.unmatched;boneJump_+=st.bones.jump;boneOverflow_+=st.bones.overflow;
@@ -1509,6 +1520,9 @@ inline std::string SpaceWarp::report() const {
      <<",\"maxPerEye\":"<<actorsMaxEye_<<",\"lastPerEye\":["<<actorsLastEye_[0]<<','<<actorsLastEye_[1]<<"],\"sameSerial\":"<<actorSameSerial_
      <<",\"skipUnmatched\":"<<actorSkipUnmatched_<<",\"skipJump\":"<<actorSkipJump_<<",\"skipStill\":"<<actorSkipStill_
      <<",\"skipOffscreen\":"<<actorSkipOffscreen_<<",\"skipMath\":"<<actorSkipMath_<<",\"maxStepM\":"<<actorMaxStepM_
+     <<",\"skipRagdoll\":"<<actorSkipRagdoll_<<",\"skipTurn\":"<<actorSkipTurn_<<",\"maxTurnDeg\":"<<spaceWarpControl.actorMaxTurnDeg()<<",\"maxAngleDeg\":"<<actorMaxAngleDeg_
+     <<",\"angleHist\":["<<actorAngleHist_[0]<<','<<actorAngleHist_[1]<<','<<actorAngleHist_[2]<<','<<actorAngleHist_[3]<<','<<actorAngleHist_[4]<<','<<actorAngleHist_[5]<<']'
+     <<",\"stepHist\":["<<actorStepHist_[0]<<','<<actorStepHist_[1]<<','<<actorStepHist_[2]<<','<<actorStepHist_[3]<<','<<actorStepHist_[4]<<','<<actorStepHist_[5]<<']'
      <<",\"serialDelta\":["<<actorSerialDelta_[0]<<','<<actorSerialDelta_[1]<<','<<actorSerialDelta_[2]<<','<<actorSerialDelta_[3]<<']'
      <<",\"pad\":"<<spaceWarpControl.actorPadSteps() // Cylinder widening in root steps (debug.rdrvr.spacewarp.actorpad)
      <<",\"skipBehind\":"<<actorSkipBehind_<<",\"clipped\":"<<actorClipped_<<",\"stillPinned\":"<<actorStillPinned_

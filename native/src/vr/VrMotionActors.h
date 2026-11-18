@@ -20,6 +20,17 @@
 // Body motion vectors (VrMotionBodyLink.h, props re-read here at 1 Hz, both default 0): every published set carries VrBody hook A's rig map of the
 // frame (ActorSet::rig) and, with debug.rdrvr.mvbody 1, John's parts (guid playerBodyGuid); with debug.rdrvr.vr.riding.horseparts 1 the
 // mount's chain parts. Report vr.mvactors.mvBody.
+// RAGDOLL gate (debug.rdrvr.mvactors.ragdoll 1 [default] / 0, hold debug.rdrvr.mvactors.ragdollhold ms [500], fall window
+// debug.rdrvr.mvactors.ragdollwin ms [3000], 0 = the whole ragdoll): an actor whose mover is the sim mover (vtable =
+// vr::camera::moverSimVtable, verified by TraceEntry) with its ragdoll word +0xb8c set is published with ActorPose::skip (SpaceWarpActors.h
+// ActorRagdoll: camera-only vectors) for the fall window from the word's set, then only within the hold of a root turn over 20 degrees or a
+// step over 1 m in one tick, and for the hold after the word clears. HandleHasDied sets the word with no clear of its own, so a corpse or a
+// hogtied body is a ragdoll for as long as it lies or is carried: past the window it keeps its own vectors (a body carried on a horse moves
+// with it), the turn guard (ActorTurn) still catches a flip. While ragdoll the root matrix this module reads
+// (the mover's own, mover +0x40) is rebuilt every physics update from the falling body (mvrMoverSimComponent::PerformPhysicalUpdate
+// 0x2892d58 -> mvrMoverInst::Teleport 0x288c1a4: b = up, c = +-the body's flattened c by the sign of its b.y): its yaw flips by up to 180
+// degrees in one tick. One 4-byte read per sim mover joins the tick's vector read; the mover's vtable is read at the rescan.
+// Report vr.mvactors.ragdoll (episodes, big root moves outside them).
 #include "VrMainThread.h"
 #include "VrLassoLink.h"
 #include "runtime/SpaceWarpActors.h"
@@ -36,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
@@ -46,10 +58,12 @@ namespace sw=::rdrvr::runtime::spacewarp;
 using ReadFn=bool(*)(void*,std::uintptr_t,void*,std::size_t);
 struct Env {ReadFn read{};std::uintptr_t actorManager{},actorSlots{};
     std::uintptr_t entityVtable{},instSkeletonFn{}; // The skeleton chain words (0: no per-bone vectors, roots only)
+    const std::atomic<std::uintptr_t>* moverSimWord{}; // vr::camera::moverSimVtable (0 inside: unverified, no ragdoll gate)
     explicit operator bool() const noexcept {return read&&actorManager&&actorSlots;}};
 inline Env env{};
 namespace off {
 inline constexpr std::size_t actorGuid=0x8,actorComponent=0xb0,actorFlags=0x118,actorHead=0x120,compMatrix=0x18,compRace=0xa30,matrixPos=0x30,matrixSize=0x40;
+inline constexpr std::size_t actorMover=0x88,moverRagdoll=0xb8c; // mvrMoverSimComponent::BecomeRagdoll 0x2892ecc / HandleHasDied set +0xb8c, ExitSimulated clears it
 }
 inline constexpr unsigned maxSlots=1024,maxScan=256;
 inline constexpr float rangeM=80.f;
@@ -68,6 +82,7 @@ struct Stats {
 inline Stats stats{};
 inline std::atomic<const char*> installState{"NOT ATTEMPTED"};
 inline std::atomic<int> enabledProp{1},playerProp{0},movingProp{0}; // movingProp = debug.rdrvr.mvactors.moving
+inline std::atomic<int> ragdollProp{1},ragdollHoldMs{500},ragdollWinMs{3000}; // debug.rdrvr.mvactors.ragdoll / .ragdollhold / .ragdollwin
 inline bool measuring() noexcept {return ::rdrvr::runtime::measurementPack.load(std::memory_order_relaxed)!=0;}
 
 namespace detail {
@@ -90,16 +105,18 @@ inline bool vread(diagnostics::ReadSegment* s,unsigned n,int fill) noexcept { //
 inline void maxOf(std::atomic<std::uint64_t>& a,std::uint64_t v) noexcept {auto c=a.load(std::memory_order_relaxed);while(v>c&&!a.compare_exchange_weak(c,v,std::memory_order_relaxed)){}}
 } // namespace detail
 
-struct Cached {std::uint32_t guid{},slot{};std::int32_t race{-1};std::uintptr_t matrix{};std::uintptr_t actor{};float pos[3]{};bool havePos{};}; // pos = last root position (bone selection)
+struct Cached {std::uint32_t guid{},slot{};std::int32_t race{-1};std::uintptr_t matrix{};std::uintptr_t actor{};float pos[3]{};bool havePos{};
+    std::uintptr_t mover{};bool simMover{};}; // pos = last root position (bone selection); mover = actor +0x88, simMover = its vtable is the sim mover's
 struct Scratch {
     std::array<unsigned char,maxSlots*16> slots{};
     std::array<unsigned char,maxScan*off::actorHead> heads{};
-    std::array<diagnostics::ReadSegment,maxScan*2> segs{};
-    std::array<std::uintptr_t,maxScan> actor{},comp{},mtx{};std::array<std::uint32_t,maxScan> guid{},slot{};std::array<std::int32_t,maxScan> race{};
+    std::array<diagnostics::ReadSegment,maxScan*3> segs{};
+    std::array<std::uintptr_t,maxScan> actor{},comp{},mtx{},mover{},moverVt{};std::array<std::uint32_t,maxScan> guid{},slot{};std::array<std::int32_t,maxScan> race{};
     std::array<std::array<float,3>,maxScan> pos{};
     // per tick
     std::array<std::array<unsigned char,16>,sw::maxActors> entry{};std::array<std::array<float,16>,sw::maxActors> m{};
-    std::array<diagnostics::ReadSegment,sw::maxActors*2+mvbones::maxSegments> tickSegs{}; // 2 per actor + the bone reads
+    std::array<std::uint32_t,sw::maxActors> word{};std::array<int,sw::maxActors> wordSeg{}; // the ragdoll words of the sim movers
+    std::array<diagnostics::ReadSegment,sw::maxActors*3+mvbones::maxSegments> tickSegs{}; // 2 per actor + 1 per sim mover + the bone reads
 };
 inline Scratch scratch;            // main thread only
 inline sw::BoneSet boneScratch;    // This tick's parts (main thread only; ~10 KB, never on the stack)
@@ -121,6 +138,84 @@ inline void noteHistory(const sw::ActorPose& a,std::uint64_t tick) noexcept {
     if(h->bits==5u)stats.alternating.fetch_add(1,std::memory_order_relaxed);
 }
 
+// RAGDOLL: per guid (kept across rescans): the last root matrix and tick, the ragdoll word, the clock it cleared, the open episode.
+// An episode = one ragdoll stretch of an actor: its root's step / turn on the first tick, the largest while ragdoll, on the exit tick and
+// during the hold, the turns over 90 degrees, the first clean tick after the exit (step <= 0.1, turn <= 10 deg; ms after the exit).
+// Engine units are metres (the AppSW pair's unitsPerMetre 1).
+// Past the fall window: skipTicks / keptTicks = ragdoll ticks with camera vectors / their own vectors, lastUnstableMs = the last tick of a
+// turn over ragUnstableDeg or a step over ragUnstableStepM after the episode's start (ms, -1 none).
+struct RagEpisode {std::uint32_t guid{};std::int32_t race{-1};std::uint64_t startNs{},endNs{},exitNs{};std::uint32_t ticks{},flips{},skipTicks{},keptTicks{};
+    float enterStepM{-1.f},enterTurnDeg{-1.f},maxStepM{},maxTurnDeg{},exitStepM{-1.f},exitTurnDeg{-1.f},holdMaxStepM{},holdMaxTurnDeg{};std::int32_t firstCleanMs{-1},lastUnstableMs{-1};
+    bool open{},exited{};};
+struct RagTrack {std::uint32_t guid{};std::uint64_t seen{};float m[12]{};bool rag{};std::uint64_t exitNs{},ragNs{},unstableNs{};RagEpisode ep{};};
+inline constexpr float ragUnstableDeg=20.f,ragUnstableStepM=1.f;
+struct BigMove {std::uint32_t guid{};std::int32_t race{-1};float stepM{},turnDeg{};bool simMover{};std::uint32_t word{};std::int32_t msSinceExit{-1};std::uint64_t ns{};};
+struct RagStats {
+    std::atomic<std::uint64_t> ragdollTicks{},holdTicks{},enters{},exits{},readFails{},flips{},flipsRagdoll{},episodes{},bigMoves{};
+    std::atomic<std::uint64_t> keptTicks{},unstableTicks{}; // ragdoll ticks past the window with their own vectors; unstable ragdoll ticks
+    std::atomic<unsigned> simMovers{},otherMovers{};
+    std::atomic<float> maxStepM{},maxTurnDeg{},maxStepRagdollM{},maxTurnRagdollDeg{},maxStepHoldM{},maxTurnHoldDeg{};
+    std::atomic<const char*> gate{"NOT STARTED"};
+};
+inline RagStats ragStats{};
+inline std::array<RagTrack,48> ragTracks{};                       // main thread only
+inline std::mutex ragRingMutex;inline std::array<RagEpisode,16> ragRing{};inline unsigned ragRingNext{};
+inline std::array<BigMove,16> bigRing{};inline unsigned bigRingNext{};  // under ragRingMutex
+inline void maxF(std::atomic<float>& a,float v) noexcept {if(!std::isfinite(v))return;auto c=a.load(std::memory_order_relaxed);while(v>c&&!a.compare_exchange_weak(c,v,std::memory_order_relaxed)){}}
+// The root's step (engine units) and turn (degrees) between two matrices (rows a, b, c, d of 3).
+inline void rootMotion(const float* p,const float* c,float& stepM,float& turnDeg) noexcept {
+    const double dx=double(c[9])-p[9],dy=double(c[10])-p[10],dz=double(c[11])-p[11];stepM=float(std::sqrt(dx*dx+dy*dy+dz*dz));
+    double tr=0;for(int i=0;i<9;++i)tr+=double(p[i])*c[i]; // trace(Rp^T Rc) over the three rows
+    turnDeg=float(std::acos(std::clamp((tr-1.0)/2.0,-1.0,1.0))*57.29577951308232);
+}
+inline void closeEpisode(RagEpisode& e,std::uint64_t now) noexcept {
+    if(!e.open)return;e.endNs=now;e.open=false;ragStats.episodes.fetch_add(1,std::memory_order_relaxed);
+    std::lock_guard lock(ragRingMutex);ragRing[ragRingNext]=e;ragRingNext=(ragRingNext+1u)%unsigned(ragRing.size());}
+// One published actor of this tick: the skip it gets (0 none, 1 ragdoll, 2 the hold after it). word: the ragdoll word (known = read from a
+// sim mover); gate = the skip is applied (else only measured); winNs = the fall window (0: the whole ragdoll).
+inline std::uint8_t ragdollStep(std::uint32_t guid,std::int32_t race,const float* m,bool known,std::uint32_t word,bool simMover,bool gate,
+                                std::uint64_t tick,std::uint64_t now,std::uint64_t holdNs,std::uint64_t winNs=3'000'000'000ull) noexcept {
+    RagTrack* t=nullptr;RagTrack* oldest=&ragTracks[0];
+    for(auto& x:ragTracks){if(x.guid==guid&&x.seen){t=&x;break;}if(x.seen<oldest->seen)oldest=&x;}
+    bool havePrev=false;
+    if(!t){t=oldest;if(t->ep.open)closeEpisode(t->ep,now);*t=RagTrack{};t->guid=guid;}
+    else havePrev=t->seen+1==tick;
+    float step=-1.f,turn=-1.f;if(havePrev)rootMotion(t->m,m,step,turn);
+    std::memcpy(t->m,m,sizeof t->m);t->seen=tick;
+    const bool rag=known&&word!=0;auto& e=t->ep;
+    if(rag&&!t->rag){ragStats.enters.fetch_add(1,std::memory_order_relaxed);if(e.open)closeEpisode(e,now);
+        e=RagEpisode{};e.open=true;e.guid=guid;e.race=race;e.startNs=now;e.enterStepM=step;e.enterTurnDeg=turn;t->exitNs=0;t->ragNs=now?now:1;t->unstableNs=0;}
+    if(!rag&&t->rag){ragStats.exits.fetch_add(1,std::memory_order_relaxed);t->exitNs=now?now:1;
+        if(e.open){e.exited=true;e.exitNs=t->exitNs;e.exitStepM=step;e.exitTurnDeg=turn;}}
+    t->rag=rag;
+    const bool hold=!rag&&t->exitNs&&now>=t->exitNs&&now-t->exitNs<holdNs;
+    if(havePrev){
+        maxF(ragStats.maxStepM,step);maxF(ragStats.maxTurnDeg,turn);if(turn>90.f)ragStats.flips.fetch_add(1,std::memory_order_relaxed);
+        if(rag){maxF(ragStats.maxStepRagdollM,step);maxF(ragStats.maxTurnRagdollDeg,turn);
+            if(e.open){e.maxStepM=std::max(e.maxStepM,step);e.maxTurnDeg=std::max(e.maxTurnDeg,turn);if(turn>90.f)++e.flips;}
+            if(turn>90.f)ragStats.flipsRagdoll.fetch_add(1,std::memory_order_relaxed);}
+        else if(hold){maxF(ragStats.maxStepHoldM,step);maxF(ragStats.maxTurnHoldDeg,turn);
+            if(e.open){e.holdMaxStepM=std::max(e.holdMaxStepM,step);e.holdMaxTurnDeg=std::max(e.holdMaxTurnDeg,turn);}}
+        else if(step>.5f||turn>30.f){ragStats.bigMoves.fetch_add(1,std::memory_order_relaxed);
+            BigMove b{};b.guid=guid;b.race=race;b.stepM=step;b.turnDeg=turn;b.simMover=simMover;b.word=word;b.ns=now;
+            b.msSinceExit=t->exitNs&&now>=t->exitNs?std::int32_t(std::min<std::uint64_t>((now-t->exitNs)/1'000'000ull,1'000'000'000ull)):-1;
+            std::lock_guard lock(ragRingMutex);bigRing[bigRingNext]=b;bigRingNext=(bigRingNext+1u)%unsigned(bigRing.size());}}
+    // the fall window, then only around an unstable tick
+    bool fall=false;
+    if(rag){ragStats.ragdollTicks.fetch_add(1,std::memory_order_relaxed);if(e.open)++e.ticks;
+        if(havePrev&&(turn>ragUnstableDeg||step>ragUnstableStepM)){t->unstableNs=now?now:1;ragStats.unstableTicks.fetch_add(1,std::memory_order_relaxed);
+            if(e.open&&now>=e.startNs)e.lastUnstableMs=std::int32_t(std::min<std::uint64_t>((now-e.startNs)/1'000'000ull,1'000'000'000ull));}
+        const bool inWin=!winNs||(t->ragNs&&now>=t->ragNs&&now-t->ragNs<winNs);
+        const bool shaky=t->unstableNs&&now>=t->unstableNs&&now-t->unstableNs<holdNs;
+        fall=inWin||shaky;
+        if(!inWin&&e.open)++(fall?e.skipTicks:e.keptTicks);
+        if(!fall)ragStats.keptTicks.fetch_add(1,std::memory_order_relaxed);}
+    if(hold)ragStats.holdTicks.fetch_add(1,std::memory_order_relaxed);
+    if(e.open&&e.exited&&!rag&&!hold){ // after the hold: the first clean tick ends the episode (3 s at most)
+        if(havePrev&&step<=.1f&&turn<=10.f){e.firstCleanMs=std::int32_t((now-e.exitNs)/1'000'000ull);closeEpisode(e,now);}
+        else if(now>=e.exitNs&&now-e.exitNs>3'000'000'000ull)closeEpisode(e,now);}
+    return !gate?std::uint8_t(0):rag?std::uint8_t(fall?1:0):hold?std::uint8_t(2):std::uint8_t(0);
+}
 inline std::uint32_t playerGuid(std::uint64_t now) noexcept {
     lasso::PlayerLink pl{};
     return lasso::playerBox.load(pl)&&pl.valid&&now>=pl.ns&&now-pl.ns<500'000'000ull?pl.guid:0u;
@@ -144,12 +239,16 @@ inline void rescan(const float cam[3],std::uint64_t now) noexcept {
         const auto guid=detail::at<std::uint32_t>(h,off::actorGuid);const auto gen=detail::at<std::uint16_t>(B.slots.data(),std::size_t(i)*16+8);
         if((guid&0xffffu)!=i||(guid>>16)!=gen||(player&&guid==player)||(detail::at<std::uint32_t>(h,off::actorFlags)&1u))continue;
         const auto comp=detail::at<std::uintptr_t>(h,off::actorComponent);if(!comp)continue;
-        B.actor[q]=B.actor[k];B.slot[q]=i;B.guid[q]=guid;B.comp[q]=comp;++q;
+        B.actor[q]=B.actor[k];B.slot[q]=i;B.guid[q]=guid;B.comp[q]=comp;B.mover[q]=detail::at<std::uintptr_t>(h,off::actorMover);++q;
     }
-    // stage 2: matrix pointer + race
-    for(unsigned k=0;k<q;++k){B.mtx[k]=0;B.race[k]=-1;B.segs[2*k]={B.comp[k]+off::compMatrix,&B.mtx[k],sizeof(std::uintptr_t)};
+    // stage 2: matrix pointer + race (+ the mover's vtable: the ragdoll gate)
+    const std::uintptr_t simVt=env.moverSimWord?env.moverSimWord->load(std::memory_order_acquire):0;
+    unsigned nm=0;std::array<int,maxScan> vtSeg{};
+    for(unsigned k=0;k<q;++k){B.mtx[k]=0;B.race[k]=-1;B.moverVt[k]=0;B.segs[2*k]={B.comp[k]+off::compMatrix,&B.mtx[k],sizeof(std::uintptr_t)};
         B.segs[2*k+1]={B.comp[k]+off::compRace,&B.race[k],sizeof(std::int32_t)};}
-    detail::vread(B.segs.data(),2*q,0);
+    for(unsigned k=0;k<q;++k){vtSeg[k]=-1;if(simVt&&B.mover[k]){vtSeg[k]=int(2*q+nm);B.segs[2*q+nm]={B.mover[k],&B.moverVt[k],sizeof(std::uintptr_t)};++nm;}}
+    detail::vread(B.segs.data(),2*q+nm,0);
+    for(unsigned k=0;k<q;++k)if(vtSeg[k]>=0&&!B.segs[unsigned(vtSeg[k])].size)B.moverVt[k]=0;
     // stage 3: root positions
     unsigned w=0;std::array<unsigned,maxScan> live{};
     for(unsigned k=0;k<q;++k)if(B.segs[2*k].size&&B.mtx[k]){live[w]=k;B.segs[w]={B.mtx[k]+off::matrixPos,B.pos[k].data(),sizeof(float)*3};++w;}
@@ -173,9 +272,11 @@ inline void rescan(const float cam[3],std::uint64_t now) noexcept {
     }
     std::sort(nearList.begin(),nearList.begin()+nn,[preferMoving](const Near& x,const Near& y){
         return preferMoving&&x.moving!=y.moving?x.moving:x.d2<y.d2;});
-    const unsigned keep=std::min<unsigned>(nn,sw::maxActors);unsigned keptMoving=0;
-    for(unsigned t=0;t<keep;++t){const unsigned k=nearList[t].k;cache[t]={B.guid[k],B.slot[k],B.race[k],B.mtx[k],B.actor[k],{B.pos[k][0],B.pos[k][1],B.pos[k][2]},true};
-        keptMoving+=nearList[t].moving?1u:0u;}
+    const unsigned keep=std::min<unsigned>(nn,sw::maxActors);unsigned keptMoving=0,sims=0,others=0;
+    for(unsigned t=0;t<keep;++t){const unsigned k=nearList[t].k;cache[t]={B.guid[k],B.slot[k],B.race[k],B.mtx[k],B.actor[k],{B.pos[k][0],B.pos[k][1],B.pos[k][2]},true,
+        B.mover[k],simVt&&B.moverVt[k]==simVt};
+        keptMoving+=nearList[t].moving?1u:0u;sims+=cache[t].simMover?1u:0u;others+=cache[t].simMover?0u:1u;}
+    ragStats.simMovers.store(sims,std::memory_order_relaxed);ragStats.otherMovers.store(others,std::memory_order_relaxed);
     cacheCount=keep;stats.lastScanned.store(q,std::memory_order_relaxed);
     stats.scanInRange.store(nn,std::memory_order_relaxed);stats.scanMoving.store(moving,std::memory_order_relaxed);
     stats.movingKept.fetch_add(keptMoving,std::memory_order_relaxed);stats.movingDropped.fetch_add(moving-keptMoving,std::memory_order_relaxed);
@@ -212,6 +313,9 @@ inline void tick(const mainthread::Frame& f) noexcept {
         enabledProp.store(detail::intProperty("debug.rdrvr.mvactors",1),std::memory_order_relaxed);
         playerProp.store(detail::intProperty("debug.rdrvr.mvactors.player",0),std::memory_order_relaxed);
         movingProp.store(detail::intProperty("debug.rdrvr.mvactors.moving",0),std::memory_order_relaxed);
+        ragdollProp.store(detail::intProperty("debug.rdrvr.mvactors.ragdoll",1)!=0?1:0,std::memory_order_relaxed);
+        ragdollHoldMs.store(std::clamp(detail::intProperty("debug.rdrvr.mvactors.ragdollhold",500),0,5000),std::memory_order_relaxed);
+        ragdollWinMs.store(std::clamp(detail::intProperty("debug.rdrvr.mvactors.ragdollwin",3000),0,60000),std::memory_order_relaxed);
         mvbones::modeProp.store(std::clamp(detail::intProperty("debug.rdrvr.mvbones",0),0,3),std::memory_order_relaxed);
         namespace bl=::rdrvr::vr::bodylink; // Body motion vectors (VrMotionBodyLink.h): both OFF by default
         bl::bodyProp.store(detail::intProperty("debug.rdrvr.mvbody",0)!=0?1:0,std::memory_order_relaxed);
@@ -233,6 +337,10 @@ inline void tick(const mainthread::Frame& f) noexcept {
     unsigned n=0;
     for(unsigned i=0;i<cacheCount;++i){B.tickSegs[2*i]={slots+std::uintptr_t(cache[i].slot)*16,B.entry[i].data(),16};
         B.tickSegs[2*i+1]={cache[i].matrix,B.m[i].data(),off::matrixSize};n+=2;}
+    // RAGDOLL: one 4-byte word per sim mover in the same read
+    const bool simWords=env.moverSimWord&&env.moverSimWord->load(std::memory_order_relaxed)!=0;
+    for(unsigned i=0;i<cacheCount;++i){B.wordSeg[i]=-1;B.word[i]=0;
+        if(simWords&&cache[i].simMover&&cache[i].mover){B.wordSeg[i]=int(n);B.tickSegs[n++]={cache[i].mover+off::moverRagdoll,&B.word[i],sizeof(std::uint32_t)};}}
     // The bone reads of <= 8 planned actors join the same vector read
     const unsigned boneSeg=n;
     {std::array<mvbones::Candidate,sw::maxActors> cand{};
@@ -241,6 +349,10 @@ inline void tick(const mainthread::Frame& f) noexcept {
     if(!detail::vread(B.tickSegs.data(),n,0))stats.frameReadFails.fetch_add(1,std::memory_order_relaxed);
     stats.frameReads.fetch_add(1,std::memory_order_relaxed);
     sw::ActorSet set{};set.serial=++serial;const bool history=measuring(); // Change history = measurement-pack data
+    const bool gate=simWords&&ragdollProp.load(std::memory_order_relaxed)!=0;
+    ragStats.gate.store(!simWords?"NO WORDS":gate?"ON":"OFF",std::memory_order_relaxed);
+    const std::uint64_t holdNs=std::uint64_t(ragdollHoldMs.load(std::memory_order_relaxed))*1'000'000ull;
+    const std::uint64_t winNs=std::uint64_t(ragdollWinMs.load(std::memory_order_relaxed))*1'000'000ull;
     std::array<int,sw::maxActors> setIndex{};setIndex.fill(-1); // Cache index -> published index
     for(unsigned i=0;i<cacheCount;++i){
         if(!B.tickSegs[2*i].size||!B.tickSegs[2*i+1].size){stats.dropped.fetch_add(1,std::memory_order_relaxed);continue;}
@@ -254,6 +366,8 @@ inline void tick(const mainthread::Frame& f) noexcept {
         auto& a=set.actor[set.count++];a.guid=cache[i].guid;a.race=cache[i].race;
         for(int row=0;row<4;++row)for(int c=0;c<3;++c)a.m[row*3+c]=r[row*4+c];
         for(int c=0;c<3;++c)cache[i].pos[c]=a.m[9+c];cache[i].havePos=true; // The bone selection's distance / root motion
+        {const int ws=B.wordSeg[i];const bool known=ws>=0&&B.tickSegs[unsigned(ws)].size!=0;if(ws>=0&&!known)ragStats.readFails.fetch_add(1,std::memory_order_relaxed);
+         a.skip=ragdollStep(a.guid,a.race,a.m,known,known?B.word[i]:0u,cache[i].simMover,gate,set.serial,f.now,holdNs,winNs);}
         if(history)noteHistory(a,set.serial);
     }
     mvbones::finish(set,boneScratch,B.tickSegs.data()+boneSeg,setIndex.data(),f.now); // Parts of the planned actors
@@ -312,6 +426,27 @@ inline std::string report() {
         movingProp.load(),stats.scanInRange.load(),stats.scanMoving.load(),(unsigned long long)stats.movingKept.load(),(unsigned long long)stats.movingDropped.load());
     std::string out(b);if(!out.empty()&&out.back()=='}')out.pop_back();
     out+=",\"bones\":"+mvbones::report();
+    {const auto& R=ragStats;char m[1024];const auto L=[](const std::atomic<std::uint64_t>& x){return (unsigned long long)x.load(std::memory_order_relaxed);};
+     std::snprintf(m,sizeof m,",\"ragdoll\":{\"gate\":\"%s\",\"holdMs\":%d,\"winMs\":%d,\"keptActorTicks\":%llu,\"unstableActorTicks\":%llu,\"simMovers\":%u,\"otherMovers\":%u,\"readFails\":%llu,\"ragdollActorTicks\":%llu,"
+        "\"holdActorTicks\":%llu,\"enters\":%llu,\"exits\":%llu,\"episodes\":%llu,\"maxStepM\":%.3f,\"maxTurnDeg\":%.1f,\"maxStepRagdollM\":%.3f,\"maxTurnRagdollDeg\":%.1f,"
+        "\"maxStepHoldM\":%.3f,\"maxTurnHoldDeg\":%.1f,\"flips\":%llu,\"flipsRagdoll\":%llu,\"bigMoves\":%llu,\"ring\":[",R.gate.load(),ragdollHoldMs.load(),ragdollWinMs.load(),L(R.keptTicks),L(R.unstableTicks),R.simMovers.load(),
+        R.otherMovers.load(),L(R.readFails),L(R.ragdollTicks),L(R.holdTicks),L(R.enters),L(R.exits),L(R.episodes),double(R.maxStepM.load()),double(R.maxTurnDeg.load()),
+        double(R.maxStepRagdollM.load()),double(R.maxTurnRagdollDeg.load()),double(R.maxStepHoldM.load()),double(R.maxTurnHoldDeg.load()),L(R.flips),L(R.flipsRagdoll),L(R.bigMoves));out+=m;
+     std::array<RagEpisode,16> er{};std::array<BigMove,16> br{};unsigned en{},bn{};
+     {std::lock_guard lock(ragRingMutex);er=ragRing;en=ragRingNext;br=bigRing;bn=bigRingNext;}
+     const auto now=nowNs();bool first=true;
+     for(unsigned i=0;i<er.size();++i){const auto& e=er[(en+i)%er.size()];if(!e.guid)continue;
+        std::snprintf(m,sizeof m,"%s{\"guid\":%u,\"race\":%d,\"ageMs\":%.0f,\"durMs\":%.0f,\"ticks\":%u,\"enterStepM\":%.3f,\"enterTurnDeg\":%.1f,\"maxStepM\":%.3f,"
+            "\"maxTurnDeg\":%.1f,\"flips\":%u,\"exitStepM\":%.3f,\"exitTurnDeg\":%.1f,\"holdMaxStepM\":%.3f,\"holdMaxTurnDeg\":%.1f,\"firstCleanMsAfterExit\":%d,\"lastUnstableMs\":%d,"
+            "\"skipPastWin\":%u,\"keptPastWin\":%u}",
+            first?"":",",e.guid,e.race,now>=e.endNs?double(now-e.endNs)/1e6:-1.0,e.exitNs>=e.startNs&&e.exitNs?double(e.exitNs-e.startNs)/1e6:-1.0,e.ticks,
+            double(e.enterStepM),double(e.enterTurnDeg),double(e.maxStepM),double(e.maxTurnDeg),e.flips,double(e.exitStepM),double(e.exitTurnDeg),double(e.holdMaxStepM),
+            double(e.holdMaxTurnDeg),e.firstCleanMs,e.lastUnstableMs,e.skipTicks,e.keptTicks);out+=m;first=false;}
+     out+="],\"bigMoves\":[";first=true;
+     for(unsigned i=0;i<br.size();++i){const auto& b=br[(bn+i)%br.size()];if(!b.guid)continue;
+        std::snprintf(m,sizeof m,"%s{\"guid\":%u,\"race\":%d,\"stepM\":%.3f,\"turnDeg\":%.1f,\"simMover\":%s,\"word\":%u,\"msSinceExit\":%d,\"ageMs\":%.0f}",
+            first?"":",",b.guid,b.race,double(b.stepM),double(b.turnDeg),b.simMover?"true":"false",b.word,b.msSinceExit,now>=b.ns?double(now-b.ns)/1e6:-1.0);out+=m;first=false;}
+     out+="]}";}
     {namespace bl=::rdrvr::vr::bodylink;namespace sl=::rdrvr::vr::steadylink;char m[400]; // what the ticks attached (VrMotionBodyLink.h)
      std::snprintf(m,sizeof m,",\"mvBody\":{\"body\":%d,\"horseParts\":%d,\"mapsUsed\":%llu,\"bodiesUsed\":%llu,\"stale\":%llu,\"dropNpc\":%llu,\"horseUsed\":%llu,\"horseStale\":%llu}",
         bl::bodyProp.load(),bl::horseProp.load(),(unsigned long long)bl::mapsUsed.load(),(unsigned long long)bl::bodiesUsed.load(),(unsigned long long)bl::stale.load(),

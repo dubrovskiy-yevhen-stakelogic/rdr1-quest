@@ -29,10 +29,11 @@ int main(int argc,char** argv) {
     R::ControllerSample in{};in.sequence=1;in.epoch=in.continuity=in.referenceSpace=1;
     in.active=in.focused=true;
     std::uint64_t now=1'000'000'000ull;
+    std::uint8_t armMask=0; // SOFT RE-ARM: the policy's mask of inputs held across a scene-camera change
     auto tick=[&](int hand,float trigger,bool ready=true){
         now+=28'000'000;in.publishedNs=now;++in.sequence;
         in.triggers={};in.triggers[unsigned(hand)]=trigger;
-        R::PadState pad{};pad.ready=ready;
+        R::PadState pad{};pad.ready=ready;pad.armMask=armMask;
         brain.frame(&in,nullptr,true,now,pad);return pad;
     };
     // Sidearm/rifle/shotgun/sniper: hold through multiple polls, release, redraw
@@ -76,5 +77,31 @@ int main(int argc,char** argv) {
     H::currentSlot=H::SlotSniper;H::heldKind=H::kindSniper;H::holdHand=1;++H::holdGeneration;tick(1,0);
     for(int i=0;i<3;++i){p=tick(1,1);assert(p.triggers[1]==1&&(p.buttons&R::PadRightTrigger));tick(1,0);}
     H::sniperFreeFire=false;p=tick(1,1);assert(p.triggers[1]==0);tick(1,0);H::sniperFreeFire=true;
+    // SOFT RE-ARM: a squeeze carried across a scene-camera change (armMask) never fires, in Casual or Realistic, until it is released once;
+    // the first press after it fires on its edge frame. An empty hand's carried trigger is withheld too.
+    for(unsigned preset:{unsigned(V::PresetCasual),unsigned(V::PresetRealistic)}){
+        assert(V::vrSettings.applyWeaponPreset(preset));assert(V::vrSettings.set(V::Key::TwoHandFire,0));
+        H::hammerSinks=nullptr;H::rtGateSink=nullptr;H::cylinderPhaseSink=nullptr;H::fireBlockSink=nullptr;
+        H::currentSlot=H::SlotSidearm;H::heldKind=1;H::holdHand=1;++H::holdGeneration;armMask=0;tick(1,0);
+        const auto blockedBefore=H::armMaskBlocked.load();
+        armMask=R::armMaskTrigger(1);
+        for(int i=0;i<5;++i){p=tick(1,1);assert(p.triggers[1]==0&&!(p.buttons&R::PadRightTrigger));}
+        assert(H::armMaskBlocked.load()==blockedBefore+5);
+        armMask=R::armMaskTrigger(0); // the other hand's mask does not touch this gun
+        p=tick(1,0);assert(p.triggers[1]==0);
+        p=tick(1,1);assert(p.triggers[1]==1&&(p.buttons&R::PadRightTrigger));
+        armMask=0;tick(1,0);p=tick(1,1);assert(p.triggers[1]==1);tick(1,0);
+    }
+    H::holdHand=-1;++H::holdGeneration;H::emptyTriggerNative=true;armMask=R::armMaskTrigger(1);
+    p=tick(1,1);assert(p.triggers[1]==0&&!(p.buttons&R::PadRightTrigger));
+    armMask=0;tick(1,0);H::emptyTriggerNative=false;
+    // DUAL: the phantom hand's carried squeeze is no off-hand edge either; its first press after the release is
+    H::currentSlot=H::SlotSidearm;H::heldKind=1;H::holdHand=1;++H::holdGeneration;H::phantomHand=0;H::phantomSlot=H::SlotSidearm;++H::phantomGeneration;
+    tick(0,0);tick(0,0);
+    {const auto e0=H::offhandTriggerEdges.load();armMask=R::armMaskTrigger(0);
+     for(int i=0;i<4;++i)tick(0,1);assert(H::offhandTriggerEdges.load()==e0);
+     armMask=0;tick(0,1);assert(H::offhandTriggerEdges.load()==e0); // still the carried squeeze
+     tick(0,0);tick(0,1);assert(H::offhandTriggerEdges.load()==e0+1);tick(0,0);}
+    H::phantomHand=-1;H::phantomSlot=-1;++H::phantomGeneration;H::holdHand=-1;++H::holdGeneration;tick(1,0);
     std::cout<<"Casual held-trigger, redraw, transfer, preset switch and Realistic gate tests passed\n";
 }

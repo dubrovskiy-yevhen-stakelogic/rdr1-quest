@@ -1,6 +1,7 @@
 #pragma once
 // CLOTH GATE + CLOTH RING: two DIAGNOSTIC levers for the duplicated horse tail (a normal tail plus a second frozen, trembling
-// one, both eyes). OFF unless debug.rdrvr.cloth.hooks is 1 at boot: no hook, no ring proof, no property polling, so a normal run is native.
+// one, both eyes). Hooked at boot unless debug.rdrvr.cloth.hooks is 0; with HORSE > HORSE TAIL FIX OFF and no cloth property the wrapper
+// returns the native result unchanged (a few loads per cloth update call).
 // librdr 1.58 arm64. [V] = read in the binary.
 //  * Horse tail = rage::characterCloth. sagClothMgr::UpdateCloth @0x2a8ee50 does `bl ShouldUpdate @0x2a8eea8 (PLT 0x2caf320,
 //    JUMP_SLOT 0x2e5fff0); tbz w0,#0 -> 0x2a8f220` (only clears contacts) [V]. That is the only caller. False = no env-cloth and
@@ -19,12 +20,12 @@
 // LEVER 1, GOT wrapper on ShouldUpdate (installed from TraceEntry next to CREATURE LOD; FNV prints of ShouldUpdate, the
 //   UpdateCloth call site, the call word and the GOT word; any mismatch = no hook). Native result first, always. Only the
 //   audited return address 0x2a8eeac is ever changed. Runs on the cloth task threads: atomics + the fragInst translation only.
-//   debug.rdrvr.cloth.update  0 / unset = native (DEFAULT)
+//   debug.rdrvr.cloth.update  unset = the menu row HORSE > HORSE TAIL FIX (OFF = 0, ON = 1); 0 = native
 //                             1 = force true for kind 1 (character cloth) within debug.rdrvr.cloth.radius of the fresh MAIN camera
 //                                 (creaturelod::freshMainCam, published by the MAIN DrawBig, < 2 s old; none = native, noCam++)
 //                             2 = force true for every kind
 //   debug.rdrvr.cloth.radius  metres, default 40 (1..1000)
-//   debug.rdrvr.cloth.hooks   1 at boot = both levers available; anything else = nothing hooked, nothing polled
+//   debug.rdrvr.cloth.hooks   0 at boot = nothing hooked, nothing polled; unset / anything else = both levers available
 // LEVER 2, debug.rdrvr.cloth.ring N (unset = never touched; only "1" or "4"): writes sm_MultiBufferCount after its GOT word
 //   == base+0x2e7a400 and the SwapBuffers / Draw prints matched and the boot value was 4. 1 is STICKY until the game restarts:
 //   a cloth geometry double-buffered while count == 1 (EnableDoubleVertexBuffer @0x1b15548 creates slots 1..count-1 only) has
@@ -32,6 +33,7 @@
 //   So "4" after "1" is refused (ring.refused++); restart the game to restore.
 // Properties are re-read at most once per second from sceneBegin (render thread). Report graphics.clothGate / graphics.clothRing.
 #include "CreatureLod.h" // creaturelod::freshMainCam (MAIN camera position)
+#include "vr/VrSettings.h" // HORSE > HORSE TAIL FIX (the mode while debug.rdrvr.cloth.update is unset)
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -154,7 +156,8 @@ inline PropertyText propertyText{};inline std::atomic<std::uint32_t> propertyTex
 inline void readProperties() noexcept {
     PropertyText t{};property("debug.rdrvr.cloth.update",t.update,sizeof t.update);
     property("debug.rdrvr.cloth.radius",t.radius,sizeof t.radius);property("debug.rdrvr.cloth.ring",t.ring,sizeof t.ring);
-    int m=0;if(t.update[0]){char* e{};const long v=std::strtol(t.update,&e,10);if(e!=t.update&&!*e&&v>=0&&v<=2)m=int(v);else bump(rejected);}
+    int m=::rdrvr::vr::settings().horseTailFix()?1:0; // the menu row unless the property says otherwise
+    if(t.update[0]){char* e{};const long v=std::strtol(t.update,&e,10);if(e!=t.update&&!*e&&v>=0&&v<=2)m=int(v);else bump(rejected);}
     float r=40.f;if(t.radius[0]){char* e{};const float v=std::strtof(t.radius,&e);
         if(e!=t.radius&&!*e&&std::isfinite(v)&&v>=1.f&&v<=1000.f)r=v;else bump(rejected);}
     int ringWant=0;if(t.ring[0]){if(!std::strcmp(t.ring,"1"))ringWant=1;else if(!std::strcmp(t.ring,"4"))ringWant=4;else bump(rejected);}
@@ -202,7 +205,7 @@ inline void installRing(const Api& api) noexcept {
 inline int install(const Api& api) noexcept {
     if(!api.base||!api.read||!api.exec||!api.replace){installState.store("NO_API");ring.state.store("NO_API");return 0;}
     char hooksProp[16]{};property("debug.rdrvr.cloth.hooks",hooksProp,sizeof hooksProp);
-    if(!(hooksProp[0]=='1'&&!hooksProp[1])){installState.store("OFF");ring.state.store("OFF");return 0;}
+    if(hooksProp[0]=='0'&&!hooksProp[1]){installState.store("OFF");ring.state.store("OFF");return 0;}
     armed.store(true,std::memory_order_relaxed);
     installRing(api);
     if(hooked.load())return 1;

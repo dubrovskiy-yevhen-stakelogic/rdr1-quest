@@ -36,11 +36,14 @@
 #include "NativeDrawSuppression.h"
 #include "diagnostics/PerformanceProfile.h"
 #include "WorldReplayGate.h"
+#include "runtime/StereoBridge.h" // STEREO BRIDGE: shot runs, first pair of a presentation revision
 #include <map>
 #include "GameXr.h"
 #include "StereoReplay.h"
 #include "EyeDump.h" // eyeDumpAutoRequest (debug.rdrvr.eyedump.cutscene)
 #include "vr/VrControlMap.h" // BUTTONS: Touch button remap before the VrControls mapper
+#include "vr/VrCoachReins.h" // COACH REINS: the reins gestures on a coach driver's seat
+#include "vr/VrSeatSteady.h" // SEAT STEADY: the riding eye in a vehicle seat
 #include "StereoReplayInternal.h" // HANDS: trackedState / emitBoundState / replayPushLayout for the hands restore
 #include "vr/HandsPass.h"
 #include "vr/TaaPass.h"
@@ -90,11 +93,14 @@
 #include "vr/VrWeapon.h"     // WEAPON: weapon in the VR hand (pose / model / aim), report vr.weapon
 #include "vr/VrControls.h"   // Controls: Touch button layout, sprint/crouch/jump, fast jump counters
 #include "vr/VrMelee.h"      // MELEE: LOCAL -> world map provider (vrMeleeWorldMap)
+#include "vr/VrNpcAim.h"     // NPC AIM: barrel target of the AI aim-at report
+#include "vr/VrWheel.h"      // WHEEL: LB holds the game receives, the pad fallback of the wheel block
 #include "vr/VrDuelLink.h"   // DUEL ON LOOK: LT + Y on the physical buttons
 #include "vr/VrBody.h"       // BODY: frame provider (vrBodyFrame), body visible in the eyes, weapon pose reuse / native hold
 #include "vr/VrCutsceneSteady.h" // CUTSCENE PROPS / LIGHTS / SUN
 #include "vr/VrCutscene.h"   // CUTSCENES: stereo cutscenes (composer, engaged state, John facts, report vr.cutscene)
 #include "vr/VrArc.h"        // ARC: Context providers (anchor / map / raw input), engine probe binding, probe ledger, ModuleArc
+#include "vr/VrHandPhys.h" // HAND PHYSICS: ModuleHandPhys (the tick), liveMode / mvDrops for the AppSW hand parts
 #include "vr/VrThrowableTick.h" // THROWABLE: aim arc, pre-launch flight, projProjectile::Launch substitution (ModuleThrowable)
 #include "vr/VrTeleportLoco.h" // TELEPORT: stick route (mapMovement), controls / holsters neutral stick, colour-scale extension
 #include "vr/VrLasso.h"      // LASSO: face remap / minigame routing (controls), minigame focus (sticks, snap turn), marker flags
@@ -353,10 +359,20 @@ std::uint32_t worldSkipBit(const char* why) noexcept {
 }
 void recordWorldReject(const char* why){
     diagnostics::perfrec::skipMask.fetch_or(worldSkipBit(why),std::memory_order_relaxed);
+    runtime::bridge::shots.noteReject(why,diagnostics::monotonicNs()); // per-shot reject counts (inside a run and its exit window)
 #ifdef RDRVR_NATIVE_MENUS
     nativeUi.noteStereoVeto(why,diagnostics::monotonicNs()); // The veto of a presentation transition near this reject
 #endif
     std::lock_guard lock(worldRejectMutex);++worldRejectCounts[why];}
+// worldFailureHistory: the theater and stereo-cull waits are rows only within a second of a presentation change (menus would flood it).
+static bool nearPresentationChange() noexcept {
+#ifdef RDRVR_NATIVE_MENUS
+    const auto now=diagnostics::monotonicNs();const auto s=presentation.snapshot(now);
+    return s.changedNs&&now>=s.changedNs&&now-s.changedNs<1'000'000'000ull;
+#else
+    return false;
+#endif
+}
 struct RetailPassOwner {
     void* factory{};void* device{};bool poisoned{};
     std::unique_ptr<EngineEyeTargets> images;
@@ -1054,12 +1070,21 @@ bool holsterHead(std::uint64_t now,Pose& head){
 }
 void holsterPadFilter(void*,const runtime::ControllerSample* input,std::uint64_t now,runtime::PadState& state){
     holsterSettingsAndStatus();
-    const bool world=presentation.snapshot(now).world();
+    const auto presentationNow=presentation.snapshot(now);
+    const bool world=presentationNow.world();
     Pose head{};const bool haveHead=input&&world&&holsterHead(now,head);
     // TELEPORT: while TELEPORT owns the movement stick the holsters see it neutral (the fallback
     // body yaw must not turn while aiming); mapMovement ran first in this pad update.
     runtime::ControllerSample neutral{};
     vr::holsters::padFrame(vr::tploco::stickNeutralView(input,neutral),haveHead?&head:nullptr,world,now,state);
+    { // WHEEL: why LB could reach the game this update (vr.wheel.lb ring); LB off the pad in gameplay contexts while the wheel is blocked
+      // (its release in select state 4 would holster the VR-held item now that the wheel never sets player+0x43e)
+        namespace vw=vr::wheel;const bool holsters=vr::holsters::config().enabled;vw::holstersOn.store(holsters,std::memory_order_relaxed);
+        const int pres=int(presentationNow.context);vw::presentation.store(pres,std::memory_order_relaxed);
+        vw::padContext.store(!holsters?vw::CtxHolstersOff:!world?vw::CtxNotWorld:!input?vw::CtxNoInput:vw::CtxWorld,std::memory_order_relaxed);
+        if((state.buttons&runtime::PadLeftGrip)&&vw::dropsLb(vw::lever.load(std::memory_order_relaxed),holsters,pres,vr::lasso::ropeBusyFlag.load(std::memory_order_relaxed))){
+            state.buttons&=~runtime::PadLeftGrip;++(vw::hooked.load(std::memory_order_acquire)?vw::padTrack.dropsHooked:vw::padTrack.dropsUnhooked);}
+    }
     // Physical weapon hand / support grip changed: restart the attachment continuity.
     static std::uint32_t lastGeneration{};const auto generation=vr::holsters::attachmentGeneration.load(std::memory_order_relaxed);
     if(generation!=lastGeneration){lastGeneration=generation;controllerAttachment.reset();animatedAttachment.reset();scopedModelPose.reset();}
@@ -1084,15 +1109,18 @@ void controlsPadFilter(void*,const runtime::ControllerSample* input,std::uint64_
     if(!vc::controlsEnabled.load(std::memory_order_relaxed)){vr::loco::sprintRequest.store(false,std::memory_order_relaxed);
         vr::deadeye::gunInHand.store(false,std::memory_order_relaxed);if(satchelSelect)state.buttons|=runtime::PadSelect;return;} // No R3 mapping -> no SLOW-MO arm
     vc::MapIn in{};in.ready=state.ready&&input;in.buttons=state.buttons;in.now=now;
-    if(input){in.stickX=input->sticks[0];in.stickY=input->sticks[1];}
+    if(input){in.stickX=input->sticks[0];in.stickY=input->sticks[1];in.lookX=input->sticks[2];}
     in.stickOwned=vr::tploco::ownsStick.load(std::memory_order_relaxed);         // TELEPORT: neutral stick for sprint
     in.teleportWalk=vr::tploco::walkModifier.load(std::memory_order_relaxed);   // TELEPORT: L3 = escape-walk modifier
     // LASSO: a catch on the rope -> Touch A = pad A, X = X on foot; a lasso minigame -> the stock face buttons
     in.lassoRemap=vr::lasso::faceRemap();in.lassoMinigame=vr::lasso::minigameFocus();in.promptCode=vr::lasso::promptCode();
     // DEAD EYE: R3 with a firearm in a VR hand = the game's DEADEYE press, R3 while it runs = end it (VrDeadEye.h)
     // Never while that gun spins on the finger (Dead Eye = a refused spin context -> VrSpin holsters it after contextMs)
-    {const int deHold=vr::holsters::holdHand.load(std::memory_order_relaxed);
+    {const int deHold=vr::holsters::holdHand.load(std::memory_order_relaxed);in.holdHand=deHold;
      in.deadEyeGun=deHold>=0&&vr::holsters::heldFirearm.load(std::memory_order_relaxed)&&!vr::spin::keeps(deHold);}
+    // vr.controls.r3 ring: the holster context gate and the engine aim bits at an R3 press (report only)
+    in.ctxAllowed=vr::holsters::inventoryValid.load(std::memory_order_relaxed)?(vr::holsters::contextAllowed.load(std::memory_order_relaxed)?1:0):-1;
+    in.blockReason=vr::holsters::blockReason.load(std::memory_order_relaxed);in.aimBits=vr::holsters::engineAimBits.load(std::memory_order_relaxed);
     in.deadEyeActive=vr::deadeye::active.load(std::memory_order_relaxed);
     if(in.ready&&in.lassoRemap)vr::lasso::bump(vr::lasso::stats.faceRemapFrames);
     if(in.ready&&in.lassoMinigame)vr::lasso::bump(vr::lasso::stats.stockFaceFrames);
@@ -1101,15 +1129,25 @@ void controlsPadFilter(void*,const runtime::ControllerSample* input,std::uint64_
     const bool menu=context==runtime::PresentationContext::Menu||context==runtime::PresentationContext::Unknown||context==runtime::PresentationContext::Cutscene;
     LocomotionContext player{};const bool playerRead=!menu&&in.ready&&LocomotionContextReader(locomotionApi).sample(player);
     in.layout=vc::layoutFor(menu,playerRead,player.playerMode);
+    in.vehicleSeat=playerRead&&player.playerMode==3u&&vr::vehicleseat::weaponSeatNow.load(std::memory_order_relaxed);
+    // BUTTONS > GUN DEAD EYE OFF: on foot the crouch button keeps crouching with a gun in hand; LT + that button and "end it" stay
+    if(in.layout==vc::Layout::Foot&&!::rdrvr::vr::controlmap::gunDeadEye.load(std::memory_order_relaxed))in.deadEyeGun=false;
     // DUEL ON LOOK (vr/VrDuelLink.h): physical LT + Y while the CHEATS row is ON, on foot, no VR menu; that Y never reaches the game
     in.buttons&=~vr::duellink::filter(in.buttons,vc::bit::LT,vc::bit::Y,in.ready&&in.layout==vc::Layout::Foot&&!vr::menuOpen.load(std::memory_order_relaxed));
     if(in.layout==vc::Layout::Foot||in.layout==vc::Layout::Mounted)in.buttons=::rdrvr::vr::controlmap::apply(in.buttons,in.layout==vc::Layout::Mounted);
     // VR DUEL: no Dead Eye press (and no crouch) in a duel played with the real gun; after the BUTTONS map, whichever button the player gave them
     if(vr::duelctl::live())in.buttons&=~vc::bit::R3;
+    // LT + R3: Dead Eye only with the LT the game gets (the holster filter after this mapper withholds LT from empty VR hands).
+    // An engine item in a VR hand keeps the physical LT: the filter's empty-hand route (VrHolsters.h routeEmpty) runs only with
+    // holdHand < 0; firearms, throwables and the other held items have their own LT rules (ltNative, the throwable brain's force aim).
+    // debug.rdrvr.vr.r3lt 0 = physical LT.
+    {static vc::LtTrack ltTrack;const bool physLt=(in.buttons&vc::bit::LT)!=0;
+     const auto g=ltTrack.sample(physLt,vc::ltDelivered.load(std::memory_order_relaxed),vc::padNotes.load(std::memory_order_relaxed));
+     in.ltGame=vc::ltGameFor(vc::r3DeliveredLt.load(std::memory_order_relaxed),in.holdHand,g);}
     // SLOW-MO: arm the level-1 hold before any press, on every input the mapper turns R3 into the game's DEADEYE press
-    // (a gun in a VR hand OR LT held, VrControls.h R3; the stock layout passes R3 with LT = the stock aim + R3), so an LT + R3 start
-    // (no VR gun, holsters off) also begins at level 1 instead of switching from level 2 a tick after BeginDeadEyeCommon.
-    vr::deadeye::gunInHand.store(in.deadEyeGun||(in.buttons&vc::bit::LT)!=0,std::memory_order_relaxed);
+    // (a gun in a VR hand OR LT reaching the game, VrControls.h R3; the stock layout passes R3 with LT = the stock aim + R3), so an LT + R3
+    // start (no VR gun, holsters off) also begins at level 1 instead of switching from level 2 a tick after BeginDeadEyeCommon.
+    vr::deadeye::gunInHand.store(in.deadEyeGun||vc::ltAims(in.ltGame,(in.buttons&vc::bit::LT)!=0),std::memory_order_relaxed);
     const auto mover=vr::loco::playerMover.load(std::memory_order_relaxed);const auto moverNs=vr::loco::moverFrameNs.load(std::memory_order_relaxed);
     std::uint16_t flags{},posture{};const auto& reader=locomotionApi.player;
     if(mover&&moverNs&&now>=moverNs&&now-moverNs<250'000'000ull&&reader.read&&
@@ -1117,9 +1155,14 @@ void controlsPadFilter(void*,const runtime::ControllerSample* input,std::uint64_
        reader.read(reader.context,mover+vc::field::moverPosture,&posture,sizeof posture)){
         in.jumping=(flags&vc::field::jumpingBit)?1:0;
         const bool crouched=(posture&0xf00u)==0x100u; // sagPlayerInputFoot::IsCrouching 0x26b641c
+        in.crouched=crouched?1:0;
         if(crouched!=vc::crouching.exchange(crouched,std::memory_order_relaxed))vc::crouchChanges.fetch_add(1,std::memory_order_relaxed);
     }
     vc::jumpFlag.store(in.jumping,std::memory_order_relaxed);
+#ifdef RDRVR_CAMERA_BRIDGE
+    // vr.controls.r3 ring: the world yaw while R3 is held (seqlock read of the last published plan)
+    if(in.ready&&(in.buttons&vc::bit::R3)){float psi{};std::uint64_t origin{};if(visibilityBridge.worldYaw(now,psi,origin)){in.psi=psi;in.psiOrigin=origin;}}
+#endif
     state.buttons=vc::mapper.apply(in,state.buttons);
     if(satchelSelect)state.buttons|=runtime::PadSelect;
     {static std::uint64_t holdsSeen=0;const auto holds=vc::inventoryPresses.load(std::memory_order_relaxed);if(holds!=holdsSeen){holdsSeen=holds;vr::satchel::noteHold(now);}} // Hold X = the same satchel (route, forced flat view)
@@ -1131,10 +1174,19 @@ void controlsPadFilter(void*,const runtime::ControllerSample* input,std::uint64_
         // the MOUNTED layout without a head / riding sample (optic, camera override) suspends the brain; the last output is never repeated
         // into the stock pad (menu / Unknown); the input identity (reference space / input epoch / continuity) re-zeroes the held hands.
         vrn::In ri{};ri.now=now;ri.menu=context==runtime::PresentationContext::Menu||context==runtime::PresentationContext::Cutscene;
-        ri.layoutMounted=in.layout==vc::Layout::Mounted;ri.onFoot=in.layout==vc::Layout::Foot;ri.stockPad=in.layout==vc::Layout::Native;
-        // Live only on a HORSE (sagPlayer+0x5d4 == 5, the same read as the layout): a wagon / stagecoach seat
-        // (MOUNTED layout, a fresh riding sample) never grabs, masks the native grips or outputs a stick / A (its mode would be NONE)
-        ri.mounted=in.ready&&ri.layoutMounted&&playerRead&&player.playerMode==5u&&vrn::ridingFresh(now);ri.userA=(state.buttons&vc::bit::A)!=0;
+        // A vehicle seat (player state 3) ends the reins at once, as a dismount does - except the driver's seat of a stagecoach / wagon
+        // with BUTTONS > COACH REINS ON (vr/VrCoachReins.h: seat class / vehicle type from the holsters poll, the nav state from the riding
+        // sample). A move between seats (class MOVING) or another seat resets like a dismount.
+        namespace co=vr::coach;namespace vsx=vr::vehicleseat;
+        const bool seatState=playerRead&&player.playerMode==3u;
+        const bool coachSeat=seatState&&vrn::enabled()&&co::enabled()&&vsx::seatClass.load(std::memory_order_relaxed)==vsx::SeatDriver&&
+            vsx::vehicleType.load(std::memory_order_relaxed)==vsx::typeStagecoach;
+        const bool coachFacts=coachSeat&&co::verify.load(std::memory_order_relaxed)==1&&co::factsFresh(now);
+        ri.layoutMounted=in.layout==vc::Layout::Mounted;ri.onFoot=in.layout==vc::Layout::Foot||(seatState&&!coachSeat);ri.stockPad=in.layout==vc::Layout::Native;
+        // Live on a HORSE (sagPlayer+0x5d4 == 5, the same read as the layout) or on that driver's seat; any other wagon / stagecoach seat
+        // (MOUNTED layout, a fresh riding sample) never grabs or outputs a stick / A. VrHolsters.h applyMasks decides the native grips of a seat.
+        ri.mounted=in.ready&&ri.layoutMounted&&playerRead&&(player.playerMode==5u||coachSeat)&&vrn::ridingFresh(now);ri.userA=(state.buttons&vc::bit::A)!=0;
+        ri.coach=coachSeat;ri.coachGait=coachFacts?co::gaitOfNav(co::nav.load(std::memory_order_relaxed)):-1;
         if(input){ // Grips / poses / busy from every live controller sample - a hand opened while the brain is not live (a short
                    // inactivity hold / a MOUNTED-layout suspension) lets go there too
             ri.gripLive=true;
@@ -1155,10 +1207,28 @@ void controlsPadFilter(void*,const runtime::ControllerSample* input,std::uint64_
             ri.space=input->referenceSpace;ri.epoch=input->inputEpoch?input->inputEpoch:input->epoch;ri.continuity=input->continuity;
         }
         const auto ro=vrn::brain.step(ri);
-        if(ro.stick){state.sticks[0]=ro.x;state.sticks[1]=ro.y;}
-        // The brain HOLDS A at CANTER+ (the stock keep-pace hold); the player's press over it clears A for this one update so their
-        // own edge reaches the game (merged, never swallowed: the next update carries their A again)
-        if(ro.aUp)state.buttons&=~vc::bit::A;else if(ro.a)state.buttons|=vc::bit::A;
+        if(ri.coach){ // COACH: MOVE_X = the rein steer (shaped), the pace = Whip (pad A) / MOVE_Y back taps toward the brain's gait
+            const int navNow=coachFacts?co::nav.load(std::memory_order_relaxed):-1,want=co::navOfGait(vrn::brain.level());
+            const bool driving=coachFacts&&co::drive.load(std::memory_order_relaxed)==co::driveState,live=ri.mounted&&driving;
+            {static std::uint64_t lastFlicks=0;const auto fl=vrn::stats.flicks.load(std::memory_order_relaxed); // TOP WHIP (VrCoachReins Tap)
+                if(fl>lastFlicks&&lastFlicks)co::tap.kickWant=std::min(co::tap.kickWant+1,2);lastFlicks=fl;}
+            const auto t=co::tap.step(now,live,want,navNow);
+            if(ro.stick){state.sticks[0]=co::shapeSteer(ro.x,co::linear.load(std::memory_order_relaxed));state.sticks[1]=0.f;co::steerFrames.fetch_add(1,std::memory_order_relaxed);}
+            if(t.whip){state.buttons|=vc::bit::A;co::whipFrames.fetch_add(1,std::memory_order_relaxed);}
+            if(t.back){state.sticks[1]=-1.f;co::backFrames.fetch_add(1,std::memory_order_relaxed);}
+            if(ri.mounted)co::liveFrames.fetch_add(1,std::memory_order_relaxed);
+            if(ri.mounted&&coachFacts&&!driving)co::notDriving.fetch_add(1,std::memory_order_relaxed);
+            if(ri.mounted&&!coachFacts)co::stale.fetch_add(1,std::memory_order_relaxed);
+            co::liveNow.store(live,std::memory_order_relaxed);co::wantNav.store(want,std::memory_order_relaxed);
+            co::why.store(!ri.mounted?"NOT_LIVE":!coachFacts?"NO_NAV":!driving?"NOT_DRIVING":"DRIVING",std::memory_order_relaxed);
+        }else{
+            if(co::liveNow.load(std::memory_order_relaxed)||co::tap.phase!=co::Tap::Idle){co::tap.reset();co::liveNow.store(false,std::memory_order_relaxed);
+                co::why.store(seatState?"OTHER_SEAT":"IDLE",std::memory_order_relaxed);}
+            if(ro.stick){state.sticks[0]=ro.x;state.sticks[1]=ro.y;}
+            // The brain HOLDS A at CANTER+ (the stock keep-pace hold); the player's press over it clears A for this one update so their
+            // own edge reaches the game (merged, never swallowed: the next update carries their A again)
+            if(ro.aUp)state.buttons&=~vc::bit::A;else if(ro.a)state.buttons|=vc::bit::A;
+        }
     }
     vr::loco::sprintRequest.store(vc::sprintWanted.load(std::memory_order_relaxed),std::memory_order_relaxed);
 }
@@ -1214,6 +1284,7 @@ bool vrBodyFrame(::rdrvr::vr::bodyik::Frame& out,std::uintptr_t actor,std::uint6
         if(const auto why=vwm::preparePlan(req,shifted,prep)){out.why=vwm::reasonNames[why];return false;}
         out.upm=shifted.unitsPerMetre;
         if(prep.haveLatest)out.up={prep.latest.up[0],prep.latest.up[1],prep.latest.up[2]};
+        out.bridged=prep.bridged;
         const auto v3=[](const runtime::Vec3& v){return AK::Vec3{v[0],v[1],v[2]};};
         for(unsigned h=0;input&&h<2;++h){ // No sample -> no hands (head-only frame)
             ControllerRay grip{},aim{};auto& hp=out.hand[h];
@@ -1247,7 +1318,7 @@ bool vrBodyFrame(::rdrvr::vr::bodyik::Frame& out,std::uintptr_t actor,std::uint6
         auto o=vwm::ownerSnapshot();
         if(hold>=0&&vwm::config.enabled&&o.weapon&&o.poseAllowed&&o.geometry.valid&&o.geometry.weapon==o.weapon&&
            (!o.stampNs||now<=o.stampNs||now-o.stampNs<=250'000'000)){
-            out.weapon=o.weapon;out.firearm=vwm::firearm(o.kind);
+            out.weapon=o.weapon;out.firearm=vwm::firearm(o.kind);out.holdKnife=o.kind==::rdrvr::engine::WeaponClass::Melee;
             // BODY rule: an animated firearm (authored muzzle locator) is held by its BARREL placement; knife / thrown /
             // lasso / rigid items hang natively in the IK'd hand.
             out.barrel=out.firearm&&o.geometry.animated&&vwm::config.hold!=vwm::HoldMode::Hand;
@@ -1310,7 +1381,30 @@ static bool eyeThirdPerson(const StereoCameraPlan& plan) noexcept {
     (void)plan;return false;
 #endif
 }
-static std::uintptr_t eyeHatNode(const StereoCameraPlan& plan) noexcept {return eyeThirdPerson(plan)?0:plan.hatNode;} // His hat on in THIRD PERSON
+// HEAD SHOW (vr/VrHeadShow.h): John's head back in the eyes while the eye is away from his head joint (knockdown, ragdoll, get-up). One
+// state-machine step per plan (scene id + head key). The eye = the midpoint of the plan's eye translations moved by the camera anchor shift
+// (the plan's anchor -> the newest one, as vrMeleeWorldMap / vrBodyFrame do): the head row VrBody's tick reads belongs to the newest
+// skeleton, so a moving capsule adds no speed x frame-time term to the distance.
+static ::rdrvr::vr::headshow::Show eyeHeadShow(const StereoCameraPlan& plan) noexcept {
+#if defined(RDRVR_NATIVE_MENUS) && defined(RDRVR_TOUCH_CONTROLS)
+    namespace hsw=::rdrvr::vr::headshow;namespace vwm=::rdrvr::vr::weapon;
+    try{
+        hsw::Show cached{};if(hsw::stepper.cached(hsw::stepLock,plan.sceneId,plan.headSampledNs,cached))return cached;
+        hsw::Input in{};in.now=diagnostics::monotonicNs();in.upm=plan.unitsPerMetre;in.eyeGuid=plan.actorGuid;
+        const auto& w0=plan.world[0];const auto& w1=plan.world[1];
+        runtime::Vec3 shift{};
+        if(plan.headAnchored&&vwm::config.latency){vwm::AnchorRecord pa{},la{};if(vwm::anchors.find(plan.headSampledNs,pa)&&vwm::anchors.newest(la))vwm::anchorShift(plan,pa,la,shift);}
+        if(!std::isfinite(shift[0]+shift[1]+shift[2]))shift={};
+        in.eye[0]=.5f*(w0[12]+w1[12])+shift[0];in.eye[1]=.5f*(w0[13]+w1[13])+shift[1];in.eye[2]=.5f*(w0[14]+w1[14])+shift[2];in.eyeOk=plan.headAnchored;
+        {const float u=plan.unitsPerMetre>1e-3f?plan.unitsPerMetre:1.f;in.shiftM=std::sqrt(shift[0]*shift[0]+shift[1]*shift[1]+shift[2]*shift[2])/u;}
+        in.headOk=hsw::head.load(in.head);
+        return hsw::stepper.step(hsw::stepLock,plan.sceneId,plan.headSampledNs,in);
+    }catch(...){return {};}
+#else
+    (void)plan;return {};
+#endif
+}
+static std::uintptr_t eyeHatNode(const StereoCameraPlan& plan) noexcept {return eyeThirdPerson(plan)||eyeHeadShow(plan).hat?0:plan.hatNode;} // His hat on in THIRD PERSON / with the head shown away from the eye
 // BODY: the creature the eye BodyDrawFilter scopes hide. While the body is shown (BODY ON, hooks in, head collapse ready) a
 // value that never matches a crCreature: the player's body is drawn, the hat node stays hidden.
 static std::uintptr_t eyeBodyCreature(const StereoCameraPlan& plan) noexcept {
@@ -1328,7 +1422,8 @@ static std::uintptr_t globalHatNode(std::uintptr_t hat) noexcept {
 #if defined(RDRVR_NATIVE_MENUS) && defined(RDRVR_TOUCH_CONTROLS)
     // With the head back in the shadow (HEAD SHADOW live) the hat stays in the shadow too
     if(::rdrvr::vr::bodyik::headShadowLive.load(std::memory_order_relaxed)&&::rdrvr::vr::bodyik::headFillInstalled.load(std::memory_order_relaxed))return 0;
-    return ::rdrvr::vr::bodyik::bodyVisible()?hat:0;
+    // HEAD SHOW: in the fallback the head is uncollapsed while shown (VrBody), so its hat stays on it
+    return ::rdrvr::vr::bodyik::bodyVisible()&&!::rdrvr::vr::headshow::shownNow.load(std::memory_order_relaxed)?hat:0;
 #else
     (void)hat;return 0;
 #endif
@@ -1350,6 +1445,10 @@ bool vrArcMap(std::uint64_t now,vr::arc::MapInputs& out) noexcept;
 bool vrArcInput(std::uint64_t now,runtime::ControllerSample& raw) noexcept;
 bool vrArcSynthesizing() noexcept;
 #endif
+// The submitted pad: the satchel's pad facts and the wheel's LB holds (report), the delivered LT for the controls mapper's LT + R3 rule
+// (VrControls.h ltForDeadEye).
+static void vrPadObserver(std::uint64_t now,std::uint32_t buttons,bool ready) noexcept {vr::satchel::notePad(now,buttons,ready);vr::wheel::notePad(now,buttons,ready);
+    vr::controls::noteDelivered(now,buttons,ready);}
 void gameConfigureInput(NativePadApi api) noexcept {
     nativePad.configure(api);
 #if defined(RDRVR_HEAD_CAMERA) && defined(RDRVR_NATIVE_MENUS)
@@ -1359,7 +1458,7 @@ void gameConfigureInput(NativePadApi api) noexcept {
     vr::reload::overlaySink.store(&reloadOverlayToHands,std::memory_order_release); // RELOAD: overlay channel 2b
     vr::weapon::startup(); // debug.rdrvr.vr.weapon* properties (before any weapon hook / holster tick can run)
     vr::controls::loadProperties();nativePad.setControlsFilter(controlsPadFilter); // Controls (debug.rdrvr.vr.controls 0 = stock layout)
-    nativePad.setPadObserver(vr::satchel::notePad); // Report only (vr.menu.satchel pad)
+    nativePad.setPadObserver(vrPadObserver); // vr.menu.satchel pad, vr.wheel.lb, the delivered LT (controls LT + R3)
     vr::melee::worldMapFn.store(&vrMeleeWorldMap,std::memory_order_release); // MELEE: LOCAL -> world for the melee tick
     vr::bodyik::frameFn.store(&vrBodyFrame,std::memory_order_release); // BODY: this frame's controller poses for the arm IK
     // THROW (VrThrow.h): start pose from the release placement, the laser's probe, LOCAL<->world, the player's capsule, the owner
@@ -1376,6 +1475,8 @@ void gameConfigureInput(NativePadApi api) noexcept {
     vr::throwable::tossStartFn.store(&vrThrowableTossStart,std::memory_order_release); // TOSS: the held model at the toss
     vr::throwable::gravitySyncFn.store(&vrThrowableGravitySync,std::memory_order_release);
     vr::hands::setSynthesizingProbe(&vrArcSynthesizing);
+    // HAND PHYSICS (VrHandPhys.h): the tick; the engine side is verified in TraceEntry (handphys::install)
+    vr::handphys::registerTick();
 #if __has_include("vr/VrReload.h")
     vr::controls::reloadConsumer.store(&vr::reload::consumeB,std::memory_order_release);
 #endif
@@ -1476,7 +1577,7 @@ void vrHammerObserve(const LocalWeapon* owner,const WeaponContext* context,std::
             const auto o=vw::ownerSnapshot();
             in.weapon=owner->weapon;in.actor=owner->actor;in.player=owner->player;in.actorGuid=owner->actorGuid;in.kind=int(owner->type.kind);
             in.typeId=int(owner->type.id);in.held=o.weapon==owner->weapon;in.forceAllowed=in.held&&o.forceAllowed;in.poseAllowed=in.held&&o.poseAllowed;
-            in.riding=context->riding;
+            in.riding=context->riding||context->ridingVehicle; // a vehicle seat follows the horse rules
             const auto l=vw::latestPlacement();
             if(l.weapon==owner->weapon&&l.ns){in.barrel={l.placement.direction[0],l.placement.direction[1],l.placement.direction[2]};in.barrelNs=l.ns;in.barrelValid=true;}
         }
@@ -1492,7 +1593,7 @@ void vrWeaponObserve(const LocalWeapon* owner,const WeaponContext* context,std::
             if(owner&&context){c.valid=true;c.weapon=owner->weapon;c.kind=int(owner->type.kind);c.alive=context->alive;c.controlDisabled=context->controlDisabled;
                 c.deadEye=context->deadEye;c.riding=context->riding;c.ridingVehicle=context->ridingVehicle;c.vehicleTransition=context->vehicleTransition;
                 c.duel=context->duelRaw;c.mountedWeapon=context->mountedWeapon;c.mountingHorse=context->mountingHorse;c.linkedAnimation=context->linkedAnimation;
-                c.usingGringo=context->usingGringo;c.cover=context->cover;}
+                c.usingGringo=context->usingGringo;c.cover=context->cover;c.weaponSeat=context->weaponSeat;c.seatSwap=context->seatSwap;}
             vrl::noteContext(c,now);
         }
         if(!vw::config.enabled||!owner||!context||::rdrvr::vr::holsters::holdHand.load(std::memory_order_acquire)<0){
@@ -2638,7 +2739,7 @@ static ::rdrvr::vr::cutscene::Ctx cutsceneCtx(runtime::PresentationContext c) no
     return c==P::World?C::World:c==P::Cutscene?C::Cutscene:c==P::CameraTransition?C::Transition:c==P::CameraOverride?C::Override:C::Other;}
 static bool cutsceneStereo(const runtime::PresentationState& s,std::uint64_t now) noexcept {
     return (s.context==runtime::PresentationContext::Cutscene||s.context==runtime::PresentationContext::CameraTransition||
-            (s.context==runtime::PresentationContext::CameraOverride&&::rdrvr::vr::cutscene::overrideEligible()))&&
+            (s.context==runtime::PresentationContext::CameraOverride&&::rdrvr::vr::cutscene::overrideEligible(now)))&&
         ::rdrvr::vr::cutscene::engaged(s.revision,now);}
 static bool stereoPresentation(const runtime::PresentationState& s,std::uint64_t now) noexcept {return s.world()||cutsceneStereo(s,now);}
 static bool stereoPresentationAllowed() noexcept {
@@ -2813,12 +2914,12 @@ static void vrCutsceneObserve(const runtime::PresentationState& state,std::uint6
         const bool live=::rdrvr::vr::enabled(::rdrvr::vr::Feature::Cutscene);
         { // Scripted gameplay shot (camCutsceneCamera on top, NativeUiContext): cinematic for its first shotMax seconds
             const auto since=nativeUi.shotSince();const auto maxS=cs::shotMaxSeconds.load(std::memory_order_relaxed);
-            const bool shot=since&&(!maxS||now<since||now-since<=std::uint64_t(maxS)*1'000'000'000ull);
+            const bool shot=runtime::bridge::overrideEligible(since,now,maxS,2);
             if(cs::overrideShot.load(std::memory_order_relaxed)&&!shot&&since)cs::shotExpired.fetch_add(1,std::memory_order_relaxed);
             cs::overrideShot.store(shot,std::memory_order_relaxed);
         }
         const bool cut=live&&(state.context==runtime::PresentationContext::Cutscene||
-                              (state.context==runtime::PresentationContext::CameraOverride&&cs::overrideEligible())),
+                              (state.context==runtime::PresentationContext::CameraOverride&&cs::overrideEligible(now))),
                    trans=live&&state.context==runtime::PresentationContext::CameraTransition;
         cs::inCutscene.store(cut,std::memory_order_relaxed);
         { // R3 (right stick click) inside a cutscene cycles CINEMATIC -> FIRST PERSON -> SCREEN (saved like the menu row)
@@ -2836,7 +2937,9 @@ static void vrCutsceneObserve(const runtime::PresentationState& state,std::uint6
                 if(f>=1&&f<=3&&f!=lastForce)::rdrvr::vr::vrSettings.set(::rdrvr::vr::Key::Cutscenes,unsigned(f-1));
                 lastForce=f;}
         }
-        const auto mode=::rdrvr::vr::settings().cutsceneMode();const bool on=cs::requested();
+        // A scripted shot in a FIRST PERSON row is a side view (cs::modeFor): no John, the head is not collapsed (suppressCollapse below)
+        static cs::Ctx steady=cs::Ctx::Other;const auto ctx=cutsceneCtx(state.context);if(ctx!=cs::Ctx::Transition)steady=ctx;
+        const auto mode=cs::modeFor(ctx,steady,::rdrvr::vr::settings().cutsceneMode(),cs::shotView.load(std::memory_order_relaxed));const bool on=cs::requested();
         cs::John j{};j.ns=now;j.revision=state.revision;j.why=on&&(cut||trans)?"NOT_FIRST_PERSON":"NOT_ACTIVE";
         if(on&&(cut||trans)&&mode==cs::FirstPerson){cutsceneJohn(state,j);cs::bump(cs::stats.johnSamples);if(j.valid)cs::bump(cs::stats.johnValid);}
         else johnLock=JohnLock{};
@@ -2859,7 +2962,8 @@ static bool cutsceneAnchor(std::uintptr_t viewport,std::uintptr_t camera,std::ui
         bool cam=read&&viewport&&viewport<=UINTPTR_MAX-cameraReadOffset-cameraReadBytes&&read(context,viewport+cameraReadOffset,fields.data(),fields.size());
         if(cam&&camera)cam=camera<=UINTPTR_MAX-64&&read(context,camera,fields.data(),64);
         cam=cam&&decodeCamera(fields,stock);
-        cs::Input in{};in.ns=ns;in.revision=state.revision;in.ctx=ctx;in.mode=::rdrvr::vr::settings().cutsceneMode();in.stock=cam?stock.world.data():nullptr;
+        cs::Input in{};in.ns=ns;in.revision=state.revision;in.ctx=ctx;
+        in.mode=cs::modeFor(ctx,cs::composer.steady(),::rdrvr::vr::settings().cutsceneMode(),cs::shotView.load(std::memory_order_relaxed));in.stock=cam?stock.world.data():nullptr;
         runtime::TrackedViews v{};
         if(gameViews.snapshot(ns,v)&&validPose(v.eyes[0])&&validPose(v.eyes[1])){
             runtime::Quat q{};float sign{},norm{};
@@ -2876,13 +2980,40 @@ static bool cutsceneAnchor(std::uintptr_t viewport,std::uintptr_t camera,std::ui
         if(o.cut)shadowtimeline::bump(shadowtimeline::StockCut);
         HeadCameraAnchor a{};a.position=o.position;a.up={0,1,0};a.actorGuid=o.guid;a.sampledNs=ns;a.presentationRevision=state.revision;
         // CINEMATIC: a creature that never matches (nobody hidden, no head fill); FIRST PERSON: John -> the gameplay eye body rules
-        a.bodyCreature=o.effective==cs::FirstPerson&&o.creature?o.creature:std::uintptr_t(1);a.hatNode=o.effective==cs::FirstPerson?o.hat:0;
+        cs::anchorBody(o,a.bodyCreature,a.hatNode);
         a.origin.position=o.origin;a.origin.inverseYaw={0,std::sin(o.inverseYaw*.5f),0,std::cos(o.inverseYaw*.5f)};
         a.origin.referenceSpace=o.referenceSpace;a.origin.serial=o.serial;a.origin.valid=true;a.kind=HeadCameraAnchor::Kind::Head;
         if(!cutsceneCamera.publish(a))return false;
         cs::engagedMode.store(o.effective,std::memory_order_relaxed);out=a;return true;
     }catch(...){return false;}
 }
+#endif
+#ifdef RDRVR_HEAD_CAMERA
+// Eye-scope hides / HEAD SHADOW fills while the plan is a cutscene CINEMATIC plan (report vr.cutscene: expected 0, the side view
+// draws John with his head), and on a gameplay plan inside the exit window of the last scripted camera run: head copies bound or
+// taken as is (the head hidden again) / misses (no head copy yet: the player record hidden for that draw). Declared before the eye
+// scope so the scope's counts are in when this one closes. Counter reads only.
+struct CinematicHeadAudit {
+    enum class Kind : std::uint8_t {Off,Cinematic,Exit};
+    Kind kind{};std::uint64_t hidden{},fills{},asIs{},misses{};
+    explicit CinematicHeadAudit(const StereoCameraPlan& plan) noexcept {
+#ifdef RDRVR_VR_CUTSCENE
+        namespace cs=::rdrvr::vr::cutscene;
+        if(plan.actorGuid==cs::guidCinematic)kind=Kind::Cinematic;
+        else if(!cs::cutscenePlan(plan.actorGuid)&&runtime::bridge::shots.ended()&&
+                runtime::bridge::shots.exitWindow(diagnostics::monotonicNs()))kind=Kind::Exit;
+        if(kind!=Kind::Off){hidden=bodyDrawFilter.hidden();fills=bodyDrawFilter.headSwaps();asIs=bodyDrawFilter.headAsIs();misses=bodyDrawFilter.headMisses();}
+#else
+        (void)plan;
+#endif
+    }
+    ~CinematicHeadAudit(){
+        if(kind==Kind::Cinematic)runtime::bridge::noteHeadDraws(bodyDrawFilter.hidden()-hidden,bodyDrawFilter.headSwaps()-fills,diagnostics::monotonicNs());
+        else if(kind==Kind::Exit)runtime::bridge::noteExitHead(bodyDrawFilter.headSwaps()-fills+(bodyDrawFilter.headAsIs()-asIs),
+                                                               bodyDrawFilter.headMisses()-misses,diagnostics::monotonicNs());
+    }
+    CinematicHeadAudit(const CinematicHeadAudit&)=delete;CinematicHeadAudit& operator=(const CinematicHeadAudit&)=delete;
+};
 #endif
 // RIDING: HeadAnchorReader (mirror) rejects the player while player+0x5d4 is 3/5 (mounted / attached: the mover's +0x830 phInst)
 // and while the actor matrix changes between its two reads, so on a horse no head is published -> CULL_SNAPSHOT_UNAVAILABLE every
@@ -2945,12 +3076,35 @@ static bool ridingAnchorSample(std::uintptr_t reticle,std::uint64_t now,std::uin
        !get(reticle,0x10,back)||back!=actor||!get(actor,0xb0,component)||!get(component,0x18,matrix)||!matrix||
        !get(actor,0x60,health)||!get(health,0x20,hp)||!std::isfinite(hp)||hp<=0||
        !get(actor,0x50,entity)||!get(entity,0x88,instance)||!get(instance,0x138,creature)||!creature){ridingIdentity.fetch_add(1,std::memory_order_relaxed);return false;}
-    if(get(player,0x5d4,pstate)){ridingLastState.store(std::int32_t(pstate),std::memory_order_relaxed);if(pstate==2)ridingOnFootNs=now;} // On foot (mount edge)
+    const bool stateOk=get(player,0x5d4,pstate);
+    if(stateOk){ridingLastState.store(std::int32_t(pstate),std::memory_order_relaxed);if(pstate==2)ridingOnFootNs=now;} // On foot (mount edge)
+    const bool inSeat=stateOk&&pstate==3; // a vehicle seat (SEAT STEADY, COACH REINS)
     if(!get(actor,0x88,mover)||!mover||!get(mover,0x830,attached)||!attached){ridingNotAttached.fetch_add(1,std::memory_order_relaxed);return false;}
     runtime::Mat4 body{};if(!get(matrix,0,body))return false;
     for(unsigned c=0;c<4;++c)for(unsigned r=0;r<3;++r)if(!std::isfinite(body[c*4+r]))return false;
     AimNativeVector head{};head.v.fill(std::numeric_limits<float>::quiet_NaN());
     if(!reticleProbeApi.head(reinterpret_cast<const void*>(actor),&head)||!std::isfinite(head.v[0]+head.v[1]+head.v[2])){ridingNoHead.fetch_add(1,std::memory_order_relaxed);return false;}
+    // COACH REINS (vr/VrCoachReins.h): the driver's seat only, the menu row ON - the wagon input's nav states (one 8-byte read) behind its
+    // vtable word, the driving state every 4th sample; the code words and the vtable's ApplyInput slot are checked once
+    if(inSeat&&::rdrvr::vr::coach::enabled()&&::rdrvr::vr::vehicleseat::seatClass.load(std::memory_order_relaxed)==::rdrvr::vr::vehicleseat::SeatDriver){
+        namespace co=::rdrvr::vr::coach;const char* why="OK";static unsigned driveTick{};static std::int32_t driveLast{-1};
+        const auto foot=locomotionApi.footTable;
+        if(!foot||foot<co::footTableOffset)why="NO_BASE";
+        else{const std::uintptr_t base=foot-co::footTableOffset;int v=co::verify.load(std::memory_order_relaxed);
+            if(!v){std::uint64_t w{};std::array<std::uint32_t,3> g{};std::uintptr_t slot{};
+                if(!get(base+co::navGetterOffset,0,w)||!get(base+co::shiftGateOffset,0,g)||!get(base+co::wagonTableOffset,co::wagonApplySlot,slot))why="CODE_READ";
+                else{v=w==co::navGetterPrint&&g==co::shiftGatePrint&&slot==base+co::wagonApplyOffset?1:-1;co::verify.store(v,std::memory_order_relaxed);}}
+            std::uintptr_t input{},vt{},b38{},ab8{},a70{};std::array<std::int32_t,2> nx{-1,-1};
+            if(v<0)why="CODE_MISMATCH";
+            else if(!v){}
+            else if(!get(player,co::playerWagonInput,input)||!input||!get(input,0,vt))why="NO_INPUT";
+            else if(vt!=base+co::wagonTableOffset)why="NOT_WAGON";
+            else if(!get(input,co::navNext,nx))why="READ";
+            else{if((driveTick++&3u)==0){std::int32_t d{-1};
+                    if(!get(actor,0x38,b38)||!get(b38,0xab8,ab8)||!get(ab8,0x70,a70)||!get(a70,0x18,d))d=-1;driveLast=d;}
+                co::publish(nx[1],nx[0],driveLast,now);}}
+        if(std::strcmp(why,"OK")!=0)co::readFails.fetch_add(1,std::memory_order_relaxed);
+        co::factsWhy.store(why,std::memory_order_relaxed);}
     HeadCameraAnchor a{};a.actorGuid=guid;a.sampledNs=now;a.presentationRevision=revision;a.bodyCreature=creature;
     a.hatNode=readBodyHat(bodyAttachmentApi,api.read,api.context,actor);
     for(unsigned n=0;n<3;++n){a.position[n]=head.v[n];a.up[n]=body[4+n];}
@@ -2967,6 +3121,8 @@ static bool ridingAnchorSample(std::uintptr_t reticle,std::uint64_t now,std::uin
     //  * gallop lean = smooth(clamp(lf - fwdSeat, -3, +25 cm) * smoothstep(speed, 3, 6 m/s)) with tau debug.rdrvr.vr.riding.follow
     //    (ms, default 300; 0 = no lean): at a stand / walk idles, look-backs and glances never move the eye;
     //  * eye = root + f * (fwdSeat + lean + 6 cm) + s * side, 8 cm above the seat (the body's bounce stays below the view).
+    // VEHICLE SEAT (player state 3, vr/VrSeatSteady.h): root and heading Holt-filtered within their bands, the seat height a 2 s mean, no
+    // gallop lean, the eye's offset from the raw seat eye published for VrBody (John carried with the view). HORSE SHAKE ON = raw.
     // SEAT (vr/VrSeat.h): while VrBody holds John's upper body seated under the VR head,
     // lf / ls come from THAT pose (it follows this eye) - calibrating from them would be a feedback loop. Instead: fwdSeat -> the seat's
     // reference head forward + BODY BACK - 6 cm, latched once per mount by VrSeat (tau 1 s; not latched yet: kept; .body.seat.eye 0: a fixed
@@ -2988,8 +3144,10 @@ static bool ridingAnchorSample(std::uintptr_t reticle,std::uint64_t now,std::uin
     // hard: never into the body on a climb / a hill bottom; a +-15 cm stride can touch it). Both act on the level BEFORE the trend update
     // (the trend learns the guarded motion = the descent rate); a trend pointing INTO the violated guard is dropped (a crest / a hill
     // bottom: no Holt overshoot). The seat lean: below (leanDrop).
+    float seatYaw=0.f;bool seatYawOk=false; // SEAT STEADY: the filtered heading (atan2(c.x, c.z)) of this sample
     {
         constexpr float eyeUp=.08f,eyeFwd=.06f;
+        namespace ss=::rdrvr::vr::seatsteady;static ss::Filter seatFilter{};static ss::Lever seatLv{};static bool seatPrev{};
         static std::uint64_t lastNs{},lastTraceNs{};static float up{},y{},vy{},prevBody[3]{},prevDy{},settledS{},speedS{},fwdSeat{.10f},side{},lean{},leanS{};
         static bool have{},headLever{true},leanLever{true};static unsigned calls{};static int bobMs{-1},leanMs{300},sideMode{0},aboveCm{10},bandCm{15},rateCm{100};
         if((calls++&255u)==0){char v[PROP_VALUE_MAX]{};bobMs=__system_property_get("debug.rdrvr.vr.riding.bob",v)>0?std::clamp(std::atoi(v),0,3000):-1;
@@ -3002,8 +3160,18 @@ static bool ridingAnchorSample(std::uintptr_t reticle,std::uint64_t now,std::uin
             leanLever=!(__system_property_get("debug.rdrvr.vr.riding.eyelean",v)>0&&v[0]=='0');
             ridingEyeSideMode.store(sideMode,std::memory_order_relaxed);ridingEyeLeanMs.store(leanMs,std::memory_order_relaxed);
             ridingEyeAboveCm.store(aboveCm,std::memory_order_relaxed);ridingEyeBandCm.store(bandCm,std::memory_order_relaxed);
-            ridingEyeBandRate.store(rateCm,std::memory_order_relaxed);}
-        namespace vs=::rdrvr::vr::seat;const bool seatHold=vs::holding(),headMode=seatHold&&headLever; // The seat hold drives the head
+            ridingEyeBandRate.store(rateCm,std::memory_order_relaxed);
+            seatLv.on=!(__system_property_get("debug.rdrvr.vr.riding.seatsteady",v)>0&&v[0]=='0');
+            seatLv.body=!(__system_property_get("debug.rdrvr.vr.riding.seatbody",v)>0&&v[0]=='0');
+            seatLv.tau=float(__system_property_get("debug.rdrvr.vr.riding.seatms",v)>0?std::clamp(std::atoi(v),30,2000):250)*1e-3f;
+            seatLv.band=float(__system_property_get("debug.rdrvr.vr.riding.seatcm",v)>0?std::clamp(std::atoi(v),1,40):4)*.01f; // 12 cm let John swim 12-18 cm in the coach
+            seatLv.yawTau=float(__system_property_get("debug.rdrvr.vr.riding.seatyawms",v)>0?std::clamp(std::atoi(v),30,2000):300)*1e-3f;
+            seatLv.yawBand=float(__system_property_get("debug.rdrvr.vr.riding.seatyawdeg",v)>0?std::clamp(std::atoi(v),1,30):3)*.01745329f;
+            seatLv.yBand=float(__system_property_get("debug.rdrvr.vr.riding.seatycm",v)>0?std::clamp(std::atoi(v),0,40):4)*.01f;
+            ss::bodyLever.store(seatLv.body,std::memory_order_relaxed);}
+        const bool seatShake=inSeat&&::rdrvr::vr::settings().rideShake(),seatOn=inSeat&&seatLv.on&&!seatShake; // HORSE SHAKE ON = the raw seat
+        if(seatShake)ss::shakeOn.fetch_add(1,std::memory_order_relaxed);else if(inSeat&&!seatLv.on)ss::leverOff.fetch_add(1,std::memory_order_relaxed);
+        namespace vs=::rdrvr::vr::seat;const bool seatHold=vs::holding(),headMode=seatHold&&headLever&&!inSeat; // The seat hold drives the head; a vehicle seat keeps SEAT_MAX (its shift is carried into the held head: a per-frame loop)
         const int tauMs=bobMs>=0?bobMs:headMode?350:500; // HEAD mode 350 (see above)
         float fx=-body[8],fz=-body[10];const float fl=std::sqrt(fx*fx+fz*fz);if(fl>1e-3f){fx/=fl;fz/=fl;}else{fx=0;fz=1;}
         const float sx=fz,sz=-fx;
@@ -3027,6 +3195,7 @@ static bool ridingAnchorSample(std::uintptr_t reticle,std::uint64_t now,std::uin
         if(mount||!have){up=dy;fwdSeat=.10f;side=0.f;lean=0.f;have=true;}
         else{
             if(age<1.5f){if(settled)up=dy;else if(dt>0.f)up+=(dy-up)*(1.f-std::exp(-dt/.25f));} // Seating - re-seed from the settled frames
+            else if(seatOn)up=ss::seatUp(up,dy,false,settled,dt,2.f); // a seat: the mean, never the highest (a driving animation's head)
             else if(settled&&dy>up)up=dy;
             // calibration frames: settled once seated (during the first 1.5 s 'up' follows dy and the root climbs onto the saddle at > 0.5 m/s - the
             // bent-over mount pose would drag fwdSeat to a clamp), moving (0.5..8 m/s: no standstill idles / look-backs), upright (within 4 cm of the
@@ -3039,7 +3208,7 @@ static bool ridingAnchorSample(std::uintptr_t reticle,std::uint64_t now,std::uin
                 vs::eyeFwdSeatUsed.store(fwdSeat,std::memory_order_relaxed);}
             else if(sideMode==1){if(cal&&std::fabs(ls-side)<.06f)side=std::clamp(side+(ls-side)*(1.f-std::exp(-dt/3.f)),-.04f,.04f);}else side=0.f;
             const float w=std::clamp((speedS-3.f)/3.f,0.f,1.f),gallop=w*w*(3.f-2.f*w); // smoothstep(speed, 3, 6 m/s)
-            const float target=seatHold?0.f:std::clamp(lf-fwdSeat,-.03f,.25f)*gallop;
+            const float target=seatHold||seatOn?0.f:std::clamp(lf-fwdSeat,-.03f,.25f)*gallop;
             if(leanMs<=0)lean=0.f;else if(dt>0.f)lean+=(target-lean)*(1.f-std::exp(-dt/(float(leanMs)*1e-3f)));
             if(!std::isfinite(lean))lean=0.f;
         }
@@ -3063,14 +3232,29 @@ static bool ridingAnchorSample(std::uintptr_t reticle,std::uint64_t now,std::uin
         if(headMode&&std::isfinite(headUpM)){const float v=body[13]+headUpM;if(std::isfinite(v)&&std::fabs(v-head.v[1])<.40f)vhead=v;}
         if(headMode&&leanLever){const float d=(vs::stats.refUp.load(std::memory_order_relaxed)-vs::stats.headUp.load(std::memory_order_relaxed))*.01f;
             if(std::isfinite(d)){if(fresh||!std::isfinite(leanS))leanS=d;else leanS+=(d-leanS)*(1.f-std::exp(-dt/2.f));leanDrop=std::clamp(leanS,-.05f,.15f);}}
-        const float ex=body[12]+fx*fwdOff+sx*side,ez=body[14]+fz*fwdOff+sz*side,ey=headMode?vhead+leanDrop+above:body[13]+up+eyeUp;
+        float rx=body[12],rz=body[14],hfx=fx,hfz=fz;
+        if(seatOn){const auto sr=ss::step(seatFilter,body[12],body[14],std::atan2(body[8],body[10]),now,fresh||!seatPrev,seatLv);
+            rx=sr.x;rz=sr.z;seatYaw=sr.yaw;seatYawOk=std::isfinite(sr.yaw);if(seatYawOk){hfx=-std::sin(sr.yaw);hfz=-std::cos(sr.yaw);}
+            ss::frames.fetch_add(1,std::memory_order_relaxed);if(sr.reseeded)ss::reseeds.fetch_add(1,std::memory_order_relaxed);
+            if(sr.clamped)ss::clampFrames.fetch_add(1,std::memory_order_relaxed);if(sr.yawClamped)ss::yawClampFrames.fetch_add(1,std::memory_order_relaxed);
+            const float yd=std::remainder(sr.yaw-std::atan2(body[8],body[10]),6.2831853f)*57.29578f;
+            if(std::isfinite(yd)){ss::yawErrDeg.store(yd,std::memory_order_relaxed);if(std::fabs(yd)>ss::yawErrDegMax.load(std::memory_order_relaxed))ss::yawErrDegMax.store(std::fabs(yd),std::memory_order_relaxed);}}
+        seatPrev=seatOn;ss::active.store(seatOn,std::memory_order_relaxed);ss::seated.store(inSeat,std::memory_order_relaxed);
+        const float hsx=hfz,hsz=-hfx;
+        const float rawEx=body[12]+fx*fwdOff+sx*side,rawEz=body[14]+fz*fwdOff+sz*side;
+        const float ex=rx+hfx*fwdOff+hsx*side,ez=rz+hfz*fwdOff+hsz*side,ey=headMode?vhead+leanDrop+above:body[13]+up+eyeUp;
         // A plain low-pass would lag a ramp by speed * tau and a climb would drop the view to the saddle. Double exponential
         // smoothing (level + trend, Holt): ramps are followed
         // without lag, the gait bounce (~2 Hz) stays damped; and the eye never sinks more than 10
         // cm below the head joint + eyeUp (= the held head - 2 cm, both modes). HEAD
         // mode: the guards (above) on the level before the trend update; SEAT_MAX: the floor on the state only.
-        const float floorY=vhead+eyeUp-.10f,ceilY=headMode&&band>0.f?ey+band:std::numeric_limits<float>::infinity();
+        // SEAT STEADY height (VrSeatSteady Lever yBand): in a vehicle seat the level stays within yBand of the seat eye; no head floor
+        // there (the head carries the seat shift VrBody writes into John, so a floor from it follows the lag instead of stopping it)
+        const bool seatY=seatOn&&seatLv.yBand>0.f;
+        const float floorY=seatY?-std::numeric_limits<float>::infinity():vhead+eyeUp-.10f,
+            ceilY=headMode&&band>0.f?ey+band:std::numeric_limits<float>::infinity();
         if(fresh||tauMs<=0||!std::isfinite(y)||!std::isfinite(vy)){y=ey;vy=0.f;}
+        else if(seatY)ss::holtBand(y,vy,ey,dt,float(tauMs)*1e-3f,seatLv.yBand);
         else{const float tau=float(tauMs)*1e-3f;const float ka=1.f-std::exp(-dt/tau),kb=1.f-std::exp(-dt/(2.f*tau));
             const float predicted=y+vy*dt;float level=predicted+(ey-predicted)*ka;
             if(headMode){int hit=0;
@@ -3082,6 +3266,15 @@ static bool ridingAnchorSample(std::uintptr_t reticle,std::uint64_t now,std::uin
         if(std::isfinite(floorY)&&y<floorY){y=floorY;if(vy<0.f)vy=0.f;ridingEyeFloorFrames.fetch_add(1,std::memory_order_relaxed);}
         lastNs=now;
         if(std::isfinite(ex+ez+y)){a.position[0]=ex;a.position[2]=ez;a.position[1]=tauMs>0?y:ey;}
+        if(seatOn){ // SEAT STEADY: the eye minus the raw seat eye for VrBody hook A (John carried with the view), clamped to the bands
+            const float bx=std::clamp(a.position[0]-rawEx,-.3f,.3f),by=std::clamp(a.position[1]-ey,-.2f,.2f),bz=std::clamp(a.position[2]-rawEz,-.3f,.3f);
+            if(std::isfinite(bx+by+bz)){ss::shiftX.store(bx,std::memory_order_relaxed);ss::shiftY.store(by,std::memory_order_relaxed);ss::shiftZ.store(bz,std::memory_order_relaxed);
+                ss::shiftNs.store(now?now:1,std::memory_order_release);
+                const float cm=std::sqrt(bx*bx+bz*bz)*100.f;ss::errCm.store(cm,std::memory_order_relaxed);
+                if(cm>ss::errCmMax.load(std::memory_order_relaxed))ss::errCmMax.store(cm,std::memory_order_relaxed);
+                {static std::uint64_t swayNs{};const float sdt=swayNs&&now>swayNs?std::min(float(double(now-swayNs)*1e-9),.1f):0.f;swayNs=now;
+                    const float k=sdt>0.f?1.f-std::exp(-sdt/1.f):0.f;ss::rawSwayCm.store(ss::rawSwayCm.load(std::memory_order_relaxed)+(cm-ss::rawSwayCm.load(std::memory_order_relaxed))*k,std::memory_order_relaxed);}}}
+        else ss::shiftNs.store(0,std::memory_order_relaxed);
         ridingEyeYMode.store(headMode?"HEAD":seatHold?"SEAT_MAX_LEVER":"SEAT_MAX",std::memory_order_relaxed);ridingEyeTauMs.store(tauMs,std::memory_order_relaxed);
         if(headMode){ridingEyeHeadFrames.fetch_add(1,std::memory_order_relaxed);ridingEyeLeanDrop.store(leanDrop,std::memory_order_relaxed);}
         if(std::isfinite(dy))ridingEyeHeadDy.store(dy,std::memory_order_relaxed);
@@ -3090,8 +3283,8 @@ static bool ridingAnchorSample(std::uintptr_t reticle,std::uint64_t now,std::uin
             RidingTrace t{};t.speed=speed;t.dy=dy;t.lf=lf;t.ls=ls;t.up=up;t.fwd=fwdSeat;t.bodyY=body[13];t.eyeY=a.position[1];t.side=side;t.lean=lean;
             const auto n=ridingTraceNext.fetch_add(1,std::memory_order_relaxed);ridingTrace[n%ridingTrace.size()]=t;}
     }
-    { // HORSE CAM UP / FWD: the eye moved up and forward along the rider's heading (forward = -c, horizontal)
-        const auto st=::rdrvr::vr::settings();const float fx=-body[8],fz=-body[10],fl=std::sqrt(fx*fx+fz*fz);
+    { // HORSE CAM UP / FWD: the eye moved up and forward along the rider's heading (forward = -c, horizontal; a seat: the filtered one)
+        const auto st=::rdrvr::vr::settings();const float fx=seatYawOk?-std::sin(seatYaw):-body[8],fz=seatYawOk?-std::cos(seatYaw):-body[10],fl=std::sqrt(fx*fx+fz*fz);
         a.position[1]+=st.rideUpMeters();
         if(fl>1e-3f){a.position[0]+=fx/fl*st.rideFwdMeters();a.position[2]+=fz/fl*st.rideFwdMeters();}
         // HORSE > HORSE VIEW THIRD PERSON: the view 3.2 m behind and 1.1 m above the rider's eye along the rider's
@@ -3104,8 +3297,9 @@ static bool ridingAnchorSample(std::uintptr_t reticle,std::uint64_t now,std::uin
             sl::thirdNs.store(now?now:1,std::memory_order_release);}
         else sl::thirdNs.store(0,std::memory_order_relaxed);
     }
-    ridingHeading=std::atan2(body[8],body[10]);ridingHeadingValid=std::isfinite(ridingHeading);
-    ridingForwardHeading=std::atan2(-body[8],-body[10]); // the rider's forward (-c) in the headYawWorld convention atan2(f.x, f.z)
+    // a seat: the filtered heading (the view turns with the vehicle's path, not its body's yaw wobble)
+    ridingHeading=seatYawOk?seatYaw:std::atan2(body[8],body[10]);ridingHeadingValid=std::isfinite(ridingHeading);
+    ridingForwardHeading=seatYawOk?std::remainder(seatYaw+3.14159265f,2.f*3.14159265f):std::atan2(-body[8],-body[10]); // the rider's forward (-c) in the headYawWorld convention atan2(f.x, f.z)
     { // The native control vector (sagPlayer+0x30..0x38, same player identity as above) for horseMinusCam / camMinusHorseDeg
         float cv[3]{};ridingControlYawValid=get(player,0x30,cv)&&std::isfinite(cv[0]+cv[1]+cv[2])&&std::hypot(cv[0],cv[2])>.1f;
         if(ridingControlYawValid)ridingControlYaw=std::atan2(cv[0],cv[2]);}
@@ -3542,6 +3736,49 @@ static void vrGunUpBypass(void* reticle,std::uint64_t now) noexcept {
     (void)reticle;(void)now;
 #endif
 }
+// NPC AIM (vr/VrNpcAim.h): the actor on the VR barrel line, for the AI's aim-at report (hooked GetBestTarget). Main thread, reticle boundary.
+static void vrNpcAim(void* reticle,std::uint64_t now) noexcept {
+#if defined(RDRVR_HEAD_CAMERA) && defined(RDRVR_NATIVE_MENUS)
+    namespace na=::rdrvr::vr::npcaim;namespace H=::rdrvr::vr::holsters;
+    if(!na::hooked.load(std::memory_order_acquire)||!reticle||!weaponObservationReady.load(std::memory_order_acquire)||!reticleProbeReady.load(std::memory_order_acquire))return;
+    try{
+        const auto& api=weaponObservationApi;
+        const auto read=[&](std::uintptr_t p,void* out,std::size_t n){return api.read(api.context,p,out,n);};
+        na::Frame f{};f.now=now;f.reticle=reinterpret_cast<std::uintptr_t>(reticle);
+        LocalWeapon owner{};
+        if(weaponOwner.onOwnerThread()&&weaponOwner.inspect(owner)&&owner.player){
+            f.player=owner.player;f.actor=owner.actor;
+            if(H::holdHand.load(std::memory_order_acquire)>=0&&!H::duelActive.load(std::memory_order_relaxed)&&worldPresentationAllowed()){
+                const auto o=vw::ownerSnapshot();std::uintptr_t current{};
+                if(o.weapon&&o.weapon==owner.weapon&&vw::firearm(o.kind)&&o.aimAllowed&&o.stampNs&&!(now>o.stampNs&&now-o.stampNs>250'000'000)&&
+                   read(owner.actor+0xb8,&current,sizeof current)&&current==f.reticle){
+                    const auto l=vw::latestPlacement();
+                    if(l.weapon==o.weapon&&l.ns&&now>=l.ns&&now-l.ns<=150'000'000&&l.placement.unitsPerMetre>0.f){
+                        f.want=true;f.unitsPerMetre=l.placement.unitsPerMetre;
+                        for(unsigned i=0;i<3;++i){f.origin[i]=l.placement.origin[i];f.direction[i]=l.placement.direction[i];}
+                    }
+                }
+            }
+        }
+        na::tick(f,read,[&](const float* start,const float* end,na::Hit& out){
+            AimNativeVector a{},b{};for(unsigned i=0;i<3;++i){a.v[i]=start[i];b.v[i]=end[i];}
+            NativeAimHit hit{};const auto t0=diagnostics::monotonicNs();
+            out.ok=NativeAimProbe(reticleProbeApi.probe).castBetween(owner.actorGuid,a,b,hit);
+            na::noteCastNs(diagnostics::monotonicNs()-t0);
+            if(out.ok&&hit.blocked){out.blocked=true;out.distance=hit.distance;std::memcpy(&out.instance,hit.intersection.bytes.data(),sizeof out.instance);}
+        });
+    }catch(...){na::clearTarget();}
+#else
+    (void)reticle;(void)now;
+#endif
+}
+#if defined(RDRVR_CAMERA_BRIDGE)&&defined(RDRVR_PASS_RESOURCES)
+bool gameViewHeading(std::uint64_t now,float& theta) noexcept {
+    std::uint64_t origin{};float t{};
+    if(!visibilityBridge.viewHeading(now,t,origin)||(origin&::rdrvr::vr::cutscene::originSerialBit))return false; // a cutscene view is not the player's
+    theta=t;return true;
+}
+#endif
 void gameObserveReticle(void* reticle,std::uint64_t timestamp,std::uint64_t thread) noexcept {
     const int saved=errno;struct Restore{int saved;~Restore(){errno=saved;}} restore{saved};
 #ifdef RDRVR_NATIVE_MENUS
@@ -3555,6 +3792,7 @@ void gameObserveReticle(void* reticle,std::uint64_t timestamp,std::uint64_t thre
     vrNativeReticle();
     vrSniperFireZoom(timestamp); // SNIPER: zoom latch for RequestFire's CanSniperZoom
     vrGunUpBypass(reticle,timestamp); // GUN-UP: wall / blind-fire refusals of RequestFire (after vrReticleTarget: the barrel point)
+    vrNpcAim(reticle,timestamp); // NPC AIM: barrel target of the AI's aim-at report
 
 #ifdef RDRVR_HEAD_CAMERA
     try{
@@ -4479,13 +4717,16 @@ static void primaryDraw(PrimaryEyeBoundary::Stage stage,RetailSceneBoundary::Dra
                 const bool fill=::rdrvr::vr::bodyik::config.headShadow&&bodyDrawReady;
                 // THIRD PERSON keeps the head (no fill, no misses). The cutscene's own John neither: hook C never captures his set, every record would be a miss,
                 // which would also switch HEAD SHADOW off for the session (FALLBACK_MISSES)
-                bodyDrawFilter.setHeadFill(fill&&!eyeThirdPerson(plan)&&plan.actorGuid!=::rdrvr::vr::cutscene::guidFirstPersonSub?&::rdrvr::vr::bodyik::headFill:nullptr);
+                // HEAD SHOW: no fill while the eye is away from the head (the engine's uncollapsed set is drawn: the head is back)
+                bodyDrawFilter.setHeadFill(fill&&!eyeThirdPerson(plan)&&plan.actorGuid!=::rdrvr::vr::cutscene::guidFirstPersonSub&&!eyeHeadShow(plan).head?
+                    &::rdrvr::vr::bodyik::headFill:nullptr);
                 ::rdrvr::vr::bodyik::headFillInstalled.store(fill,std::memory_order_release);
             }
 #endif
             bodyDrawFilter.setGlobalHat(globalHatNode(plan.hatNode)); // BODY: no lone hat in the shadow (next passes / frames)
             bodyDrawFilter.setProbeCreature(plan.bodyCreature); // Probe: is the player's head its own draw node?
             ::rdrvr::engine::shadowupdate::stagger::playerCreature.store(plan.bodyCreature>1?plan.bodyCreature:0,std::memory_order_relaxed); // PLAYER SHADOW WINDOW (1 = CINEMATIC: none)
+            CinematicHeadAudit headAudit(plan); // before the eye scope: its counts land when the scope closes
             BodyDrawFilter::Eye body(bodyDrawFilter,eyeBodyCreature(plan),eyeHatNode(plan),true);
             std::optional<WorldDrawProfile::Eye> profile; // WATER: the colour stage unfiltered when the water targets are paired
             const int waterMode=depth?0:eyeWaterMode();const bool leftWater=!depth&&waterMode!=0&&eyeWaterReady;
@@ -4546,6 +4787,10 @@ runtime::SpaceWarpFrame spaceWarpFrame(const StereoCameraPlan& plan,std::uint64_
         // controller (the newest sample, mapped through this plan's worldFromLocal like the weapon placement)
         namespace sw=runtime::spacewarp;namespace vh=::rdrvr::vr::holsters;
         const auto now=diagnostics::monotonicNs();f.riding=::rdrvr::vr::reins::ridingFresh(now);
+        // a vehicle seat (debug.rdrvr.spacewarp.seatrig 0 = off): the coach box around the driver moves with the rig (race -4 player shape)
+        {static int seatRig=-1;static std::uint64_t seatRigNs{};if(seatRig<0||now-seatRigNs>1'000'000'000ull){char v[PROP_VALUE_MAX]{};
+            seatRig=__system_property_get("debug.rdrvr.spacewarp.seatrig",v)>0&&v[0]=='0'?0:1;seatRigNs=now;}
+         f.seat=f.riding&&seatRig&&::rdrvr::vr::seatsteady::seated.load(std::memory_order_relaxed);}
         static std::atomic<unsigned> reinPolls{};static std::atomic<bool> reinMvLever{true};
         if((reinPolls.fetch_add(1,std::memory_order_relaxed)&255u)==0){char v[PROP_VALUE_MAX]{};
             reinMvLever.store(!(__system_property_get("debug.rdrvr.vr.sw.reins",v)>0&&v[0]=='0'),std::memory_order_relaxed);}
@@ -4553,6 +4798,16 @@ runtime::SpaceWarpFrame spaceWarpFrame(const StereoCameraPlan& plan,std::uint64_
         // .reins.arm 0 / .body.mountedarm 0 the rein hands are drawn at the native pose / pinned to the native left wrist
         const auto& bc=::rdrvr::vr::bodyik::config;
         const bool reinMv=reinMvLever.load(std::memory_order_relaxed)&&bc.arms&&bc.mountedArm&&bc.reinsArm;
+        // HAND PHYSICS: debug.rdrvr.vr.sw.handfit 0 = the stock held capsules, 1 = fitted with radius 8 cm, 2..20 = fitted with that radius in cm.
+        // debug.rdrvr.vr.sw.handdrop 0 = a hand held back by a surface keeps its part. Both act only while the HAND PHYSICS row is not OFF.
+        static std::atomic<int> handFitLever{1};static std::atomic<bool> handDropLever{true};
+        if((reinPolls.load(std::memory_order_relaxed)&255u)==1u){char v[PROP_VALUE_MAX]{};
+            handFitLever.store(__system_property_get("debug.rdrvr.vr.sw.handfit",v)>0?std::clamp(std::atoi(v),0,20):1,std::memory_order_relaxed);
+            char d[PROP_VALUE_MAX]{};handDropLever.store(!(__system_property_get("debug.rdrvr.vr.sw.handdrop",d)>0&&d[0]=='0'),std::memory_order_relaxed);}
+        ::rdrvr::vr::bodyik::HandBox contactBox{};bool haveContactBox=false;
+        if(::rdrvr::vr::handphys::liveMode.load(std::memory_order_relaxed)!=::rdrvr::vr::handphys::ModeOff&&::rdrvr::vr::bodyik::handBox.load(contactBox)&&contactBox.ns)
+            haveContactBox=now>=contactBox.ns?now-contactBox.ns<=100'000'000ull:contactBox.ns-now<5'000'000ull;
+        const int contactFit=handFitLever.load(std::memory_order_relaxed);const bool contactDrop=handDropLever.load(std::memory_order_relaxed);
         runtime::ControllerSample input{};
         if(controllers.snapshot(now,input)&&input.epoch==plan.tracking.epochs.tracking&&input.referenceSpace==plan.tracking.epochs.referenceSpace){
             const int hold=vh::holdHand.load(std::memory_order_acquire),phantom=vh::phantomHand.load(std::memory_order_relaxed);
@@ -4571,7 +4826,12 @@ runtime::SpaceWarpFrame spaceWarpFrame(const StereoCameraPlan& plan,std::uint64_
                 const double n=std::sqrt(fw[0]*fw[0]+fw[1]*fw[1]+fw[2]*fw[2]);bool ok=n>0.5&&n<2.0;
                 for(int c=0;c<4;++c)for(int r=0;r<3;++r){out.m[c*3+r]=float(hw[c*4+r]);ok=ok&&std::isfinite(out.m[c*3+r]);}
                 for(int c=0;c<3;++c)out.forward[c]=float(fw[c]/n);
-                out.weapon=int(h)==hold||int(h)==phantom;out.valid=ok;}
+                out.weapon=int(h)==hold||int(h)==phantom;out.valid=ok;
+                if(haveContactBox){
+                    // the part claims every depth pixel inside its capsule: a surface the hand touches would take the hand's motion
+                    if(contactDrop&&contactBox.touch[h]){out.valid=false;::rdrvr::vr::handphys::mvDrops.fetch_add(1,std::memory_order_relaxed);}
+                    else if(contactFit&&out.weapon&&contactBox.tipLen[h]>0.f)sw::fitHeldCapsule(out,contactBox.tipLen[h],(contactFit==1?8.f:float(contactFit))*.01f);}
+            }
         }}
     return f;
 }
@@ -4610,7 +4870,7 @@ bool gameDrawRetailWorld(const RetailSceneFrame& scene) {
     diagnostics::WorldEvent profileEvent(cullDrawSerial);
     bool skipKeepsLease=false; // A WATER_TARGETS_UNPAIRED skip under debug.rdrvr.vr.waterflush bit 1
     auto skip=[&](const char* why,const char* detail=nullptr){profileEvent.result(why);worldReplayGate.skipped(skipKeepsLease||!std::strcmp(why,"PREVIOUS_EYES_PENDING"));recordWorldReject(why);worldStatus=why;++worldSkipped;
-        if(std::strcmp(why,"NATIVE_UI_THEATER"))diagnostics::worldFailureHistory.push(cullDrawSerial,detail?detail:why);
+        if(std::strcmp(why,"NATIVE_UI_THEATER")||nearPresentationChange())diagnostics::worldFailureHistory.push(cullDrawSerial,detail?detail:why);
         return false;};
     if(!sessionRunning.load()||stopWorker.load())return skip("XR_NOT_RUNNING");
     if(primaryRestoreFault.load(std::memory_order_acquire))return skip("PRIMARY_CAMERA_RESTORE_QUARANTINED");
@@ -4660,7 +4920,7 @@ bool gameDrawRetailWorld(const RetailSceneFrame& scene) {
         if(!gameViews.snapshot(now,latest)){trackingStatus="LIVE_TRACKING_UNAVAILABLE";return false;}
         if(latest.epochs!=plan.tracking.epochs){trackingStatus="TRACKING_EPOCH_CHANGED";return false;}
         trackingStatus="READY";return true;};
-    if(!trackingCurrent())return skip("FROZEN_TRACKING_EXPIRED");
+    if(!trackingCurrent()){char detail[64];std::snprintf(detail,sizeof detail,"FROZEN_TRACKING_EXPIRED:%s",trackingStatus);return skip("FROZEN_TRACKING_EXPIRED",detail);}
     LodDiagnostics::Pair lodPair(lodDiagnostics,reinterpret_cast<std::uintptr_t>(scene.renderer),reinterpret_cast<std::uintptr_t>(scene.viewport),plan,diagnostics::monotonicNs());
     if(retailPass){
         if(retailPass->poisoned)return skip("WORLD_OWNER_QUARANTINED");
@@ -4850,6 +5110,7 @@ bool gameDrawRetailWorld(const RetailSceneFrame& scene) {
     }
     if(!cullViewports->stereoCull(cullDrawRenderer,cullDrawSerial)){
         globals->discardUnchanged();recordWorldReject("WAITING_FOR_STEREO_CULL");
+        if(nearPresentationChange())diagnostics::worldFailureHistory.push(cullDrawSerial,"WAITING_FOR_STEREO_CULL");
         profileEvent.result("WAITING_FOR_STEREO_CULL");worldStatus="WAITING_FOR_STEREO_CULL";++worldSkipped;return false;
     }
     const auto preDrawNs=trackingCheckedNs;
@@ -4911,6 +5172,7 @@ bool gameDrawRetailWorld(const RetailSceneFrame& scene) {
         projectVisibleAimTarget(plan,lastAimTarget,targetAimGuid,targetAimRevision,targetAimStamp,nativeReticleFrame,now,targetReticle);
     }
     {
+        CinematicHeadAudit headAudit(plan); // before the eye scope: its counts land when the scope closes
         BodyDrawFilter::Eye bodyEye(bodyDrawFilter,eyeBodyCreature(plan),eyeHatNode(plan));
         result=owner.pass->drawScene(queue,*views,frame,runtime::SourceEncoding::Linear,before.gfx,before.context,*owner.resolve,PhaseDraw::invoke,&phased,targetReticle,primarySelection?&nativeLeft:nullptr);
         bodyFilterGood=bodyEye.good();
@@ -4980,6 +5242,7 @@ bool gameDrawRetailWorld(const RetailSceneFrame& scene) {
         passCapture.cancelFrame(frame.renderFrameId);++worldCancelled;
         worldReplayGate.rejectCompletion(plan,owner.images->generation(),completion);recordWorldReject(completionName);worldStatus=completionName;profileEvent.result(completionName);return false;
     }
+    runtime::bridge::revisionPairs.note(plan.presentationRevision,frame.renderFrameId); // STEREO BRIDGE: ends on the first pair of the new revision
     if(runtime::GameStereoCapture::warpWanted())passCapture.setWarpFrame(spaceWarpFrame(plan,frame.renderFrameId));
     if(hudFrameContext.renderer==scene.renderer&&!hudFrameContext.interval)hudFrameContext.world=frame;
     diagnostics::frameTimings.worldRecorded.elapsedWall(worldTiming.start(),diagnostics::monotonicNs());
@@ -5115,10 +5378,13 @@ std::uint64_t gameBeginVisibility(std::uintptr_t renderer,std::uint32_t marker,s
         namespace cs=::rdrvr::vr::cutscene;const auto ctx=cutsceneCtx(state.context);cs::composer.note(ctx);
         cs::noteContext(unsigned(state.context),ns); // Which context a story scene reports
         {static unsigned leverCalls=0;if((leverCalls++&63u)==0)cs::readOverrideLever();}
-        if(!state.world()&&cs::requested()&&cs::composer.eligible(ctx)){
+        if(!state.world()&&cs::requested()&&cs::composer.eligible(ctx,ns)){
             waterForce(true);
             const bool ok=cutsceneAnchor(viewport,camera,ns,reader,context,state,ctx,anchor);
             const auto serial=visibilityBridge.begin(renderer,marker,viewport,camera,ns,reader,context,ok?&anchor:nullptr,true);
+            if(state.context==runtime::PresentationContext::CameraOverride){namespace sb=runtime::bridge; // the shot run of the report
+                sb::shots.bump(sb::Eligible);if(ok)sb::shots.bump(sb::Composed);
+                if(ok&&serial){sb::shots.bump(sb::Stereo);sb::shots.setMode(cs::engagedMode.load(std::memory_order_relaxed));}}
             cutsceneShadowPublish(renderer,serial,ok);
             if(ok&&serial){cs::engagedRevision.store(state.revision,std::memory_order_release);cs::engagedNs.store(ns,std::memory_order_release);cs::bump(cs::stats.stereo);
                 // debug.rdrvr.eyedump.cutscene K = an eye dump on the K-th stereo frame of every cutscene (the first frames of a scene)
@@ -5636,10 +5902,18 @@ std::string gameXrReport() {
 #endif
     out<<",\"controlMap\":"<<::rdrvr::vr::controlmap::report();
     out<<",\"reins\":"<<::rdrvr::vr::reins::report(); // REINS
+    out<<",\"coachReins\":"<<::rdrvr::vr::coach::report(); // COACH REINS
     out<<",\"riding\":{\"samples\":"<<ridingSamples.load()<<",\"noHead\":"<<ridingNoHead.load()<<",\"notAttached\":"<<ridingNotAttached.load()
        <<",\"identity\":"<<ridingIdentity.load()<<",\"lastPlayerState\":"<<ridingLastState.load()
        <<",\"turns\":"<<ridingTurns.load()<<",\"turnDeclined\":"<<ridingTurnDeclined.load()<<",\"turnedDeg\":"<<ridingTurnedDeg.load()
        <<",\"recenters\":"<<ridingRecenters.load()<<",\"lastRecenterDeg\":"<<ridingRecenterDeg.load();
+    {namespace ss=::rdrvr::vr::seatsteady; // SEAT STEADY (vr/VrSeatSteady.h)
+     out<<",\"seat\":{\"active\":"<<(ss::active.load()?"true":"false")<<",\"body\":"<<(ss::bodyLever.load()?"true":"false")<<",\"frames\":"<<ss::frames.load()
+        <<",\"reseeds\":"<<ss::reseeds.load()<<",\"clampFrames\":"<<ss::clampFrames.load()<<",\"yawClampFrames\":"<<ss::yawClampFrames.load()
+        <<",\"shakeOn\":"<<ss::shakeOn.load()<<",\"leverOff\":"<<ss::leverOff.load()<<",\"bodyFrames\":"<<ss::bodyFrames.load()
+        <<",\"offsetCm\":"<<std::round(ss::errCm.load()*10.f)/10.f<<",\"offsetCmMax\":"<<std::round(ss::errCmMax.load()*10.f)/10.f
+        <<",\"offsetMeanCm\":"<<std::round(ss::rawSwayCm.load()*10.f)/10.f<<",\"yawOffsetDeg\":"<<std::round(ss::yawErrDeg.load()*100.f)/100.f
+        <<",\"yawOffsetDegMax\":"<<std::round(ss::yawErrDegMax.load()*100.f)/100.f<<"}";}
     // Horse-relative steering, camera vs horse, the turn accumulator, the mount recenter, the riding eye
     out<<",\"horseRel\":{\"lever\":"<<(horseRelLeverOn.load()?1:0)<<",\"active\":"<<(::rdrvr::vr::reins::horseRelActive.load()?"true":"false")
        <<",\"forced\":"<<(horseRelForcedNow.load()?"true":"false")<<",\"value638\":"<<horseRel638.load()<<",\"value63c\":"<<horseRel63c.load()
@@ -5790,7 +6064,7 @@ std::string gameXrReport() {
     out<<",\"nativeInput\":{\"state\":\""<<nativePad.status()<<"\",\"updates\":"<<nativePad.updates()
        <<",\"neutralUpdates\":"<<nativePad.neutralUpdates()<<",\"created\":"<<nativePad.created()
        <<",\"filterRejected\":"<<nativePad.filterRejected()<<",\"controlsRejected\":"<<nativePad.controlsRejected()
-       <<",\"delivery\":"<<nativePad.deliveryReport()<<"}";
+       <<",\"delivery\":"<<nativePad.deliveryReport()<<",\"rearm\":"<<runtime::rearmReport()<<"}";
     out<<",\"haptics\":{\"source\":\"native-actuator-pair\",\"published\":"<<haptics.published()
        <<",\"rejected\":"<<haptics.rejected()<<",\"declined\":"<<hapticDeclined<<",\"applied\":"<<hapticApplied
        <<",\"stopped\":"<<hapticStopped<<",\"failed\":"<<hapticFailed<<",\"maxAgeNs\":"<<runtime::HapticMailbox::maxAgeNs

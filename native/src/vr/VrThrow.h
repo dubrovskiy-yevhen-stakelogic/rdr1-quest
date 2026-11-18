@@ -319,6 +319,18 @@ inline bool fromTape(unsigned h,std::uint64_t space,std::uint64_t now,ReleaseEst
     for(unsigned i=0;i<n;++i)out.add(got[i].ns,got[i].p[h],got[i].q[h]);
     return out.count()>=3;
 }
+// Input thread (diagnostics): the runtime's linear velocity of hand h (XrSpaceVelocity, LOCAL) in the tape entry of reference space
+// `space` nearest to ns (by poseNs when set, else ns), within 60 ms. False = no such entry with the tapeLinear bit.
+inline bool tapeVelocityAt(unsigned h,std::uint64_t space,std::uint64_t ns,V3& out) noexcept {
+    if(h>1||!space||!ns)return false;
+    const auto head=tapeHead.load(std::memory_order_acquire);
+    std::uint64_t best=~0ull;bool found=false;
+    for(std::uint64_t i=head>tapeSize?head-tapeSize:0;i<head;++i){TapeEntry t{};
+        if(!tapeRing[i%tapeSize].load(t)||t.space!=space||!(t.valid&tapeLinear(h))||!math::finite(t.v[h]))continue;
+        const std::uint64_t at=t.poseNs?t.poseNs:t.ns;const std::uint64_t d=at>ns?at-ns:ns-at;
+        if(d<best&&d<=60'000'000ull){best=d;out=t.v[h];found=true;}}
+    return found;
+}
 
 // =====================================================================================================================
 // Published state.

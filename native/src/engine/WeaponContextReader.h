@@ -1,6 +1,7 @@
 #pragma once
 #include "WeaponOwnerReader.h"
 #include "vr/VrDuelRoute.h"
+#include "vr/VrVehicleSeat.h"
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -13,6 +14,10 @@ struct WeaponContext {
     bool animationFirePending{};
     // Preserve raw references alongside their generation-checked native validity.
     std::uint32_t linkedActorGuid{},gringoGuid{};
+    // Player state 3 only (readSeat): vehicleType = sagVehicleType+0x10 (-1 unread), seatClass = vehicleseat::SeatClass, seatIndex = the location
+    // index, seatSwap = a move between seats runs, weaponSeat = VR weapons work in this seat. ridingVehicle stays true there: knownLock
+    // and the readers that keep every vehicle seat native do not change.
+    std::int32_t vehicleType{-1},seatIndex{-1};unsigned seatClass{};bool seatSwap{},weaponSeat{};
     std::uint32_t flags()const {
         return (!alive?1u:0u)|(controlDisabled?2u:0u)|(deadEye?4u:0u)|(riding?8u:0u)|
             (ridingVehicle?16u:0u)|(vehicleTransition?32u:0u)|(duel?64u:0u)|(mountedWeapon?128u:0u)|
@@ -53,6 +58,30 @@ class WeaponContextReader {
             if(!api.read(api.context,e.address,now.data(),e.size)||std::memcmp(e.value.data(),now.data(),e.size))return false;
         }return true;}
     };
+    // actor+0x40 -> +0x238 = the actor's vehicle location record (sagActorComponent::GetVehicle / IsInsideVehicle, sagPlayerInputWagon::
+    // ConsiderSeatChange): +0x14 location index, +0x20 1 = inside / 4 = moving between seats, +0x50 the vehicle's actor guid. That actor's
+    // +0xb0 sagVehicleComponent -> +0xa38 the vehicle sim (LookupVehicleFromGuid): +0xac the same guid (CreateVehicleSim), +0x90 -> +0x10 the
+    // vehicle type sagPlayer::UpdateStateVehicle picks the input by. Component+0xc88 = sagVehLocationSet: +0x18 records of 0x78 bytes, +0x20 count;
+    // record +0x70 PilotLocation, +0x71 WeaponLocation. enterState 3 = sagPlayerVehAction::GetVehicleTransitionSignal. A failed read leaves
+    // weaponSeat false: the seat stays refused.
+    void readSeat(Journal& r,std::uintptr_t actor,std::int32_t enterState,WeaponContext& out)const noexcept {
+        namespace S=::rdrvr::vr::vehicleseat;
+        out.seatSwap=enterState==3;
+        std::uintptr_t body{},record{},vehicleActor{},component{},sim{},type{},set{},seats{};
+        std::uint32_t guid{},simGuid{},place{};std::int32_t index{-1},kind{-1};std::uint16_t count{};std::uint8_t pilot{},shotgun{};bool valid{};
+        if(!r.get(actor,0x40,body)||!r.get(body,0x238,record)||!r.get(record,0x14,index)||!r.get(record,0x20,place)||!r.get(record,0x50,guid)||
+           !r.resolve(api_.actorManagerGlobal,api_.actorSlotsGlobal,guid,valid,&vehicleActor)||!valid||
+           !r.get(vehicleActor,0xb0,component)||!r.get(component,0xa38,sim)||!r.get(sim,0xac,simGuid)||simGuid!=guid||
+           !r.get(sim,0x90,type)||!r.get(type,0x10,kind))return;
+        out.vehicleType=kind;out.seatIndex=index;
+        if(place==4u)out.seatSwap=true;
+        if(out.seatSwap)out.seatClass=S::SeatMoving;
+        else if(place==1u&&index>=0&&r.get(component,0xc88,set)&&r.get(set,0x20,count)&&std::uint32_t(index)<count&&r.get(set,0x18,seats)){
+            const std::uintptr_t seat=seats+std::uintptr_t(index)*0x78;
+            if(r.get(seat,0x70,pilot)&&r.get(seat,0x71,shotgun))out.seatClass=pilot?S::SeatDriver:shotgun?S::SeatShotgun:S::SeatPassenger;
+        }
+        out.weaponSeat=S::eligible(kind,out.seatClass);
+    }
     // Call only on the current owner's native thread, with a fresh LocalWeapon.
     // No native methods/virtual casts, no mutations and no use as a cached permit.
     bool inspectImpl(const LocalWeapon& owner,WeaponContext& out,bool weapon)const noexcept {
@@ -79,6 +108,7 @@ class WeaponContextReader {
                !r.get(owner.player,0x418,vehicle)||!r.get(vehicle,8,enter)||!r.get(vehicle,9,leave)||!r.get(vehicle,0x18,enterState))return false;
             result.alive=hp>0;result.controlDisabled=locks||lock1||lock2;result.deadEye=eyeState!=0;
             result.riding=state==5;result.ridingVehicle=state==3;result.vehicleTransition=(enter&&enterState!=3)||leave;
+            if(state==3)readSeat(r,owner.actor,enterState,result);
             // Vector Aim does not clear a previous tracked-shot bit. Native
             // ManagerAim / FireProjectile and the launch-override setters use
             // these fields independently of Dead Eye's current player state.

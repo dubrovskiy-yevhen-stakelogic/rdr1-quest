@@ -86,6 +86,13 @@ struct EngineProbeApi {
     explicit operator bool() const noexcept {return exclude&&probe&&closest;}
 };
 inline std::atomic<const EngineProbeApi*> engineApi{};
+// The mod's own physics instances (HAND PHYSICS bodies) that every cast excludes as well: compare-only for the engine, null = none.
+inline std::array<std::atomic<const void*>,2> extraExcluded{};
+// Appends them to an exclude list of `count` entries; the list stays below `cap` (castWith refuses a full one).
+inline int appendExtraExcluded(const void** list,int count,int cap) noexcept {
+    for(auto& e:extraExcluded){const void* p=e.load(std::memory_order_relaxed);if(p&&count+1<cap)list[count++]=p;}
+    return count;
+}
 
 enum class Select : std::uint8_t {BulletStopper=0,AnySurface=1};   // FindClosestBulletStopper bool
 // Include masks (read from the engine's call sites, not named rage enums): 0x500208 =
@@ -145,6 +152,7 @@ inline ProbeResult castWith(const EngineProbeApi& api,std::uint32_t actorGuid,co
         if(!list||count<=0){
             count=api.exclude(&actorGuid,own.data(),int(own.size()),0x176);
             if(count<=0||count>=int(own.size()))return ProbeResult::Failed;
+            count=appendExtraExcluded(own.data(),count,int(own.size()));
             list=own.data();
         }
         if(count<=0||count>=20)return ProbeResult::Failed;
@@ -236,14 +244,18 @@ struct Ledger {
         bump(users[u].refused);return false;
     }
     // Every cast (the laser, VrThrow and arc::probe included): time, length (metres), engine failure.
-    void charge(ProbeUser user,std::uint64_t ns,float metres,bool failed) noexcept {
-        roll();const auto u=unsigned(user);if(u>=probeUsers)return;
+    void charge(ProbeUser user,std::uint64_t ns,float metres,bool failed) noexcept {roll();noteCast(user,ns,metres,failed);}
+    // The accounting of one cast without a window roll: a user that only reports its casts leaves the grants of the others alone.
+    void noteCast(ProbeUser user,std::uint64_t ns,float metres,bool failed) noexcept {
+        const auto u=unsigned(user);if(u>=probeUsers)return;
         auto& s=users[u];bump(s.casts);if(failed)bump(s.failed);s.nsSum.fetch_add(ns,std::memory_order_relaxed);maxOf(s.nsMax,ns);
         const float m=std::isfinite(metres)&&metres>0.f?std::min(metres,1e5f):0.f;s.mmSum.fetch_add(std::uint64_t(m*1000.f),std::memory_order_relaxed);
         if(m>=.1f){const auto perM=std::uint64_t(double(ns)/double(m));bump(s.nsPerMSumCasts);maxOf(s.nsPerMMax,perM);}
-        ++windowCasts;windowNs+=ns;
+        if(window==currentWindow()){++windowCasts;windowNs+=ns;}
     }
     void demand(ProbeUser user,unsigned casts) noexcept {roll();const auto u=unsigned(user);if(u<probeUsers)demandNow[u]=std::max(demandNow[u],casts);}
+    // The casts and time charged to this window so far (main thread).
+    void windowLoad(std::uint64_t& casts,std::uint64_t& ns) const noexcept {const bool current=window==currentWindow();casts=current?windowCasts:0u;ns=current?windowNs:0u;}
     // One exclude() per (tick run, actor); nullptr outside a mainthread::run call or when the engine refuses (castWith builds its own).
     const void* const* excluded(std::uint32_t actorGuid,int& count) noexcept {
         count=0;const auto run=mainthread::runningFrame.load(std::memory_order_relaxed);const auto* api=engineApi.load(std::memory_order_acquire);
@@ -254,7 +266,8 @@ struct Ledger {
             std::uint32_t guid=actorGuid;const int n=api->exclude(&guid,excludeList.data(),int(excludeList.size()),0x176);
             if(n<=0||n>=int(excludeList.size())){bump(excludeFailed);return nullptr;}
             for(int i=0;i<n;++i)if(!excludeList[std::size_t(i)]){bump(excludeFailed);return nullptr;}
-            excludeWindow=run;excludeGuid=actorGuid;excludeCount=n;count=n;return excludeList.data();
+            const int all=appendExtraExcluded(excludeList.data(),n,int(excludeList.size()));
+            excludeWindow=run;excludeGuid=actorGuid;excludeCount=all;count=all;return excludeList.data();
         }catch(...){bump(excludeFailed);return nullptr;}
     }
     unsigned granted(ProbeUser u) const noexcept {return grant[unsigned(u)];}

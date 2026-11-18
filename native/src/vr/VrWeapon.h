@@ -224,7 +224,8 @@ inline std::atomic<std::uint64_t> gunUpChecks{},gunUpWrites{},gunUpSweep{},gunUp
 inline std::atomic<int> gunUpLastCause{-1};inline std::atomic<bool> gunUpStock{};
 // NATIVE RETICLE: the game draws its free-aim dot into the HUD while sagPlayerStates+0xc (the reticle prevention mask) is 0.
 // The VR-held firearm aims with its barrel and laser, so while one is held the mod sets its own mask bit (mission scripts hide the
-// reticle the same way with 0x10000). EvaluateReticleDraw then fades the reticle UI alpha to 0; aiming and firing do not read it.
+// reticle the same way with 0x10000). EvaluateReticleDraw then fades the reticle UI alpha to 0; aiming and firing do not read it, but
+// sagPlayer::UpdateInput gates its aim-at report to the AI on that alpha (0x2698b20; vr/VrNpcAim.h).
 inline constexpr std::uint32_t reticlePreventionBit=0x40000000u;
 inline std::atomic<std::uint64_t> reticleHiddenFrames{},reticleShownFrames{};
 
@@ -279,15 +280,16 @@ inline std::atomic<std::uint64_t> deadEyeSeenNs{};
 inline constexpr std::uint64_t deadEyeTailNs=3'000'000'000ull;
 inline ContextGates gates(const E::WeaponContext& c,E::WeaponClass kind,const Config& cfg,std::uint64_t now=0) noexcept {
     ContextGates g{};
-    g.pose=attachable(kind,cfg)&&c.alive&&!c.controlDisabled&&!c.ridingVehicle&&!c.vehicleTransition&&!c.mountedWeapon&&
+    // A vehicle seat counts only as WeaponContext::weaponSeat. A move between seats keeps the gun at the hand, without aim or force aim.
+    g.pose=attachable(kind,cfg)&&c.alive&&!c.controlDisabled&&(!c.ridingVehicle||c.weaponSeat)&&!c.vehicleTransition&&!c.mountedWeapon&&
         !c.mountingHorse&&!c.linkedAnimation&&!c.usingGringo;
-    g.force=g.pose&&firearm(kind)&&!c.deadEye&&!c.duel&&!c.cover;
+    g.force=g.pose&&firearm(kind)&&!c.deadEye&&!c.duel&&!c.cover&&!c.seatSwap;
     const auto seen=deadEyeSeenNs.load(std::memory_order_relaxed);
     const bool deadEyeTail=c.deadEye||(seen&&now>=seen&&now-seen<deadEyeTailNs);
     // Duel / cover / blind fire / scripted DrV launch keep the native target (they aim and fire by themselves).
     // DEAD EYE: the VR gun keeps aiming while Dead Eye runs (the world slows, the hand does not); the engine's own tracked shots
     // (painted targets, +0x188 bit5) stay native. debug.rdrvr.vr.deadeye.aim native = the native Dead Eye target.
-    const bool deadEyeAim=c.deadEye&&::rdrvr::vr::deadeye::vrAim.load(std::memory_order_relaxed)&&g.pose&&firearm(kind)&&!c.duel&&!c.cover;
+    const bool deadEyeAim=c.deadEye&&::rdrvr::vr::deadeye::vrAim.load(std::memory_order_relaxed)&&g.pose&&firearm(kind)&&!c.duel&&!c.cover&&!c.seatSwap;
     g.aim=(g.force||deadEyeAim)&&!c.blindFiring&&!c.driveLaunchOverride&&!(c.trackedShot&&deadEyeTail);
     if(deadEyeAim&&g.aim)::rdrvr::vr::deadeye::bump(::rdrvr::vr::deadeye::vrAimFrames);
     return g;
@@ -1508,11 +1510,11 @@ inline std::string report() {
         std::snprintf(b,sizeof b,"%s\"%s\":%llu",first?"":",",shotReasonNames[i],(unsigned long long)n);out+=b;first=false;}}
     out+="}},\"diagnostics\":"+firediag::report()+',';
     std::snprintf(b,sizeof b,"\"triggers\":{\"ltNative\":%s,\"meleeTrigger\":%s,\"heldKind\":%d,\"edges\":%llu,\"forwarded\":%llu,"
-        "\"ltBlockedFrames\":%llu,\"rtBlockedMelee\":%llu,\"rtBlockedCylinder\":%llu,\"rtBlockedRearm\":%llu,\"bMaskedFrames\":%llu,"
+        "\"ltBlockedFrames\":%llu,\"rtBlockedMelee\":%llu,\"rtBlockedCylinder\":%llu,\"rtBlockedRearm\":%llu,\"armMaskBlocked\":%llu,\"bMaskedFrames\":%llu,"
         "\"empty\":{\"native\":%s,\"strikeOnly\":%s,\"edgesWithheld\":%llu,\"framesWithheld\":%llu,\"strikePassed\":%llu,\"passedGated\":%llu}},",
         H::ltNative.load()?"true":"false",H::meleeTrigger.load()?"true":"false",H::heldKind.load(),(unsigned long long)H::triggerEdges.load(),
         (unsigned long long)H::triggerForwarded.load(),(unsigned long long)H::ltBlockedFrames.load(),(unsigned long long)H::rtBlockedMelee.load(),
-        (unsigned long long)H::rtBlockedCylinder.load(),(unsigned long long)H::rtBlockedRearm.load(),(unsigned long long)H::bMaskedFrames.load(),
+        (unsigned long long)H::rtBlockedCylinder.load(),(unsigned long long)H::rtBlockedRearm.load(),(unsigned long long)H::armMaskBlocked.load(),(unsigned long long)H::bMaskedFrames.load(),
         H::emptyTriggerNative.load()?"true":"false",H::nativeFistTrigger.load()?"true":"false",(unsigned long long)H::emptyTriggerEdges.load(),
         (unsigned long long)H::emptyTriggerFrames.load(),(unsigned long long)H::emptyStrikePassed.load(),(unsigned long long)H::emptyTriggerPassedGated.load());out+=b;
     out+="\"reload\":";out+=::rdrvr::vr::reload::report();out+=",";

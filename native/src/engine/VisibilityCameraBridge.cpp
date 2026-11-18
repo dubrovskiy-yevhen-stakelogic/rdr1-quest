@@ -97,11 +97,15 @@ void VisibilityCameraBridge::publishYaw(const StereoCameraPlan& plan,std::uint64
     const auto& q=plan.tracking.eyes[0].orientation;const auto& w=plan.world[0];
     const auto u=runtime::rotate({-q[0],-q[1],-q[2],q[3]},{0,0,1});
     const float x=w[0]*u[0]+w[4]*u[1]+w[8]*u[2],z=w[2]*u[0]+w[6]*u[1]+w[10]*u[2];
-    if(!std::isfinite(x)||!std::isfinite(z)||x*x+z*z<0.25f)return; // tilted base: no horizontal heading
+    const bool yawOk=std::isfinite(x)&&std::isfinite(z)&&x*x+z*z>=0.25f; // tilted base: no horizontal heading
+    // View heading: both eyes' back axes summed (column-major, column 2); |h| < 0.5 = looking nearly straight up / down (pitch > ~75 deg).
+    const auto& v=plan.world[1];const float hx=w[8]+v[8],hz=w[10]+v[10];
+    const bool arrowOk=std::isfinite(hx)&&std::isfinite(hz)&&hx*hx+hz*hz>=0.25f;
+    if(!yawOk&&!arrowOk)return;
     const auto s=yawSequence_.load(std::memory_order_relaxed);
     yawSequence_.store(s+1,std::memory_order_relaxed);std::atomic_thread_fence(std::memory_order_release);
-    yaw_.store(std::atan2(x,z),std::memory_order_relaxed);yawNs_.store(ns,std::memory_order_relaxed);
-    yawOrigin_.store(plan.originSerial,std::memory_order_relaxed);
+    if(yawOk){yaw_.store(std::atan2(x,z),std::memory_order_relaxed);yawNs_.store(ns,std::memory_order_relaxed);yawOrigin_.store(plan.originSerial,std::memory_order_relaxed);}
+    if(arrowOk){arrow_.store(std::atan2(hx,hz),std::memory_order_relaxed);arrowNs_.store(ns,std::memory_order_relaxed);arrowOrigin_.store(plan.originSerial,std::memory_order_relaxed);}
     yawSequence_.store(s+2,std::memory_order_release);
 }
 bool VisibilityCameraBridge::worldYaw(std::uint64_t now,float& psi,std::uint64_t& originSerial,std::uint64_t maxAgeNs) const noexcept {
@@ -114,6 +118,18 @@ bool VisibilityCameraBridge::worldYaw(std::uint64_t now,float& psi,std::uint64_t
         // The render stamp may trail or lead the main-thread clock read by a few microseconds.
         if(!s||!at||(now>at&&now-at>maxAgeNs)||(at>now&&at-now>maxAgeNs)||!std::isfinite(yaw))return false;
         psi=yaw;originSerial=origin;return true;
+    }
+    return false;
+}
+bool VisibilityCameraBridge::viewHeading(std::uint64_t now,float& theta,std::uint64_t& originSerial,std::uint64_t maxAgeNs) const noexcept {
+    for(unsigned attempt=0;attempt<4;++attempt){
+        const auto s=yawSequence_.load(std::memory_order_acquire);if(s&1u)continue;
+        const float t=arrow_.load(std::memory_order_relaxed);const auto at=arrowNs_.load(std::memory_order_relaxed);
+        const auto origin=arrowOrigin_.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if(yawSequence_.load(std::memory_order_relaxed)!=s)continue;
+        if(!s||!at||(now>at&&now-at>maxAgeNs)||(at>now&&at-now>maxAgeNs)||!std::isfinite(t))return false;
+        theta=t;originSerial=origin;return true;
     }
     return false;
 }

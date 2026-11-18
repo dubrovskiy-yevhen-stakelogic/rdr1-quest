@@ -13,9 +13,11 @@ layout(location=8) in vec2 texcoord;
 // clip = F * P_eye * inverse(E_eye) * M_hand (double on the CPU). light.xyz = light direction in MODEL space
 // (M is orthonormal up to scale, so the model-space direction gives the LOCAL-space Lambert term), light.w = ambient.
 // params: x brightness, y world-depth test, z output encode (0 linear, 1 sRGB, 2 inverse Reinhard), w depth epsilon.
-layout(push_constant) uniform Push {mat4 clip;vec4 weights;vec4 light;vec4 params;} push;
+// blood: xyz knuckle face centre in MODEL space of the FIST pose (p3), w tint 0..1 (VrHandBlood.h; 0 = none).
+layout(push_constant) uniform Push {mat4 clip;vec4 weights;vec4 light;vec4 params;vec4 blood;} push;
 layout(location=0) out vec2 uv;
 layout(location=1) out float shade;
+layout(location=2) out vec4 blood; // the vertex on the fist pose relative to the knuckle centre, w tint
 void main(){
     const vec4 w=push.weights;
     const vec3 p=w.x*p0+w.y*p1+w.z*p2+w.w*p3;
@@ -24,4 +26,5 @@ void main(){
     uv=texcoord;
     const float lambert=dot(n,n)>1e-12?max(dot(normalize(n),push.light.xyz),0.0):0.0;
     shade=push.light.w+(1.0-push.light.w)*lambert;
+    blood=vec4(p3-push.blood.xyz,push.blood.w); // on the fist pose: the tint stays on the same skin when the hand opens
 }

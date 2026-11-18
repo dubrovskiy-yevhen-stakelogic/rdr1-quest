@@ -24,6 +24,12 @@
 // Kill switch debug.rdrvr.vr.marker 0 (Feature::Marker: no checks, no module); menu MOVEMENT > QUEST MARKER ON/OFF; levers (every 64 ticks):
 // debug.rdrvr.vr.marker.sources (bits 1 objective blips + yellow radius areas, 2 mission GPS, 4 map waypoint, 8 script glow, 16 mission
 // starts; default 3).
+// OBJECT GLOW beam: gohGlowManager's optic has the same fate as the script glow (OpticsManager::Draw, not in the eyes), so a glow a script
+// marked as priority (entry+0x20, engine/ObjectGlowTable.h: pickups always store 0, and only the Merchant02 skull passes 1) gets its own beam
+// at the effect's position, next to the objective's beam and never in its place. Within objectGlowMaxM only: nothing but RemoveObjectGlow or
+// the object's death ends a glow, so one left behind by a script must not become a beam across the map. Hidden with the rest of the marker
+// outside the World presentation (cutscenes, camera overrides, menus, optics). debug.rdrvr.vr.marker.glow 0 = no such beam.
+#include "engine/ObjectGlowTable.h"
 #include "HandsArcApi.h"
 #include "VrArc.h"
 #include "VrMainThread.h"
@@ -89,10 +95,11 @@ inline constexpr std::array<unsigned char,188> scriptGlowCreateFingerprint{
 };
 } // namespace elf
 
-enum Source : std::uint32_t {SrcObjective=1,SrcMission=2,SrcUser=4,SrcGlow=8,SrcContact=16,SrcAll=31};
+enum Source : std::uint32_t {SrcObjective=1,SrcMission=2,SrcUser=4,SrcGlow=8,SrcContact=16,SrcAll=31,SrcObjectGlow=32}; // SrcObjectGlow: its own lever, not in .sources
 inline constexpr std::array<int,6> objectiveSprites{33,34,35,58,115,116};
 inline constexpr int contactFirst=2,contactLast=24;
-inline constexpr unsigned maxTargets=16,maxDrawn=1; // Release: one beam, the nearest target
+inline constexpr unsigned maxTargets=16,maxDrawn=2; // one beam for the nearest target, one more for an object glow
+inline constexpr float objectGlowMaxM=60.f;
 inline constexpr std::uint64_t scanIntervalNs=250'000'000;
 struct Target {V3 pos{};std::uint32_t source{};int sprite{-1};};
 
@@ -110,11 +117,11 @@ inline std::atomic<const char*> installNote{"NOT RUN"};
 struct Stats {
     using C=std::atomic<std::uint64_t>;
     C ticks{},scans{},scanUsSum{},scanUsMax{},reads{},readFailures{},slots{},complexBlips{},shown{},objective{},areas{},contacts{},waypoints{},glows{},
-      published{},hidden{},exceptions{},leverReads{},rejected{},merged{};
+      published{},hidden{},exceptions{},leverReads{},rejected{},merged{},objectGlows{},objectGlowsFar{},objectGlowBeamTicks{};
     std::array<C,8> display{}; // display value histogram of the shown objective-sprite blips (7 = >= 7)
 };
 inline Stats stats;
-inline std::atomic<std::uint32_t> sourcesLever{SrcObjective|SrcMission|SrcGlow},depthLever{1},lastCount{},lastSources{},glowCount{};
+inline std::atomic<std::uint32_t> sourcesLever{SrcObjective|SrcMission|SrcGlow},depthLever{1},objectGlowLever{1},lastCount{},lastSources{},glowCount{},objectGlowEntries{},objectGlowPriority{};
 inline std::atomic<const char*> hideReason{"NOT RUN"};
 struct Shown {std::uint32_t count{};std::array<Target,maxDrawn> t{};std::array<float,maxDrawn> distM{};};
 inline hs::SeqCell<Shown> shownCell; // main thread writes, report reads
@@ -140,13 +147,13 @@ inline int spriteOf(std::uintptr_t desc,std::uint32_t sources) noexcept {
 }
 inline void add(Target* out,unsigned& n,const V3& p,std::uint32_t src,int sprite,float mergeUnits) noexcept {
     for(unsigned i=0;i<n;++i){const float dx=out[i].pos[0]-p[0],dz=out[i].pos[2]-p[2];
-        if(dx*dx+dz*dz<mergeUnits*mergeUnits){out[i].source|=src;if(src&(SrcMission|SrcUser))out[i].pos=p;bump(stats.merged);return;}} // GPS y wins (full xyz)
+        if(dx*dx+dz*dz<mergeUnits*mergeUnits){out[i].source|=src;if(src&(SrcMission|SrcUser|SrcObjectGlow))out[i].pos=p;bump(stats.merged);return;}} // GPS y wins (full xyz), the glow's point wins over that
     if(n<maxTargets)out[n++]={p,src,sprite};
 }
 } // namespace detail
 
 // Guarded scan (main thread). Returns the target count; never throws.
-inline unsigned scan(Target* out,std::uint32_t sources,float upm) noexcept {
+inline unsigned scan(Target* out,std::uint32_t sources,float upm,const V3& eye) noexcept {
     using namespace detail;auto& S=scratch;unsigned n=0,calls=0;const float merge=3.f*std::max(upm,.01f);
     if(!env)return 0;
     if(sources&(SrcObjective|SrcContact)){
@@ -195,6 +202,17 @@ inline unsigned scan(Target* out,std::uint32_t sources,float upm) noexcept {
             glowCount.store(count,std::memory_order_relaxed);const V3 v{p[0],p[1],p[2]};
             if((sources&SrcGlow)&&sane(v)){bump(stats.glows);add(out,n,v,SrcGlow,-1,merge);}}
     }
+    if(sources&SrcObjectGlow){
+        namespace og=::rdrvr::engine::objectglow;std::array<og::Glow,og::maxPositions> g{};unsigned entries=0,priority=0;
+        const unsigned found=og::readPositions(env.read,g.data(),unsigned(g.size()),entries);calls+=3;if(found)++calls;
+        for(unsigned i=0;i<found;++i){
+            if(!g[i].priority)continue; // a pickup or an ordinary script glow
+            ++priority;const V3 v{g[i].pos[0],g[i].pos[1],g[i].pos[2]};if(!sane(v))continue;
+            if(am::distance(v,eye)/std::max(upm,.01f)>objectGlowMaxM){bump(stats.objectGlowsFar);continue;}
+            bump(stats.objectGlows);add(out,n,v,SrcObjectGlow,-3,merge);
+        }
+        objectGlowEntries.store(entries,std::memory_order_relaxed);objectGlowPriority.store(priority,std::memory_order_relaxed);
+    }else{objectGlowEntries.store(0,std::memory_order_relaxed);objectGlowPriority.store(0,std::memory_order_relaxed);}
     bump(stats.reads,calls);return n;
 }
 
@@ -213,9 +231,9 @@ inline unsigned buildFrame(const Target* t,unsigned n,const V3& eye,V3 up,float 
     unsigned pts=0,beams=0;
     const auto put=[&](const V3& p,float hw,float a){auto& q=out.points[pts++];q.position[0]=p[0];q.position[1]=p[1];q.position[2]=p[2];
         q.halfWidthM=std::clamp(hw,.0006f,.19f);q.rgba=hs::packRgba(yr,yg,yb,a);q.depthTolM=0;};
-    for(unsigned k=0;k<m&&beams<maxDrawn&&pts+4<=hs::arcMaxPoints;++k){
-        const unsigned i=order[k];const float D=dist[i];
-        const float fade=std::clamp((D-look.arriveM)/std::max(look.fadeM,.01f),0.f,1.f);if(fade<.02f)continue;
+    const auto beam=[&](unsigned i){
+        const float D=dist[i];
+        const float fade=std::clamp((D-look.arriveM)/std::max(look.fadeM,.01f),0.f,1.f);if(fade<.02f)return false;
         const float Dm=std::min(D,look.nearM);const V3 d=am::sub(t[i].pos,eye);
         const V3 base=D>look.nearM?am::add(eye,am::mul(d,look.nearM/D)):t[i].pos;     // far: same direction, at nearM
         const float H=std::clamp(.20f*Dm,2.f,8.f),hw=std::clamp(.0035f*Dm,.02f,.14f),a=.85f*fade;
@@ -224,8 +242,13 @@ inline unsigned buildFrame(const Target* t,unsigned n,const V3& eye,V3 up,float 
         if(!beams){auto& mk=out.marker;mk.shape=hs::ArcMarkerShape::Disc;mk.rgba=hs::packRgba(yr,yg,yb,.9f*fade);
             mk.centre[0]=base[0];mk.centre[1]=base[1];mk.centre[2]=base[2];mk.radiusM=std::clamp(.011f*Dm,.06f,.45f);mk.liftM=0;mk.depthTolM=.3f;mk.xrayAlpha=0.f;} // Never through walls
         if(drawnIdx)(*drawnIdx)[beams]=i;if(drawnDist)(*drawnDist)[beams]=D;
-        ++beams;
-    }
+        ++beams;return true;
+    };
+    // The nearest target that is not only an object glow keeps its beam and the disc. The nearest object glow without a beam then gets the second
+    // one, also when it merged with a blip or a GPS point that lost the first beam to a nearer target.
+    unsigned first=maxTargets;
+    for(unsigned k=0;k<m&&pts+4<=hs::arcMaxPoints;++k)if(t[order[k]].source!=SrcObjectGlow&&beam(order[k])){first=order[k];break;}
+    for(unsigned k=0;k<m&&pts+4<=hs::arcMaxPoints;++k)if(order[k]!=first&&(t[order[k]].source&SrcObjectGlow)&&beam(order[k]))break;
     if(pts<2){out.count=0;out.marker=hs::ArcMarker{};return 0;}
     out.count=pts;out.flags=hs::ArcFrame::Valid;
     auto& s=out.style;s.dashPeriodM=0;s.fadeInM=0;s.tube=1;s.core=.3f;s.xrayAlpha=0.f;s.flags=look.depthTest?0u:std::uint32_t(hs::ArcStyle::NoWorldTest);
@@ -249,7 +272,8 @@ inline void tick(const mainthread::Frame& fr) noexcept {
         bump(stats.ticks);auto& s=state();
         if(!s.levers||fr.index>=s.lastLeverIndex+64||fr.index<s.lastLeverIndex){s.levers=true;s.lastLeverIndex=fr.index;bump(stats.leverReads);
             sourcesLever.store(std::uint32_t(arc::propertyInt("debug.rdrvr.vr.marker.sources",int(SrcObjective|SrcMission|SrcGlow)))&SrcAll,std::memory_order_relaxed);
-            depthLever.store(arc::propertyInt("debug.rdrvr.vr.marker.depth",1)?1u:0u,std::memory_order_relaxed);} // World-tested by default
+            depthLever.store(arc::propertyInt("debug.rdrvr.vr.marker.depth",1)?1u:0u,std::memory_order_relaxed); // World-tested by default
+            objectGlowLever.store(arc::propertyInt("debug.rdrvr.vr.marker.glow",1)?1u:0u,std::memory_order_relaxed);}
         // our cheap beacon is ON by default (the game's own yellow X is drawn only while the camera is
         // indoors, cause not found yet); debug.rdrvr.vr.marker.custom 0 hides it
         static int custom=1;if(s.lastLeverIndex==fr.index)custom=arc::propertyInt("debug.rdrvr.vr.marker.custom",1);
@@ -259,9 +283,9 @@ inline void tick(const mainthread::Frame& fr) noexcept {
         auto& c=arc::frameContext(fr.now);
         if(!c.world()){hide(s,"NOT_WORLD");return;}
         V3 eye{};if(!c.eye(eye)){hide(s,"NO_EYE");return;}
-        const float upm=std::max(c.upm(),.01f);const auto sources=sourcesLever.load(std::memory_order_relaxed);
+        const float upm=std::max(c.upm(),.01f);const auto sources=sourcesLever.load(std::memory_order_relaxed)|(objectGlowLever.load(std::memory_order_relaxed)?std::uint32_t(SrcObjectGlow):0u);
         if(!s.scanned||fr.now<s.lastScanNs||fr.now-s.lastScanNs>=scanIntervalNs){
-            const auto t0=nowNs();s.count=scan(s.targets.data(),sources,upm);s.lastScanNs=fr.now;s.scanned=true;bump(stats.scans);
+            const auto t0=nowNs();s.count=scan(s.targets.data(),sources,upm,eye);s.lastScanNs=fr.now;s.scanned=true;bump(stats.scans);
             const auto us=(nowNs()-t0)/1000u;stats.scanUsSum.fetch_add(us,std::memory_order_relaxed);arc::maxOf(stats.scanUsMax,us);
             std::uint32_t mask=0;for(unsigned i=0;i<s.count;++i)mask|=s.targets[i].source;lastSources.store(mask,std::memory_order_relaxed);}
         if(!s.count){hide(s,"NO_TARGETS");arm(s,false);return;}
@@ -271,7 +295,7 @@ inline void tick(const mainthread::Frame& fr) noexcept {
         const unsigned beams=buildFrame(s.targets.data(),s.count,eye,c.up(),upm,c.key(),look,f,&idx,&sh.distM);
         if(!beams){hide(s,f.key?"ARRIVED":"NO_KEY");return;}
         hs::publishArc(hs::ArcChannel::Marker,f);s.shown=true;bump(stats.published);hideReason.store("",std::memory_order_relaxed);
-        sh.count=beams;for(unsigned i=0;i<beams;++i)sh.t[i]=s.targets[idx[i]];
+        sh.count=beams;for(unsigned i=0;i<beams;++i){sh.t[i]=s.targets[idx[i]];if(sh.t[i].source&SrcObjectGlow)bump(stats.objectGlowBeamTicks);}
         shownCell.store(sh);lastCount.store(beams,std::memory_order_relaxed);
     }catch(...){bump(stats.exceptions);}
 }
@@ -303,7 +327,10 @@ inline std::string report() {
     Shown sh{};if(shownCell.load(sh))for(unsigned i=0;i<sh.count&&i<maxDrawn;++i){const auto& t=sh.t[i];
         std::snprintf(b,sizeof b,"%s{\"x\":%.1f,\"y\":%.1f,\"z\":%.1f,\"src\":%u,\"sprite\":%d,\"distM\":%.1f}",i?",":"",double(t.pos[0]),double(t.pos[1]),double(t.pos[2]),
             t.source,t.sprite,double(sh.distM[i]));o+=b;}
-    std::snprintf(b,sizeof b,"],\"scriptGlow\":%u,\"drawn\":{\"published\":%llu,\"cleared\":%llu,\"hides\":%llu,\"rejected\":%llu,\"wrongThread\":%llu,\"killed\":%llu},"
+    std::snprintf(b,sizeof b,"],\"objectGlow\":{\"install\":\"%s\",\"lever\":%u,\"entries\":%u,\"priority\":%u,\"found\":%llu,\"far\":%llu,\"beamTicks\":%llu}",
+        ::rdrvr::engine::objectglow::installNote.load(std::memory_order_relaxed),objectGlowLever.load(),objectGlowEntries.load(),objectGlowPriority.load(),
+        (unsigned long long)stats.objectGlows.load(),(unsigned long long)stats.objectGlowsFar.load(),(unsigned long long)stats.objectGlowBeamTicks.load());o+=b;
+    std::snprintf(b,sizeof b,",\"scriptGlow\":%u,\"drawn\":{\"published\":%llu,\"cleared\":%llu,\"hides\":%llu,\"rejected\":%llu,\"wrongThread\":%llu,\"killed\":%llu},"
         "\"errors\":{\"exceptions\":%llu,\"readFailures\":%llu,\"hidden\":%llu},\"leverReads\":%llu}",
         glowCount.load(),(unsigned long long)ch.published,(unsigned long long)ch.cleared,(unsigned long long)ch.hides,(unsigned long long)ch.rejected,
         (unsigned long long)ch.wrongThread,(unsigned long long)ch.killed,(unsigned long long)stats.exceptions.load(),(unsigned long long)stats.readFailures.load(),

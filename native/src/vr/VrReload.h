@@ -400,7 +400,7 @@ enum ContextGap : int {GapNone=0,GapNoContext=1,GapNoWorld=2};
 struct Context {
     std::uintptr_t weapon{};int kind{-1};bool valid{};
     bool alive{},controlDisabled{},deadEye{},riding{},ridingVehicle{},vehicleTransition{},duel{},mountedWeapon{},mountingHorse{},
-         linkedAnimation{},usingGringo{},cover{};
+         linkedAnimation{},usingGringo{},cover{},weaponSeat{},seatSwap{};
     int gap{GapNone};                                  // only when !valid
 };
 enum VetoBit : unsigned {VetoDead=1,VetoControl=2,VetoVehicle=4,VetoTransition=8,VetoMountedWeapon=16,VetoMounting=32,VetoLinked=64,
@@ -412,7 +412,7 @@ inline std::atomic<std::uint64_t> contextEmptyNotes{},contextNoContextNotes{},co
 inline constexpr std::uint64_t deadEyeTailNs=3'000'000'000ull;
 inline std::uint32_t vetoOf(const Context& c,std::uint64_t now) noexcept {
     std::uint32_t v=0;
-    if(!c.alive)v|=VetoDead;if(c.controlDisabled)v|=VetoControl;if(c.ridingVehicle)v|=VetoVehicle;if(c.vehicleTransition)v|=VetoTransition;
+    if(!c.alive)v|=VetoDead;if(c.controlDisabled)v|=VetoControl;if(c.ridingVehicle&&!c.weaponSeat)v|=VetoVehicle;if(c.vehicleTransition||c.seatSwap)v|=VetoTransition;
     if(c.mountedWeapon)v|=VetoMountedWeapon;if(c.mountingHorse)v|=VetoMounting;if(c.linkedAnimation)v|=VetoLinked;if(c.usingGringo)v|=VetoGringo;
     if(c.deadEye)v|=VetoDeadEye;if(c.duel)v|=VetoDuel;
     const auto seen=deadEyeSeenNs.load(std::memory_order_relaxed);if(!c.deadEye&&seen&&now>=seen&&now-seen<deadEyeTailNs)v|=VetoDeadEyeTail;
@@ -430,7 +430,7 @@ inline void noteContext(const Context& c,std::uint64_t now) noexcept {
     const std::uint32_t veto=vetoOf(c,now);
     contextWord.store(((now/1'000'000ull)<<16)|veto,std::memory_order_release);
     // VrWeapon gates().pose without the weapon-kind term (cover and riding are NOT vetoes)
-    const bool pose=c.alive&&!c.controlDisabled&&!c.ridingVehicle&&!c.vehicleTransition&&!c.mountedWeapon&&!c.mountingHorse&&!c.linkedAnimation&&!c.usingGringo;
+    const bool pose=c.alive&&!c.controlDisabled&&(!c.ridingVehicle||c.weaponSeat)&&!c.vehicleTransition&&!c.mountedWeapon&&!c.mountingHorse&&!c.linkedAnimation&&!c.usingGringo;
     ownerKind.store(c.kind,std::memory_order_relaxed);ownerPoseAllowed.store(pose,std::memory_order_relaxed);
     ownerWeapon.store(c.weapon,std::memory_order_relaxed);ownerNs.store(now,std::memory_order_release);
 }

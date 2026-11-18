@@ -59,7 +59,7 @@ bool ControllerActions::stopHaptic(void* context,unsigned hand){
     return xrStopHapticFeedback(self.hapticSession_,&info)==XR_SUCCESS;
 }
 bool ControllerActions::read(XrSession session,XrSpace base,XrTime time,ControllerSample& sample,bool& recenter,bool& theaterToggle){
-    recenter=theaterToggle=false;sample.active=false;sample.buttons=0;sample.sticks={};sample.triggers={};sample.grips={};sample.grip={};
+    recenter=theaterToggle=false;sample.active=false;sample.buttons=0;sample.sticks={};sample.triggers={};sample.grips={};sample.chordGrips=0;sample.grip={};
     if(!sample.focused){invalidate();return false;}
     // INPUT RECORD / REPLAY (VrInputRec.h): every OpenXR action state of this read goes into one PadRaw first (result, isActive,
     // currentState, changedSinceLastSync, grip locate flags + pose + XrSpaceVelocity); ir::pad records it or, while a replay plays, replaces it;
@@ -127,7 +127,7 @@ bool ControllerActions::read(XrSession session,XrSpace base,XrTime time,Controll
     const auto clicks=stickClicks_.sample((sample.buttons&PadLeftStick)!=0,(sample.buttons&PadRightStick)!=0,sample.publishedNs);
     recenter=clicks.recenter;sample.buttons=(sample.buttons&~chord)|(clicks.bits&chord);
     if(manualTheater_) // Never while the VR holsters own a grip (the consumed grips read as a release there)
-        theaterToggle=theaterGripChord(theaterChord_,theaterGrips_,sample.grips,sample.publishedNs,gripsBusy_&&gripsBusy_());
+        theaterToggle=theaterGripChord(theaterChord_,theaterGrips_,sample.grips,sample.publishedNs,gripsBusy_&&gripsBusy_(),2'000'000'000,&sample.chordGrips);
     return true;
 }
 }

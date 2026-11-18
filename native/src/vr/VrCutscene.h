@@ -28,6 +28,7 @@
 // Kill switch debug.rdrvr.vr.cutscene 0 (row PROP, SCREEN). Fail closed: anything missing ->
 // no anchor -> the theater.
 #include "VrSettings.h"
+#include "runtime/StereoBridge.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -60,8 +61,11 @@ enum class Ctx : unsigned {Other,World,Cutscene,Transition,Override};
 // is not where the skinned / bone-driven geometry is, so props would vanish in both eyes (A / SMALL OBJECTS) or in one (B pads).
 // FIRST PERSON yaw (live): debug.rdrvr.vr.cutscene.follow 0 = a latched heading; .followdz <deg> dead zone (default 6);
 // .followrate <deg/s> top speed (default 90).
+// debug.rdrvr.vr.cutscene.shotview: unset / 1 = scripted gameplay shots (Override, and a transition out of one) are shown
+// CINEMATIC (the shot camera, John drawn with his head) also when the row is FIRST PERSON; 0 = they follow the row.
+// debug.rdrvr.vr.cutscene.bridge <ms> (default 300, 0 = off): runtime/StereoBridge.h.
 inline std::atomic<int> overrideMode{2},shotMaxSeconds{15};
-inline std::atomic<bool> overrideShot{false},cutsceneCull{false},followOn{true};
+inline std::atomic<bool> overrideShot{false},cutsceneCull{false},followOn{true},shotView{true};
 inline std::atomic<float> followDzDeg{6.f},followRateDegS{90.f};
 inline std::atomic<int> shadowCamProperty{-1}; // debug.rdrvr.vr.cutscene.shadowcam 0 / 1 / 2 beats the SUN SHADOW CAM row (stereo/CutsceneShadowCam.h)
 inline std::atomic<std::uint64_t> shotExpired{0},cullKept{0}; // shots past shotMax (theater), SMALL OBJECTS skips undone in cutscenes
@@ -81,11 +85,18 @@ inline void readOverrideLever() noexcept {
     followRateDegS.store(n>0&&v[0]>='0'&&v[0]<='9'?std::clamp(float(std::atof(v)),5.f,720.f):90.f,std::memory_order_relaxed);
     n=__system_property_get("debug.rdrvr.vr.cutscene.shadowcam",v);
     shadowCamProperty.store(n==1&&v[0]>='0'&&v[0]<='2'?v[0]-'0':-1,std::memory_order_relaxed);
+    n=__system_property_get("debug.rdrvr.vr.cutscene.shotview",v);
+    shotView.store(!(n>0&&v[0]=='0'),std::memory_order_relaxed);
+    n=__system_property_get("debug.rdrvr.vr.cutscene.bridge",v);
+    ::rdrvr::runtime::bridge::bridgeMs.store(n>0&&v[0]>='0'&&v[0]<='9'?unsigned(std::clamp(std::atoi(v),0,int(::rdrvr::runtime::bridge::maxBridgeMs))): ::rdrvr::runtime::bridge::defaultBridgeMs,
+        std::memory_order_relaxed);
 #endif
 }
-// The Override presentation is cinematic (overrideShot: GameXr, main thread, from NativeUiContext::shotSince + shotMax).
-inline bool overrideEligible() noexcept {
-    const int m=overrideMode.load(std::memory_order_relaxed);return m==1||(m==2&&overrideShot.load(std::memory_order_relaxed));}
+// The Override presentation is cinematic: the same rule on every thread, from the shot start the main thread stores before it
+// publishes the context (runtime::bridge::shotSinceNs), shotMax and the override lever.
+inline bool overrideEligible(std::uint64_t now) noexcept {
+    return ::rdrvr::runtime::bridge::overrideEligible(::rdrvr::runtime::bridge::shotSinceNs.load(std::memory_order_relaxed),now,
+        shotMaxSeconds.load(std::memory_order_relaxed),overrideMode.load(std::memory_order_relaxed));}
 // Diagnostics: visibility calls per runtime::PresentationContext (Unknown, World, Menu, Cutscene, CameraOverride, CameraTransition,
 // Optic) and the last 16 context changes seen there (context, ms since the first call) - which context RDR reports in a story scene.
 inline std::array<std::atomic<std::uint64_t>,8> ctxVisibility{};
@@ -114,6 +125,11 @@ inline float dist(const V3& a,const V3& b) noexcept {const float x=a[0]-b[0],y=a
 inline bool headingOfForward(float fx,float fz,float& out) noexcept {if(!(fx*fx+fz*fz>1e-4f)||!std::isfinite(fx+fz))return false;out=std::atan2(-fx,-fz);return true;}
 
 inline bool requested() noexcept {return enabled(Feature::Cutscene)&&settings().cutsceneMode()!=Screen;}
+// The mode a context is composed in: a scripted gameplay shot (Override, or a transition whose last steady context was one) is a
+// side view, CINEMATIC, when the row is FIRST PERSON and shotview is on: no John is sampled, the player is not the probe creature,
+// so nothing of him is hidden and his head is not collapsed (GameXr cutsceneAnchor / vrCutsceneObserve). SCREEN stays SCREEN.
+constexpr unsigned modeFor(Ctx ctx,Ctx steady,unsigned row,bool shotview) noexcept {
+    return shotview&&row==FirstPerson&&(ctx==Ctx::Override||(ctx==Ctx::Transition&&steady==Ctx::Override))?unsigned(Cinematic):row;}
 inline const char* modeName(unsigned m) noexcept {return m==Cinematic?"CINEMATIC":m==FirstPerson?"FIRST_PERSON":"SCREEN";}
 
 // ---- main thread -> render thread: John (the player actor) for FIRST PERSON ----
@@ -197,17 +213,18 @@ class Composer {
 public:
     // Every visibility call (any presentation): remembers the last non-transition context for the Transition rule.
     void note(Ctx c) noexcept {if(c!=Ctx::Transition)steady_=c;}
+    Ctx steady() const noexcept {return steady_;}
     // A camera transition is cinematic only next to a cutscene / gameplay (World -> T -> Cutscene, Cutscene -> T -> World);
     // Override: scripted gameplay shots only (overrideEligible); other scripted / minigame cameras with essential 2D HUD and menus
     // stay in the theater.
-    bool eligible(Ctx c) const noexcept {
-        const bool ov=overrideEligible();
+    bool eligible(Ctx c,std::uint64_t now) const noexcept {
+        const bool ov=overrideEligible(now);
         return c==Ctx::Cutscene||(ov&&c==Ctx::Override)||(c==Ctx::Transition&&(steady_==Ctx::Cutscene||steady_==Ctx::World||(ov&&steady_==Ctx::Override)));}
     void reset() noexcept {softReset();good_=John{};phiValid_=false;holdRun_=0;prevHeld_=false;}
     bool active() const noexcept {return active_;}
     bool step(const Input& in,Output& out) noexcept {
         bump(stats.frames);
-        if(in.mode==Screen||!eligible(in.ctx)){reset();return false;}
+        if(in.mode==Screen||!eligible(in.ctx,in.ns)){reset();return false;}
         bump(stats.eligible);stats.source.store(in.ctx==Ctx::Cutscene?"CUTSCENE":in.ctx==Ctx::Override?"OVERRIDE":"TRANSITION",std::memory_order_relaxed);
         if(!in.stock){bump(stats.badCamera);softReset();return false;}
         const float* w=in.stock;const V3 pos{w[12],w[13],w[14]},fwd{-w[8],-w[9],-w[10]};
@@ -293,6 +310,10 @@ public:
     }
 };
 inline Composer composer{}; // render thread only
+// The anchor's body rules for an output: CINEMATIC = a creature that never matches (nobody hidden, no head fill), FIRST PERSON =
+// John's creature / hat (the gameplay eye body rules).
+inline void anchorBody(const Output& o,std::uintptr_t& creature,std::uintptr_t& hat) noexcept {
+    creature=o.effective==FirstPerson&&o.creature?o.creature:std::uintptr_t(1);hat=o.effective==FirstPerson?o.hat:0;}
 
 inline std::string report() {
     char b[1700];const auto s=settings();
@@ -319,7 +340,7 @@ inline std::string report() {
     out+="},\"ctxChanges\":[";const auto n=ctxChanges.load();
     for(std::uint32_t k=n>16?n-16:0,first=1;k<n;++k,first=0){const auto v=ctxChange[k&15u].load();
         out+=first?"":",";out+="[\"";out+=names[std::min(7u,v>>28)];out+="\","+std::to_string(v&0x0fffffffu)+"]";}
-    out+="]";
+    out+="],\"shotView\":";out+=shotView.load()?"1,":"0,";out+=::rdrvr::runtime::bridge::report(now);
     {char t[512];std::snprintf(t,sizeof t,",\"follow\":{\"on\":%d,\"dzDeg\":%.1f,\"rateDegS\":%.0f,\"frames\":%llu,\"followedDeg\":%.0f,\"snaps\":%llu,\"johnCuts\":%llu},"
         "\"heading\":{\"now\":\"%s\",\"headAxes\":%llu,\"eyeOffset\":%llu,\"mover\":%llu,\"none\":%llu},",
         followOn.load()?1:0,double(followDzDeg.load()),double(followRateDegS.load()),(unsigned long long)stats.followFrames.load(),double(stats.followedDeg.load()),

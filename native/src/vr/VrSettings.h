@@ -48,16 +48,19 @@ enum class Key : unsigned {Locomotion,MoveSpeed,Roomscale,Camera,EyeHeight,BumpR
     GameMessages, // HUD page: GAME MESSAGES (cfg "gameMessages", 1 bit; VrGameMsg.h)
     CutsceneShadows, // MOVEMENT page: SUN SHADOW CAM (cfg "cutsceneShadows"; stereo/CutsceneShadowCam.h)
     CutsceneProps,CutsceneLights,CutsceneSun, // MOVEMENT page: CUTSCENE PROPS / LIGHTS / SUN (1 bit each; VrCutsceneSteady.h)
+    HandPhysics, // HANDS page: HAND PHYSICS (cfg "handPhysics", 2 bits; VrHandPhys.h)
+    CoachTurn, // HORSE page: COACH TURN (cfg "coachTurnCm", 3 bits; VrReins.h coach steer distance)
+    HorseTailFix, // HORSE page: HORSE TAIL FIX (cfg "horseTailFix", 1 bit; stereo/ClothUpdateGate.h mode 1)
     Count}; // HUD page: PERF RECORD (cfg "perfRecord", 1 bit; diagnostics/PerfRecorder.h); HUD page: DEAD EYE MODE (GAME / SLOW-MO, 1 bit)
 // Variable-width packing: each key takes ceil(log2(count)) bits (2 values = 1 bit, 3..4 = 2, 5..8 = 3), offsets in key order. vr.cfg (key=value text) is by name.
 inline constexpr unsigned keyCount=unsigned(Key::Count);
 // Kill-switch features (debug.rdrvr.vr.<name>) = the status slots of the modules.
 enum class Feature : unsigned {Menu,Loco,Bump,Stumble,Camera,Roomscale,Hands,Holsters,TwoHand,Cheats,Melee,Laser,Cover,Dual,Body,Throw,
-    Arc,TpLoco,Lasso,Reload,Hammer,Spin,Marker,Cutscene,Hud,Throwable,Count};
+    Arc,TpLoco,Lasso,Reload,Hammer,Spin,Marker,Cutscene,Hud,Throwable,HandPhys,Count};
 inline constexpr unsigned featureCount=unsigned(Feature::Count);
 inline constexpr std::array<const char*,featureCount> featureNames{"menu","loco","bump","stumble","camera","roomscale","hands","holsters",
     "twohand","cheats","melee","laser","cover","dual","body","throw",
-    "arc","tploco","lasso","reload","hammer","spin","marker","cutscene","hud","throwable"}; // Feature::Reload = the property VrReload reads itself (same name / meaning)
+    "arc","tploco","lasso","reload","hammer","spin","marker","cutscene","hud","throwable","handphys"}; // Feature::Reload = the property VrReload reads itself (same name / meaning)
 
 struct KeyInfo {
     const char* cfg;const char* label;unsigned count,defaultValue;
@@ -218,6 +221,12 @@ inline constexpr std::array<KeyInfo,keyCount> keyInfo{{
     {"cutsceneProps", "CUTSCENE PROPS", 2,1,Feature::Cutscene,-1,false,{"SCRIPT","STEADY"}},
     {"cutsceneLights","CUTSCENE LIGHTS",2,1,Feature::Cutscene,-1,false,{"SCRIPT","STEADY"}},
     {"cutsceneSun",   "CUTSCENE SUN",   2,1,Feature::Cutscene,-1,false,{"SCRIPT","STEADY"}},
+    // MEASURE: the behaviours time the physics step, no bodies. ON: the empty hands are bodies in the engine's physics (VrHandPhys.h).
+    {"handPhysics",   "HAND PHYSICS",   3,2,Feature::HandPhys, 0,false,{"OFF","MEASURE","ON"}}, // ON by default (experimental; the welcome panel says where to turn it off)
+    // COACH TURN: how far a rein hand moves for a full turn on a coach / wagon seat (TURN PULL stays the horse's)
+    {"coachTurnCm",   "COACH TURN",     8,4,Feature::Camera,  -1,false,{"12 CM","16 CM","20 CM","24 CM","28 CM","32 CM","38 CM","45 CM"}},
+    // HORSE TAIL FIX: ON = horse tails / manes (character cloth) within 40 m are simulated even when the stock game camera misses them
+    {"horseTailFix",  "HORSE TAIL FIX", 2,0,Feature::Camera,  -1,false,{"OFF","ON"}},
 }};
 // ---- variable-width packing ----
 inline constexpr unsigned bitsFor(unsigned count) noexcept {unsigned b=0;while(b<32&&(1u<<b)<count)++b;return b;}
@@ -290,6 +299,7 @@ struct Snapshot {
     constexpr unsigned hudMode() const noexcept {const unsigned v=(*this)[Key::Hud];return v<3?v:0u;}       // 0 OFF, 1 HEAD, 2 HAND
     constexpr bool subtitlesOff() const noexcept {return (*this)[Key::Subtitles]==1;}
     constexpr bool hudAmmo() const noexcept {return (*this)[Key::HudAmmo]==1;}
+    constexpr bool horseTailFix() const noexcept {return (*this)[Key::HorseTailFix]==1;}                 // HORSE TAIL FIX ON
     constexpr bool twoHandFire() const noexcept {return (*this)[Key::TwoHandFire]==1;}                    // TWO HAND FIRE ON
     constexpr bool deadEyeHalfTime() const noexcept {return (*this)[Key::DeadEyeTime]==1;}               // DEAD EYE TIME HALF
     constexpr bool deadEyeTint() const noexcept {return (*this)[Key::DeadEyeTint]==1;}                   // DEAD EYE FILTER ON
@@ -298,6 +308,7 @@ struct Snapshot {
     constexpr bool deadEyeSlowMo() const noexcept {return (*this)[Key::DeadEyeMode]==1;}
     constexpr bool gameMessages() const noexcept {return (*this)[Key::GameMessages]==1;}
     constexpr bool shellShakeOut() const noexcept {return (*this)[Key::ShellEject]==1;}                   // SHELL EJECT SHAKE OUT
+    constexpr unsigned handPhysicsMode() const noexcept {const unsigned v=(*this)[Key::HandPhysics];return v<3?v:0u;} // 0 OFF, 1 MEASURE, 2 ON
     constexpr float scopeFullDistM() const noexcept {return .06f+.02f*float((*this)[Key::ScopeFullDist]);}       // FULL ZOOM DIST (metres)                  // DEAD EYE MODE SLOW-MO
     constexpr float rideUpMeters() const noexcept {return .05f*(float((*this)[Key::RideUp])-6.f);}   // HORSE CAM UP -30..+40 cm
     constexpr float rideFwdMeters() const noexcept {return .05f*(float((*this)[Key::RideFwd])-2.f);} // HORSE CAM FWD -10..+25 cm
@@ -306,6 +317,8 @@ struct Snapshot {
     constexpr bool rideShake() const noexcept {return (*this)[Key::RideShake]==1;}                 // HORSE SHAKE ON = no ride steady
     constexpr float rideTurnMeters() const noexcept {constexpr float cm[8]{4,6,8,10,12,15,18,22};   // TURN PULL (full lock)
         const unsigned v=(*this)[Key::RideTurn];return cm[v<8?v:3]*.01f;}
+    constexpr float coachTurnMeters() const noexcept {constexpr float cm[8]{12,16,20,24,28,32,38,45}; // COACH TURN (full lock)
+        const unsigned v=(*this)[Key::CoachTurn];return cm[v<8?v:4]*.01f;}
     // THROWING page
     constexpr bool throwablesVr() const noexcept {return (*this)[Key::ThrowMode]==1;}
     constexpr float throwPower() const noexcept {constexpr float x[8]{.6f,.8f,1.f,1.2f,1.5f,1.8f,2.2f,2.6f};const unsigned v=(*this)[Key::ThrowPower];return x[v<8?v:4];}
@@ -327,7 +340,7 @@ enum WeaponPreset : unsigned {PresetRealistic,PresetCasual,PresetCustom,PresetCo
 inline constexpr std::array<const char*,PresetCount> weaponPresetNames{"REALISTIC","CASUAL","CUSTOM"};
 struct WeaponPresetValue {Key key;unsigned realistic,casual;};
 inline constexpr std::array<WeaponPresetValue,7> weaponPresetKeys{{
-    {Key::TwoHandFire,1,0},    // ON / OFF
+    {Key::TwoHandFire,0,0},    // OFF in both presets: a long gun fires one-handed too (TWO HAND FIRE stays a menu choice)
     {Key::ShellEject,1,0},     // SHAKE OUT / AUTO
     {Key::GunSpin,1,0},        // ON / OFF
     {Key::ReloadMode,0,2},     // SINGLE / NATIVE
@@ -345,6 +358,7 @@ inline constexpr unsigned weaponPresetOf(const Snapshot& s) noexcept {
     return PresetCustom;}
 static_assert(weaponPresetOf(Snapshot{})==PresetCasual,"a new install = the CASUAL preset: a preset key's default is its CASUAL value");
 static_assert(!Snapshot{}.gameMessages()&&!Snapshot{}.perfRecord(),"a new install: no GAME MESSAGES notices, no PERF RECORD");
+static_assert(Snapshot{}.handPhysicsMode()==2,"a new install: HAND PHYSICS ON");
 static_assert(Snapshot{}.scopeFullZoom()&&Snapshot{}.hudAmmo()&&Snapshot{}.throwablesVr(),"a new install: FULL ZOOM, AMMO ON GUN and VR THROWABLES on");
 
 // ---- kill switches: debug.rdrvr.vr.<name> = 0 at startup -> feature off, no hooks ----

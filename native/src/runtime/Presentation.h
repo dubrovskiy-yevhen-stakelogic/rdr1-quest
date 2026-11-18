@@ -12,6 +12,8 @@ inline bool preserveHeldInput(PresentationContext before,PresentationContext aft
 struct PresentationState {
     PresentationContext context{PresentationContext::Unknown};
     std::uint64_t revision{},publishedNs{},inputRevision{};
+    // changedNs: when the last revision was published; menuRevision: the last revision that was a Menu (or a manual-theater toggle)
+    std::uint64_t changedNs{},menuRevision{};
     bool world()const{return context==PresentationContext::World;}
 };
 // Main thread publishes native UI state. XR/render threads only read snapshots.
@@ -20,7 +22,7 @@ class PresentationMailbox {
     mutable std::mutex mutex_;PresentationState state_{};bool manualTheater_{};
 public:
     static constexpr std::uint64_t maxAgeNs=500'000'000;
-    bool toggleManualTheater(){std::lock_guard guard(mutex_);manualTheater_=!manualTheater_;++state_.revision;++state_.inputRevision;return manualTheater_;}
+    bool toggleManualTheater(){std::lock_guard guard(mutex_);manualTheater_=!manualTheater_;++state_.revision;++state_.inputRevision;state_.menuRevision=state_.revision;return manualTheater_;}
     bool manualTheater()const{std::lock_guard guard(mutex_);return manualTheater_;}
     bool publish(PresentationContext context,std::uint64_t now){
         std::lock_guard guard(mutex_);
@@ -29,6 +31,7 @@ public:
         if(changed){
             ++state_.revision;
             if(!state_.inputRevision||!preserveHeldInput(state_.context,context))++state_.inputRevision;
+            state_.changedNs=now;if(context==PresentationContext::Menu)state_.menuRevision=state_.revision;
         }
         state_.context=context;state_.publishedNs=now;return changed;
     }
@@ -53,5 +56,7 @@ public:
     }
     bool world()const{return world_;}
     bool preservesInput()const{return preserveInput_;}
+    PresentationContext context()const{return context_;}
+    std::uint64_t revision()const{return revision_;}
 };
 }

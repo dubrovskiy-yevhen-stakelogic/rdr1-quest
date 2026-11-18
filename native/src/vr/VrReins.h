@@ -4,14 +4,21 @@
 // The reached pace is held (A held at CANTER+), x / y output independent, lighter / two-style steering, a
 // standing turn only on a deliberate 300 ms rein, and a steering trace against the real horse yaw rate.
 // Rules behind levers (default on, 0 = the base rule in the sections below):
-//  a) RELEASE (.relopen): grip < .relgrip (8%) for .relms (500 ms), so a wobbling squeeze does not drop the rein;
+//  a) RELEASE (.relopen): grip < .relgrip (25%, the holsters' own open level) for .relms (350 ms), so a wobbling squeeze does not drop the rein;
 //     .relidle: an opened hand also lets go during an inactivity hold / suspension;
 //     a hand let go there re-grabs on a squeeze still held at the resume. At a holster socket the holsters' own open level
 //     (.relout 30% for .reloutms 100 ms; default OFF = sticky reins) lets go too - else the draw squeeze is captured as REINS;
 //     .relfreeze: an opening hand (the timer running) keeps its pose - its way to the hip does not swerve the horse.
-//  b) ONE HAND (.onepull): one held hand steers by its own pull toward the rider: s = +pullR / -pullL (no neck rein / inward rule),
-//     signed (.pushturn default 1 - pushed forward = the other way: one hand on a gun still turns both ways, and a forward-
-//     arcing snap leaves no lasting turn); the second grab / 2 -> 1 handoff / snap re-zero keep that hand's turn. Two hands = direct rein.
+//  b) ONE HAND = neck rein: the held hand's side move steers (hand right = right, either hand), its pull back does not; the other hand is
+//     free for a gun. .onepull 1 = the older pull law s = +pullR / -pullL (.pushturn 1: pushed forward = the other way).
+//     STROKE HOLD (.strokehold): while one held hand moves faster than .strokev (0.8 m/s, a snap stroke swings the hand 40-70 cm) and
+//     .strokems (200 ms) after it slowed, the steer never exceeds the one before the stroke (the same way, the smaller of the two): a
+//     one-hand snap never steers, a lock from before a run of snaps is not kept. ONE HAND never stops by a lift (the rein hand rises
+//     with the snaps / a gun in the other hand): stop = both hands lifted, or let go. Two hands = direct rein.
+//  b2) WEAPON HAND: the reins never hand a squeeze to the holsters - a weapon is taken only after the rein hand opened (let go) and
+//     squeezed again. A held rein hand steers wherever it is: on a coach seat both rein hands rest inside the holster / dead zones,
+//     so a socket never freezes the pull or side. A hand drawn back >= 10 cm keeps the rein on an open grip only while both hands
+//     hold (.highpull1 1 = also one hand).
 //  c) STOP = LIFT (.lift; a stopping rider LIFTS both hands 15-35 cm, often arcing forward, no back pull): both hands up
 //     >= .brakeup (15 cm) over their neutral height and alike (|upR - upL| < max(.alike 6 cm, .alikepct 30% of the larger)), or one
 //     held hand up >= .liftone (18 cm), HELD .liftms (300 ms) -> the slow ladder (TROT+ -> WALK -> HALT, one step per .slowms 600 ms).
@@ -87,6 +94,8 @@
 //    sample) the state is kept for as long as it lasts with no output and only the held hands masked; anything else > .hold resets.
 //  - Arms: while REINS is on, both arms follow the controllers on a horse (VrBody armsFollow); holds(h) = the hands on the rope.
 // Menu: CONTROLS > REINS GESTURES OFF / ON (controls.cfg "horse.reins"). Kill: debug.rdrvr.vr.reins 0.
+// A stagecoach / wagon driver's seat (BUTTONS > COACH REINS, VrCoachReins.h): the same grab / snap / pull / lift in the coach's frame,
+// output MOVE_X + the coach's pace (In::coach); a horse ride is unchanged.
 // Props debug.rdrvr.vr.reins.* (read every ~256 updates): walk (stick %, 40) flick (cm, 5) snapspeed (cm/s, 50) steer (cm, 8) brake
 // (cm, 8) brakeup (cm, 8) yaw (deg, 55; .xy 0 only) hold (ms, 300; 0 = reset at once) loose (s, 3; 0 = keep the gait); hold_a
 // (1 tap + hold, 2 hold press = spur, 0 taps only) gain (x, 1.0) lat2 (x, 0.6; 0 = pull difference only) dead (cm, 1.5) smooth (ms,
@@ -97,13 +106,14 @@
 // 0 = full) handoff (2 -> 1 hand re-zero) stillleak (still-hand leak) slowfast (TROT+ slows to WALK) yank (yank reject) inward (one-hand
 // inward pull ignored) holster (holster targets block grabs / arming; VrHolsters prefers foregrip / transfer at the latch) maskheld
 // (VrHolsters masks a held rein's grip bit) relkeep (horse-relative kept on a failure frame) suspend (MOUNTED-layout suspension).
-// relopen relidle relgrip (%, 8) relms (ms, 500) onepull lift brakeup (cm: 15 for .lift; unset = 8 for the back + up rule)
+// relopen relidle relgrip (%, 25) relms (ms, 350) onepull lift brakeup (cm: 15 for .lift; unset = 8 for the back + up rule)
 // liftone (cm, 18) liftms (ms, 300) alike (cm, 6) alikepct (%, 30) hleak (s, 4; 0 = off) lowsnap lowms (ms, 1500) lowcm (cm, 8) slowms
 // (ms, 600: the ladder step) pushturn (0 = only a pull turns); liftstill (ms, 200; 0 = off) liftv (cm/s, 50) liftfull
 // spotlift hleakdn (s, 30; 0 = never down) hleakhold (ms, 5000) lowmax (count, 3; 0 = no cap) relout (grip %, 30; 0 = off) reloutms
 // (ms, 100) relfreeze.
 #include "VrHaptics.h"
 #include "VrSettings.h" // HORSE > TURN PULL
+#include "VrCoachReins.h" // COACH REINS: the driver's seat of a stagecoach / wagon
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -188,6 +198,7 @@ inline void publishRiding(std::uint64_t now,float horseMinusHeadRad,bool deltaVa
 }
 
 struct Tuning {
+    float coachSteer{.28f}; // a coach / wagon seat: full lock 28 cm (HORSE > COACH TURN)
     float walk{.40f},flick{.05f},snapSpeed{.50f},steer{.10f}, // steer: full lock 10 cm
     brake{.08f},brakeUp{.10f},yaw{.9599311f}; // yaw: 55 deg; brakeUp 10 cm
     // still-hand neutral re-learn (ms still before, tau s) and the WHIP snap (up then down: cm each way, window ms, m/s average)
@@ -205,13 +216,13 @@ struct Tuning {
     // .brakeback: after a stop from TROT+ the stick is pulled back (y -1) for .brakebackms (500 ms),
     // stick 0 = the game's own coast-down
     // .brakeback OFF by default (y -1 after the stop spins the horse at -204 deg/s: horse-relative back = turn around, no brake)
-    std::uint64_t relHighNs{800'000'000ull}; // .relhighms
+    std::uint64_t relHighNs{800'000'000ull},coachRelNs{350'000'000ull}; // .relhighms / .coachrelms (COACH: the open-grip release time)
     // FAST path = raised (the same mean / each) AND pulled back toward
     // the rider (mean pull >= .stoppull 6 cm) for .stopfastms 300 ms (recorded stops pull 8-14 cm back, the go-whips <= 4 cm); else
     // .stopms 550 ms (500 fires on a whip)
     float stopPull{.06f};std::uint64_t stopFastNs{300'000'000ull};
     std::uint64_t brakePullNs{0}; // .brakepullms (0 = off): (0,-1) spins the horse in 4 frames (-198 deg/s)
-    bool holdStop{true},dropStop{true},brakeBack{false},hardStop{true};std::uint64_t hardStopNs{2'500'000'000ull};float stopUp{.35f},stopMin{.25f};std::uint64_t stopHoldNs{550'000'000ull},brakeBackNs{500'000'000ull}; // .hardstop / .hardstopms
+    bool holdStop{true},dropStop{false},brakeBack{false},hardStop{true};std::uint64_t hardStopNs{2'500'000'000ull};float stopUp{.35f},stopMin{.25f};std::uint64_t stopHoldNs{550'000'000ull},brakeBackNs{500'000'000ull}; // .hardstop / .hardstopms
     bool relSteer{true},letGo{true},relInvalid{false},symStop{true},stopDirect{true};float level{.12f},symCm{.12f}; // .symcm: a 5 cm lock rejects real lift frames
     std::uint64_t stillNs{2'500'000'000ull};float stillTau{10.f};bool whip{true};float whipUp{.04f},whipDown{.04f},whipSpeed{.35f};std::uint64_t whipNs{700'000'000ull};
     std::uint64_t holdNs{300'000'000ull},looseNs{3'000'000'000ull};
@@ -224,9 +235,12 @@ struct Tuning {
     // TROT+ full-lock yaw (55 deg; 45 = plain (1, 1))
     float yawMax{.9599311f};
     // release, one-hand pull steering, stop = lift + height leak, no snap from the lowering after a slow step
-    bool relOpen{true},relIdle{true},onePull{true},lift{true},lowSnap{true},pushTurn{true};
-    float relGrip{.08f},liftOne{.18f},alike{.10f},alikePct{.50f},hLeak{4.f},lowCm{.08f},brakeUp25{.08f};
-    std::uint64_t relNs{500'000'000ull}, // both grips can dip to 0.00 for 0.1-0.3 s while held (the holsters see every dip as a new press): a shorter time drops the reins
+    bool relOpen{true},relIdle{true},onePull{false},lift{true},lowSnap{true},pushTurn{true};
+    // one-hand stroke hold, away freeze (header b, b2)
+    bool strokeHold{true},highPullOne{false};float strokeV{.8f};
+    std::uint64_t strokeHoldNs{200'000'000ull};
+    float relGrip{.25f},liftOne{.18f},alike{.10f},alikePct{.50f},hLeak{4.f},lowCm{.08f},brakeUp25{.08f};
+    std::uint64_t relNs{350'000'000ull}, // both grips can dip to 0.00 for 0.1-0.3 s while held (the holsters see every dip as a new press): a shorter time drops the reins
     liftNs{200'000'000ull},lowNs{1'500'000'000ull},slowStepNs{600'000'000ull};
     // a HELD lift (vertically still), the ladder completes, the held stop at HALT, the lap-rest leak, the socket release
     float liftV{.25f},hLeakDn{30.f},relOut{0.f};int lowMax{3};
@@ -237,7 +251,7 @@ struct In {
     std::uint64_t now{},sampleNs{},sequence{};
     std::uint64_t space{},epoch{},continuity{}; // input identity (reference space / input epoch / mailbox continuity): a change re-zeroes
     bool mounted{};                       // MOUNTED layout on a horse (player state 5) + fresh riding sample (+ pad ready)
-    bool layoutMounted{},onFoot{},stockPad{}; // the MOUNTED layout alone (suspend, never reset) / FOOT (a dismount: reset at once) /
+    bool layoutMounted{},onFoot{},stockPad{}; // the MOUNTED layout alone (suspend, never reset) / FOOT or a vehicle seat (off the horse: reset at once) /
                                           // NATIVE (menu / Unknown: the stock pad - never a held stick or A)
     bool haveHead{};std::array<float,3> head{},headFwd{};
     std::array<bool,2> valid{};std::array<std::array<float,3>,2> pos{};std::array<float,2> grip{};
@@ -246,12 +260,16 @@ struct In {
     float userX{},userY{};                // Touch left stick
     bool userA{};                         // the player's own pad A (after the Mapper) is down
     bool menu{};                          // a real menu / cutscene: reset at once
+    // COACH REINS (VrCoachReins.h): mounted = the driver's seat of a stagecoach / wagon; coachGait = the coach's nav state as a gait
+    // (0 HALT .. 4 GALLOP, -1 unknown). The stick is MOVE_X only (no gait throttle, no A, no standing turn, no hard stop / brake pull);
+    // GameXr turns level() into Whip / MOVE_Y taps. While no rein is held (or the player's own stick / A is used) the gait follows coachGait.
+    bool coach{};int coachGait{-1};
 };
 struct Out {bool stick{};float x{},y{};bool a{};
     bool aUp{}; // clear pad A this update (the player's own press while the brain holds A: their edge reaches the game)
 };
-enum Mode : int {ModeNone=0,ModeHorseRel=1,ModeCamRel=2};
-inline const char* modeName(int m) noexcept {return m==ModeHorseRel?"HORSE_REL":m==ModeCamRel?"CAM_REL":"NONE";}
+enum Mode : int {ModeNone=0,ModeHorseRel=1,ModeCamRel=2,ModeCoach=3};
+inline const char* modeName(int m) noexcept {return m==ModeHorseRel?"HORSE_REL":m==ModeCamRel?"CAM_REL":m==ModeCoach?"COACH":"NONE";}
 inline const char* gaitName(int g) noexcept {static constexpr const char* n[5]{"HALT","WALK","TROT","CANTER","GALLOP"};return n[std::clamp(g,0,4)];}
 
 struct Stats {
@@ -261,6 +279,8 @@ struct Stats {
         standingTurns{},inactivityHolds{},resets{},looseDrops{},horseRelFrames{},noneFrames{},hapticPosts{},hapticDrops{},rezeros{},leakFrames{},
         rejYank{},settleRezeros{},spaceRezeros{},resumeRezeros{},handoffRezeros{},frameSteps{},stillLeakFrames{},inwardFrames{},
         dismountResets{},suspendFrames{},relKept{},holsterBlocked{},armBlocked{},
+        strokeHoldFrames{}, // header b
+        coachFrames{},coachFollows{}, // COACH: frames the stick carried MOVE_X / updates the gait took the coach's nav state
         // A hold / merge, standing-turn dwell, steer-vs-horse-turn sign check
         aHoldFrames{},aTaps{},aUserEdges{},aUserFollow{},aReleases{},spotShort{},
         turnFramesLeft{},turnFramesRight{},horseTurnLeft{},horseTurnRight{},signAgree{},signDisagree{},rateSamples{},rateRejected{},
@@ -315,6 +335,21 @@ struct EventRing {
     }
 };
 inline EventRing events{};
+// HAND LOG (report reins.handLog): every rein-hand press / grab / opening of a held hand and how it ended (128 rows; the rope in its own 32), for the 'sometimes
+// lets go fast, sometimes not; a squeeze takes the gun / lasso instead' reports. kind 1 press (x = 1 armed for the reins, 0 blocked by
+// a socket, 2 already held), 2 grab, 3 open start (x = grip), 4 re-closed before the release (x = ms open), 5 released (x = ms open),
+// 6 open while BOTH hands raised = the stop gesture (.dropstop 1 only), 7 rope (hand = held bits, bits 1 = want, x = native * 10 + mode). f / d / r = cm from the head (forward / down / right, horse frame).
+template<unsigned N> struct HandLog {
+    static constexpr unsigned size=N;
+    struct Row {std::atomic<std::uint64_t> ms{};std::array<std::atomic<float>,7> v{};};
+    std::array<Row,N> rows{};std::atomic<std::uint32_t> n{};
+    void push(std::uint64_t now,int kind,unsigned hand,float f,float d,float r,bool zone,unsigned ht,float x) noexcept {
+        const std::uint32_t i=n.fetch_add(1,std::memory_order_acq_rel);auto& w=rows[i%N];w.ms.store(now/1'000'000ull,std::memory_order_relaxed);
+        const float v[7]{float(kind),float(hand),f*100.f,d*100.f,r*100.f,float((zone?1u:0u)|((ht&3u)<<1)),x};
+        for(unsigned k=0;k<7;++k)w.v[k].store(v[k],std::memory_order_relaxed);}
+};
+inline HandLog<128> handLog{}; // presses / grabs / openings (event-only)
+inline HandLog<32> ropeLog{};  // kind 7: rope mode / held changes (VrBody ropeStep)
 // STEERING TRACE: 10 Hz while the brain is live, 64 rows
 // (6.4 s). v = gait, s, pullL, pullR, latL, latR (cm), out x, out y, A (1 brain, 2 player, 4 cleared for the player's edge), horse yaw rate
 // (deg/s, + = left, NaN = no fresh heading), head yaw relative to the horse (deg, + = looking left: do glances steer?).
@@ -331,13 +366,15 @@ class Brain {
     enum Rz : int {RzSettle=1,RzSpace=2,RzResume=3,RzHandoff=4,RzLetGo=5};
     struct Hand {bool held{},pressed{},posValid{},zeroPending{};std::uint64_t armUntil{},openNs{},badNs{},posNs{},settleUntil{},settleStartBy{},stillNs{};
         std::array<float,3> neutral{},pos{},settleRef{};float speed{};
-        float vy{};bool idleRel{};std::uint64_t outNs{},busyNs{},openHighNs{}; // |vertical speed| (m/s, 50 ms), let go by .relidle, socket timer
+        float vy{};bool idleRel{};std::uint64_t outNs{},busyNs{},openHighNs{}; // |vertical speed| (m/s, 50 ms), let go by .relidle
     };
     std::array<Hand,2> h_{};
     float headYaw_{},grabYaw_{};bool grabYawValid_{};
     float prevYaw_{},prevHeadYaw_{};bool frameValid_{};          // frame step detector
     std::uint64_t space_{},epoch_{},continuity_{},layoutNs_{},relTrueNs_{};
-    int gait_{};bool manual_{},spot_{};Out last_{};int lastMode_{};
+    std::uint64_t strokeUntil_{};float lastRaw_{},lastDv_{}; // STROKE HOLD
+    int gait_{};bool manual_{},spot_{};Out last_{};int lastMode_{};bool coach_{}; // coach_: this update drives a coach (In::coach)
+    std::uint64_t coachUserNs_{}; // COACH: the last update with the player's own pad A or stick (their pace change: the gait follows it)
     // snap detector: mean height (y) and mean back coordinate (b, along -horse forward) of the held hands per controller sample
     struct S {std::uint64_t t{};float y{},b{};};
     std::array<S,128> ring_{};unsigned ringN_{},ringAt_{};
@@ -384,6 +421,8 @@ class Brain {
             if(get(name)){const float x=float(std::atof(v));if(std::isfinite(x)&&(x>0||(zero&&x==0)))return std::clamp(x*scale,zero?0.f:lo,hi);}return def;};
         auto on=[&](const char* name){return !(get(name)&&v[0]=='0');};
         killed.store(!on("debug.rdrvr.vr.reins"),std::memory_order_relaxed);
+        ::rdrvr::vr::coach::killed.store(!on("debug.rdrvr.vr.reins.coach"),std::memory_order_relaxed);
+        ::rdrvr::vr::coach::linear.store(on("debug.rdrvr.vr.reins.coachlin"),std::memory_order_relaxed);
         t_.walk=num("debug.rdrvr.vr.reins.walk",d.walk,.01f,.15f,.80f);
         t_.flick=num("debug.rdrvr.vr.reins.flick",d.flick,.01f,.03f,.30f);
         t_.snapSpeed=num("debug.rdrvr.vr.reins.snapspeed",d.snapSpeed,.01f,.15f,3.f);
@@ -392,7 +431,7 @@ class Brain {
         t_.relSteer=on("debug.rdrvr.vr.reins.relsteer");t_.letGo=on("debug.rdrvr.vr.reins.letgo");t_.relInvalid=get("debug.rdrvr.vr.reins.relinvalid")&&v[0]=='1';t_.symStop=on("debug.rdrvr.vr.reins.symstop");t_.stopDirect=on("debug.rdrvr.vr.reins.stopdirect");t_.holdStop=on("debug.rdrvr.vr.reins.holdstop");t_.relHighNs=std::uint64_t(num("debug.rdrvr.vr.reins.relhighms",float(d.relHighNs/ms),1.f,0.f,3000.f,true))*ms;t_.brakeBack=get("debug.rdrvr.vr.reins.brakeback")&&v[0]=='1';
         t_.brakePullNs=std::uint64_t(num("debug.rdrvr.vr.reins.brakepullms",float(d.brakePullNs/ms),1.f,0.f,3000.f,true))*ms;t_.hardStop=on("debug.rdrvr.vr.reins.hardstop");
         t_.hardStopNs=std::uint64_t(num("debug.rdrvr.vr.reins.hardstopms",float(d.hardStopNs/ms),1.f,50.f,5000.f))*ms;
-        t_.brakeBackNs=std::uint64_t(num("debug.rdrvr.vr.reins.brakebackms",float(d.brakeBackNs/ms),1.f,50.f,3000.f))*ms;t_.dropStop=on("debug.rdrvr.vr.reins.dropstop");
+        t_.brakeBackNs=std::uint64_t(num("debug.rdrvr.vr.reins.brakebackms",float(d.brakeBackNs/ms),1.f,50.f,3000.f))*ms;t_.dropStop=get("debug.rdrvr.vr.reins.dropstop")?v[0]!='0':d.dropStop;
         t_.stopUp=num("debug.rdrvr.vr.reins.stopup",d.stopUp,.01f,.05f,1.f);t_.stopMin=num("debug.rdrvr.vr.reins.stopmin",d.stopMin,.01f,0.f,1.f,true);
         t_.stopHoldNs=std::uint64_t(num("debug.rdrvr.vr.reins.stopms",float(d.stopHoldNs/ms),1.f,100.f,3000.f))*ms;t_.stopPull=num("debug.rdrvr.vr.reins.stoppull",d.stopPull,.01f,-1.f,.5f,true);
         t_.stopFastNs=std::uint64_t(num("debug.rdrvr.vr.reins.stopfastms",float(d.stopFastNs/ms),1.f,50.f,3000.f))*ms;t_.symCm=num("debug.rdrvr.vr.reins.symcm",d.symCm,.01f,.03f,.50f);t_.level=num("debug.rdrvr.vr.reins.level",d.level,.01f,0.f,.40f,true);
@@ -400,6 +439,7 @@ class Brain {
         t_.whipDown=num("debug.rdrvr.vr.reins.whipdown",d.whipDown,.01f,.02f,.40f);t_.whipSpeed=num("debug.rdrvr.vr.reins.whipspeed",d.whipSpeed,.01f,.1f,3.f);
         t_.whipNs=std::uint64_t(num("debug.rdrvr.vr.reins.whipms",float(d.whipNs/ms),1.f,150.f,2000.f))*ms;
         t_.steer=num("debug.rdrvr.vr.reins.steer",::rdrvr::vr::settings().rideTurnMeters(),.01f,.03f,.40f); // HORSE > TURN PULL
+        t_.coachSteer=num("debug.rdrvr.vr.reins.coachsteer",::rdrvr::vr::settings().coachTurnMeters(),.01f,.03f,.60f); // HORSE > COACH TURN
         t_.dead=std::fmin(t_.dead,.6f*t_.steer); // the dead zone stays below the lock
         // levers
         t_.holdA=get("debug.rdrvr.vr.reins.hold_a")?std::clamp(std::atoi(v),0,2):d.holdA;
@@ -415,7 +455,10 @@ class Brain {
         t_.brakeUp=num("debug.rdrvr.vr.reins.brakeup",d.brakeUp,.01f,.02f,.40f); // a stop = the lift (or back AND up)
         t_.brakeUp25=num("debug.rdrvr.vr.reins.brakeup",d.brakeUp25,.01f,.02f,.40f); // .lift 0 = the back + up rule (8 cm unless set)
         // levers (header)
-        t_.relOpen=on("debug.rdrvr.vr.reins.relopen");t_.relIdle=on("debug.rdrvr.vr.reins.relidle");t_.onePull=on("debug.rdrvr.vr.reins.onepull");
+        t_.relOpen=on("debug.rdrvr.vr.reins.relopen");t_.relIdle=on("debug.rdrvr.vr.reins.relidle");t_.onePull=get("debug.rdrvr.vr.reins.onepull")?v[0]!='0':d.onePull;
+        t_.strokeHold=on("debug.rdrvr.vr.reins.strokehold");t_.strokeV=num("debug.rdrvr.vr.reins.strokev",d.strokeV,.01f,.2f,5.f);
+        t_.strokeHoldNs=std::uint64_t(num("debug.rdrvr.vr.reins.strokems",float(d.strokeHoldNs/ms),1.f,0.f,2000.f,true))*ms;
+        t_.highPullOne=get("debug.rdrvr.vr.reins.highpull1")?v[0]!='0':d.highPullOne;
         t_.lift=on("debug.rdrvr.vr.reins.lift");t_.lowSnap=on("debug.rdrvr.vr.reins.lowsnap");
         t_.pushTurn=on("debug.rdrvr.vr.reins.pushturn"); // default 1 = the signed law (0 = only a pull turns)
         t_.liftFull=on("debug.rdrvr.vr.reins.liftfull");t_.relFreeze=on("debug.rdrvr.vr.reins.relfreeze");t_.spotLift=on("debug.rdrvr.vr.reins.spotlift");
@@ -427,7 +470,7 @@ class Brain {
         t_.relOut=num("debug.rdrvr.vr.reins.relout",d.relOut,.01f,0.f,.60f,true);
         t_.relOutNs=std::uint64_t(num("debug.rdrvr.vr.reins.reloutms",float(d.relOutNs/ms),1.f,0.f,1000.f,true))*ms;
         t_.relGrip=num("debug.rdrvr.vr.reins.relgrip",d.relGrip,.01f,.05f,.50f);
-        t_.relNs=std::uint64_t(num("debug.rdrvr.vr.reins.relms",float(d.relNs/ms),1.f,0.f,2000.f,true))*ms;
+        t_.relNs=std::uint64_t(num("debug.rdrvr.vr.reins.relms",float(d.relNs/ms),1.f,0.f,2000.f,true))*ms;t_.coachRelNs=std::uint64_t(num("debug.rdrvr.vr.reins.coachrelms",float(d.coachRelNs/ms),1.f,0.f,2000.f,true))*ms;
         t_.liftOne=num("debug.rdrvr.vr.reins.liftone",d.liftOne,.01f,.05f,.50f);
         t_.liftNs=std::uint64_t(num("debug.rdrvr.vr.reins.liftms",float(d.liftNs/ms),1.f,0.f,2000.f,true))*ms;
         t_.alike=num("debug.rdrvr.vr.reins.alike",d.alike,.01f,0.f,.40f,true);
@@ -479,7 +522,8 @@ class Brain {
         // sideways (the right arm reaching forward-right) would read as 'the left rein drawn' and beat the side term
         return (std::fmax(pull[1],0.f)-std::fmax(pull[0],0.f))+t_.lat2*side;}
     float relGrip() const noexcept {return t_.relOpen?t_.relGrip:.30f;}
-    std::uint64_t relNs() const noexcept {return t_.relOpen?t_.relNs:100*ms;}
+    // COACH: an opened rein hand lets go in .coachrelms (350 ms): open hand -> the reins drop -> the next squeeze is the weapon
+    std::uint64_t relNs() const noexcept {return t_.relOpen?(coach_?t_.coachRelNs:t_.relNs):100*ms;}
     // .onepull: the one-hand steer (m, + = right) of hand i at pull p, the signed law s = +pullR / -pullL
     // (.pushturn default 1 - a rein hand pushed forward turns the other way, so a rider with a gun in one hand still turns both ways, and
     // the snap / slow re-zero keeps any one-hand displacement beyond the dead zone: a forward-arcing stroke leaves no lasting turn);
@@ -504,7 +548,7 @@ class Brain {
     // the brain's A is down) A 120 ms, up 70 ms, then A held; 2: (up 70 ms if down) then A held - the press is the spur; 0: (up 70 ms if
     // down) A 120 ms, then up. From the first spur at CANTER+ on, A stays held (aHold_) until the gait drops below CANTER ----
     void requestSpur(std::uint64_t now,bool userA,int mode) noexcept {
-        if(!t_.spur||mode==ModeNone){bump(stats.spurOff);return;}
+        if(!t_.spur||mode==ModeNone||mode==ModeCoach){bump(stats.spurOff);return;} // a coach: the snap is a Whip tap (GameXr)
         if(t_.holdA>0)aHold_=true;               // the pace the rider reached is kept (stock: keep A held)
         if(userA){bump(stats.spurUserA);return;} // the player's own A passes untouched (their release resumes the hold, aStep)
         if(aPh_==AGap){bump(stats.spurs);events.push(now,EvSpur,float(gait_),float(t_.holdA));return;} // a fresh edge already on its way
@@ -522,14 +566,17 @@ class Brain {
     }
     void captureAt(std::uint64_t now,int kind) noexcept {if(!capPendNs_){capPendNs_=now+1'000*ms;capPendAt_=now/ms;capPendKind_=kind;}}
     void release(unsigned i,Ev why,std::uint64_t now,bool idle=false) noexcept {
-        auto& h=h_[i];if(!h.held)return;h.held=false;h.openNs=h.badNs=h.outNs=0;h.settleUntil=h.stillNs=0;h.zeroPending=false;bump(stats.releases);
+        auto& h=h_[i];if(!h.held)return;
+        if(why==EvRelOpen)handLog.push(now,5,i,0.f,0.f,0.f,false,0u,h.openNs&&now>=h.openNs?float(double(now-h.openNs)*1e-6):-1.f);
+        h.held=false;h.openNs=h.badNs=h.outNs=0;h.settleUntil=h.stillNs=0;h.zeroPending=false;bump(stats.releases);
         bump(why==EvRelOpen?stats.relOpen:why==EvRelSocket?stats.relSocket:why==EvRelInvalid?stats.relInvalid:why==EvRelBusy?stats.relBusy:stats.relReset);
         if(why!=EvRelOpen&&why!=EvRelSocket){bump(stats.forcedReleases);if(h.pressed)h.armUntil=~0ull;} // a still-squeezed hand re-grabs at once
         events.push(now,why,float(i),idle?1.f:0.f);if(why!=EvRelReset)captureAt(now,1);
         // .dropstop: the hand opened while the held hands were raised (the last update's mean height) = HALT now, not the loose GALLOP
-        if(why==EvRelOpen&&t_.dropStop&&gait_>0){const unsigned o=i^1u;const float m=h_[o].held?.5f*(upPrev_[0]+upPrev_[1]):upPrev_[i];
+        // (every held hand raised: min, not the mean - one raised hand letting go is a reach for a gun, no stop)
+        if(why==EvRelOpen&&t_.dropStop&&gait_>0){const unsigned o=i^1u;const float m=h_[o].held?std::fmin(upPrev_[0],upPrev_[1]):upPrev_[i];
             if(m>=t_.stopUp){if(t_.brakeBack)brakeBackUntil_=now+t_.brakeBackNs;
-                if(t_.hardStop&&gait_>=2)hardStopUntil.store(now+t_.hardStopNs,std::memory_order_relaxed);gait_=0;stopped_=true;aPh_=AIdle;aHold_=false;looseSince_=0;slowing_=false;bump(stats.dropStops);bump(stats.halts);
+                if(t_.hardStop&&gait_>=2&&!coach_)hardStopUntil.store(now+t_.hardStopNs,std::memory_order_relaxed);gait_=0;stopped_=true;aPh_=AIdle;aHold_=false;looseSince_=0;slowing_=false;bump(stats.dropStops);bump(stats.halts);
                 events.push(now,EvHalt,1.f,m*100.f);}}
     }
     // at a holster socket (holsterTarget bit 0) a held rein lets go at the holsters' own open
@@ -653,6 +700,7 @@ public:
         bump(stats.updates);if((propTick_++&255u)==0)readProps();
         const std::uint64_t now=in.now;stats.nowNs.store(now,std::memory_order_relaxed);
         const bool uRise=in.userA&&!prevUserA_,uFall=!in.userA&&prevUserA_;prevUserA_=in.userA; // the player's own A edges
+        coach_=in.coach;
         if(!enabled()||in.menu){ // off / a menu: everything resets at once
             if(lastActive_){resetAll(now,heldBits()||gait_>0);lastActive_=0;}
             clearMasks();publish({},ModeNone);return {};
@@ -732,11 +780,14 @@ public:
                 if(h.held&&h.zeroPending){h.neutral=h.pos;h.zeroPending=false;}
                 if(h.speed<.03f){if(!h.stillNs)h.stillNs=now;}else h.stillNs=0;
                 const auto rel=sub(in.pos[i],in.head);f=dot(rel,zf);r=dot(rel,zr);d=-rel[1];
-                inZone=!in.busy[i]&&f>=.15f&&f<=1.6f&&d>=-.10f&&d<=1.2f&&std::fabs(r)<=.7f; // in front of the body, up to the horse's head
+                // in front of the body, up to the horse's head; close to the body only near the middle (|r| <= 20 cm from 8 cm ahead): both
+                // hands at the horn put the left one 10 cm ahead / 14-16 cm left, where the lasso socket took it; hip draws come from the side
+                inZone=!in.busy[i]&&(f>=.15f||(f>=.08f&&std::fabs(r)<=.20f))&&f<=1.6f&&d>=-.10f&&d<=1.2f&&std::fabs(r)<=.7f;
                 if(inZone&&(ht&2u)){inZone=false;if(rise)bump(stats.holsterBlocked);} // the barrel / a transfer: the holsters' press
             }else if(h.held&&!h.badNs)h.badNs=now;
             // a squeeze just before the zone still grabs (300 ms) - never one that began in a socket outside the zone (a hip draw)
             if(rise){if((ht&1u)&&!inZone){h.armUntil=0;bump(stats.armBlocked);}else h.armUntil=now+300*ms;}else if(!h.pressed)h.armUntil=0;
+            if(rise)handLog.push(now,1,i,f,d,r,inZone,ht,h.held?2.f:h.armUntil?1.f:0.f);
             if(rise){stats.pressRel[i][0].store(f,std::memory_order_relaxed);stats.pressRel[i][1].store(d,std::memory_order_relaxed);
                 stats.pressRel[i][2].store(r,std::memory_order_relaxed);stats.pressInZone[i].store(inZone,std::memory_order_relaxed);if(!inZone)bump(stats.pressOutside);}
             if(inZone)zone|=1u<<i;
@@ -749,28 +800,36 @@ public:
                 if(h.busyNs&&now-h.busyNs>=300*ms){h.busyNs=0;release(i,EvRelBusy,now);}
                 // the grip is a button, not a pose: an opened hand lets go with an invalid pose too (hands raised out of the tracking)
                 else if(!in.valid[i]){ // the last valid pose decides 'raised' (both raised out of the tracking -> let go)
-                    if(h.pos[1]-h.neutral[1]>=.20f)h.openNs=0;
+                    if(t_.dropStop&&h.pos[1]-h.neutral[1]>=.20f&&h_[i^1u].held&&h_[i^1u].pos[1]-h_[i^1u].neutral[1]>=.20f)h.openNs=0;
                     else if(g<relGrip()){if(!h.openNs)h.openNs=now;if(now-h.openNs>=relNs())release(i,EvRelOpen,now);}else h.openNs=0;
                     if(h.held&&t_.relInvalid&&now-h.badNs>300*ms)release(i,EvRelInvalid,now);}
                 else{bool gone=false; // .relopen; + the socket rule (.relout)
+                    {
                     // the grip relaxes while the arms go up: a hand raised >= 20 cm over its neutral lets go
                     // only after .relhighms (800 ms) open; lowered it lets go after .relms
                     // a RAISED hand (>= 20 cm over its neutral) never lets go by an open grip - the stop gesture opens the fingers; it lets go
                     // once it is lowered (the open timer restarts there)
                     // a hand drawn back >= 10 cm counts as
                     // in the stop / turn gesture too - no open-grip release there either
-                    const bool high=in.pos[i][1]-h.neutral[1]>=.20f||-dot(sub(in.pos[i],h.neutral),zf)>=.10f;
-                    // ... and a raised hand held open .25 s IS the stop: HALT + the hard stop, the reins stay in the hand
+                    // only BOTH hands raised is the stop gesture (horse and coach) - one raised / drawn-back open hand is a reach for a gun:
+                    // it lets go in .relms and the horse keeps its pace (shooting on the move)
+                    // .dropstop (default 0 since riders grab low and ride higher: dropping one rein halted the horse): an open hand is a release
+                    const bool high=t_.dropStop&&h_[i^1u].held&&in.pos[i][1]-h.neutral[1]>=.20f&&h_[i^1u].pos[1]-h_[i^1u].neutral[1]>=.20f;
+                    // ... and a raised hand held open .25 s IS the stop: HALT + the hard stop; still open .relms later it lets go
                     if(high){h.openNs=0;
-                        if(g<relGrip()){if(!h.openHighNs)h.openHighNs=now;
+                        if(g<relGrip()){if(!h.openHighNs){h.openHighNs=now;handLog.push(now,6,i,f,d,r,inZone,ht,g);}
                             if(t_.dropStop&&gait_>0&&now-h.openHighNs>=250*ms){const bool fast=gait_>=2;gait_=0;stopped_=true;aPh_=AIdle;aHold_=false;looseSince_=0;
-                                slowing_=false;if(t_.hardStop&&fast)hardStopUntil.store(now+t_.hardStopNs,std::memory_order_relaxed);
-                                if(fast&&t_.brakePullNs)brakePullUntil.store(now+t_.brakePullNs,std::memory_order_relaxed);
+                                slowing_=false;if(t_.hardStop&&fast&&!coach_)hardStopUntil.store(now+t_.hardStopNs,std::memory_order_relaxed);
+                                if(fast&&t_.brakePullNs&&!coach_)brakePullUntil.store(now+t_.brakePullNs,std::memory_order_relaxed);
                                 lastStopNs_=now;bump(stats.dropStops);bump(stats.halts);events.push(now,EvHalt,2.f,(in.pos[i][1]-h.neutral[1])*100.f);
-                                hap(now,heldBits(),.6f,60'000);}}
+                                hap(now,heldBits(),.6f,60'000);}
+                            // ... and the hands still open .relms after that stop: they let go (the stop stays; a rider who grabbed low and
+                            // rides with the hands higher reads as 'both raised' - their open hands never dropped the reins)
+                            if(now-h.openHighNs>=250*ms+relNs()){release(i,EvRelOpen,now);gone=true;}}
                         else h.openHighNs=0;}
-                    else if(g<relGrip()){if(!h.openNs)h.openNs=now;if(now-h.openNs>=relNs()){release(i,EvRelOpen,now);gone=true;}}else h.openNs=0;
-                    if(!gone&&socketOpen(h,g,(ht&1u)!=0u,now))release(i,EvRelSocket,now);}
+                    else if(g<relGrip()){if(!h.openNs){h.openNs=now;handLog.push(now,3,i,f,d,r,inZone,ht,g);}if(now-h.openNs>=relNs()){release(i,EvRelOpen,now);gone=true;}}
+                    else{if(h.openNs)handLog.push(now,4,i,f,d,r,inZone,ht,float(double(now-h.openNs)*1e-6));h.openNs=0;}
+                    if(!gone&&socketOpen(h,g,(ht&1u)!=0u,now))release(i,EvRelSocket,now);}}
             }
             if(!h.held&&h.pressed&&g>=.55f&&inZone&&now<=h.armUntil){
                 const bool first=!h_[0].held&&!h_[1].held;
@@ -787,12 +846,13 @@ public:
                     const float oPull=-dot(sub(o.pos,o.neutral),zf),st=oneSteer(i^1u,oPull),sg=(i^1u)==1u?1.f:-1.f,
                         keep=t_.common&&std::fabs(st)>=t_.dead?sg*st:0.f; // the pull that steered (never a forward push)
                     o.neutral[1]=o.pos[1];zeroKeepPull(o,zf,keep);bump(stats.rezeros);noteRezeroSteer(st,sg*keep);}
+                // the second grab: both hands start STRAIGHT - a kept one-hand side offset steered on (a coach pulled left after the
+                // right hand took its rein again while the left one sat 25-30 cm left)
                 else if(!first&&h_[i^1u].posValid){auto& o=h_[i^1u];
-                    const auto od=sub(o.pos,o.neutral);const float oPull=-dot(od,zf),oLat=dot(od,zr);
-                    const bool inwardZeroed=t_.inward&&oPull>std::fabs(oLat)&&((i^1u)==0u?oLat>0.f:oLat<0.f);
-                    const float keep=t_.common&&t_.lat2>0.f&&!inwardZeroed?oLat:0.f;
+                    const auto od=sub(o.pos,o.neutral);const float oLat=dot(od,zr);
+                    const float keep=0.f;
                     o.neutral[1]=o.pos[1];zeroKeepSide(o,zr,keep);bump(stats.rezeros);noteRezeroSteer(oLat,keep);} // one-hand terms
-                events.push(now,EvGrab,float(i),f*100.f);hap(now,1u<<i,.5f,30'000,haptics::SourceGrab);
+                events.push(now,EvGrab,float(i),f*100.f);handLog.push(now,2,i,f,d,r,inZone,ht,g);hap(now,1u<<i,.5f,30'000,haptics::SourceGrab);
             }
         }
         for(unsigned i=0;i<2;++i)if(h_[i].held)zone|=1u<<i; // a held hand keeps its grip masked even if it left the zone
@@ -845,7 +905,8 @@ public:
         if(relAct&&relNs)relTrueNs_=relNs;
         const bool relKept=!relAct&&t_.relKeep&&relTrueNs_&&relNs==relTrueNs_;
         int mode=ModeNone;
-        if((relAct||relKept)&&stampFresh(relNs,now,500*ms)){mode=ModeHorseRel;if(relKept)bump(stats.relKept);}
+        if(coach_)mode=ModeCoach;
+        else if((relAct||relKept)&&stampFresh(relNs,now,500*ms)){mode=ModeHorseRel;if(relKept)bump(stats.relKept);}
         else if(t_.camRel&&stampFresh(horseMinusCamNs.load(std::memory_order_relaxed),now,500*ms))mode=ModeCamRel;
         // ---- slow / stop: both back >= .brake 250 ms (one hand: back + raised 6 cm) -> TROT+ to WALK, WALK to HALT, every 600 ms.
         // never armed at HALT (there is nothing to slow) or by a hand
@@ -866,7 +927,7 @@ public:
         if(t_.lift&&held==2&&std::fmax(up[0],up[1])>=t_.brakeUp){if(std::fmin(up[0],up[1])<t_.brakeUp)bump(stats.stopLow);
             else if(!levelOk)bump(stats.stopLevel);else if(!symOk)bump(stats.stopSym);}
         if(t_.lift)pose=held==2?std::fmin(up[0],up[1])>=t_.brakeUp&&levelOk&&symOk:
-            held==1&&up[one]>=t_.liftOne;
+            false; // ONE HAND: no lift stop (header b)
         else pose=held==2?std::fmin(pull[0],pull[1])>=t_.brake&&std::fmin(up[0],up[1])>=t_.brakeUp25:held==1&&pull[one]>=t_.brake&&up[one]>=t_.brakeUp25;
         // the stop is a HELD lift. A go-snap's wind-up passes through the same pose (tops 46 cm over the rest, 0.5-1 s
         // apart) but never rests there: the pose arms only once it lasted .liftms (300 ms) AND
@@ -906,9 +967,10 @@ public:
             if(cond&&!slowing_){slowing_=true;bump(stats.brakes);}
             slowNext_=now+t_.slowStepNs;aPh_=AIdle;aHold_=false; // a slow step lets A go (the stock hold ends: the pace drops)
             const int from=gait_;gait_=t_.lift&&t_.stopDirect&&cond?0:t_.slowFast&&gait_>=2?1:gait_-1;if(!gait_)lastStopNs_=now;
-            if(gait_==0&&from>=2&&t_.brakeBack)brakeBackUntil_=now+t_.brakeBackNs; // .brakeback
-            if(gait_==0&&from>=2&&t_.hardStop)hardStopUntil.store(now+t_.hardStopNs,std::memory_order_relaxed); // the game's hard brake
-            if(gait_==0&&from>=2&&t_.brakePullNs)brakePullUntil.store(now+t_.brakePullNs,std::memory_order_relaxed); // the pad brake
+            // the horse's brakes only (a coach stops by its nav state: GameXr taps MOVE_Y back)
+            if(gait_==0&&from>=2&&t_.brakeBack&&!coach_)brakeBackUntil_=now+t_.brakeBackNs; // .brakeback
+            if(gait_==0&&from>=2&&t_.hardStop&&!coach_)hardStopUntil.store(now+t_.hardStopNs,std::memory_order_relaxed); // the game's hard brake
+            if(gait_==0&&from>=2&&t_.brakePullNs&&!coach_)brakePullUntil.store(now+t_.brakePullNs,std::memory_order_relaxed); // the pad brake
             bump(stats.slowSteps);
             lowRef_=stepTs_=ts;stopped_=true;rejLiftN_=0; // the window in the stroke clock (sample time)
             events.push(now,EvSlow,float(from*10+gait_),!cond?0.f:(t_.lift?(held==2?std::fmin(up[0],up[1]):up[one]):held==2?std::fmin(pull[0],pull[1]):pull[one])*100.f);
@@ -934,6 +996,11 @@ public:
         // (neck-reining) would read 0 or even LEFT otherwise (the left hand crossing toward the chest comes back more than the right one); a
         // one-rein pull back and a rotation of both hands to the right (right hand back, left hand forward, both right) all agree ----
         float raw=0.f,dv=0.f;
+        // STROKE HOLD (header b): one held hand in a fast stroke keeps the steer it had
+        // a STROKE is vertical: |vy| >= .strokev and the vertical part >= ~70% of the speed (a fast side move of the rein hand is a turn,
+        // 1 m/s in a recorded ride: the old total-speed rule zeroed it)
+        if(t_.strokeHold&&held==1&&h_[one].vy>=t_.strokeV&&2.f*h_[one].vy*h_[one].vy>=h_[one].speed*h_[one].speed)strokeUntil_=now+t_.strokeHoldNs;
+        const bool strokeHeld=t_.strokeHold&&held==1&&now<strokeUntil_&&!slowBlock&&!settling;
         if(held&&!slowBlock&&!settling){
             // .onepull: one held hand = its own pull, + right / - left
             // .relsteer: the side term is the hands' SPREAD (R - L sideways over the grab) signed by the side that moved (the midpoint shift) - both
@@ -945,7 +1012,7 @@ public:
             if(held==1&&!t_.onePull&&t_.inward&&pull[one]>std::fabs(dv)&&(one==0u?dv>0.f:dv<0.f)){dv=0.f;bump(stats.inwardFrames);}
             const float dz=t_.dead,lo=std::fmax(dz-.005f,.003f),ad=std::fabs(dv);
             if(!engaged_&&ad>=dz)engaged_=true;else if(engaged_&&ad<lo)engaged_=false;
-            if(engaged_)raw=std::copysign(std::clamp((ad-lo)/std::fmax(t_.steer-lo,.01f),0.f,1.f),dv);
+            if(engaged_)raw=std::copysign(std::clamp((ad-lo)/std::fmax((coach_?t_.coachSteer:t_.steer)-lo,.01f),0.f,1.f),dv);
             // .letgo: a turn eased back to <= 60% of its peak (peak >= 3 cm)
             // with the held hands calm (< 8 cm/s) for 250 ms re-zeroes the hands where they are - the horse keeps the heading it has, no
             // leftover offset pulls it round. A turn HELD at its peak keeps turning.
@@ -960,6 +1027,9 @@ public:
                         events.push(now,EvRezero,float(RzLetGo),letPeak_*100.f);bump(stats.rezeros);letPeak_=letAvg_=0.f;letCalmNs_=0;raw=0.f;engaged_=false;}}
                 else letCalmNs_=0;}
         }else{engaged_=false;letCalmNs_=0;}
+        if(strokeHeld){const auto cap=[](float was,float now){return was*now>0.f?std::copysign(std::fmin(std::fabs(was),std::fabs(now)),now):0.f;};
+            raw=cap(lastRaw_,raw);dv=cap(lastDv_,dv);bump(stats.strokeHoldFrames);}
+        if(!strokeHeld){lastRaw_=raw;lastDv_=dv;}
         if(!held)letPeak_=letAvg_=0.f;
         steerS_+=(raw-steerS_)*(t_.smooth>.001f?1.f-std::exp(-dt/t_.smooth):1.f);if(!held)steerS_=0.f; // loose reins: steer 0
         const float s=std::fabs(steerS_)<.01f?0.f:steerS_;
@@ -988,7 +1058,7 @@ public:
         // ---- manual Touch stick: gait 0, no output until the next snap ----
         const bool userStick=std::hypot(in.userX,in.userY)>.3f;
         if(userStick){bump(stats.userOverride);
-            if(t_.manual){if(!manual_){manual_=true;events.push(now,EvManual,float(gait_),0.f);}gait_=0;aPh_=AIdle;aHold_=false;spot_=false;spotArmNs_=0;
+            if(t_.manual){if(!manual_){manual_=true;events.push(now,EvManual,float(gait_),0.f);}gait_=coach_&&in.coachGait>=0?in.coachGait:0;aPh_=AIdle;aHold_=false;spot_=false;spotArmNs_=0;
                 stopped_=pendHalt_=false;}}
         // ---- snap: each new controller sample once, mean height (+ back coordinate) of the held hands ----
         if(held&&in.sequence&&in.sequence!=lastSeq_){
@@ -1073,16 +1143,22 @@ public:
                 }
             }
         }
+        // ---- COACH: no rein held (or the player's own stick / A) = the gait is the coach's own nav state (the next snap / lift starts there) ----
+        // the player's own A (Whip) / stick and 400 ms after it: the nav state they set reaches the riding sample a few frames late
+        if(coach_&&(in.userA||userStick))coachUserNs_=now;
+        const bool coachUser=coach_&&coachUserNs_&&now>=coachUserNs_&&now-coachUserNs_<400*ms;
+        if(coach_&&in.coachGait>=0&&(!held||manual_||userStick||coachUser)){if(gait_!=in.coachGait)bump(stats.coachFollows);gait_=in.coachGait;}
         // ---- loose reins: the gait holds .loose (3 s), then WALK, after 2x HALT ----
-        if(!held&&gait_>0&&looseSince_&&t_.looseNs&&now>=looseSince_){const auto age=now-looseSince_;
+        if(!coach_&&!held&&gait_>0&&looseSince_&&t_.looseNs&&now>=looseSince_){const auto age=now-looseSince_;
             if(age>=2*t_.looseNs){gait_=0;bump(stats.looseDrops);events.push(now,EvLoose,0.f,float(age/ms));}
             else if(age>=t_.looseNs&&gait_>1){gait_=1;bump(stats.looseDrops);events.push(now,EvLoose,1.f,float(age/ms));}}
         // ---- output ----
         Out out{};
         const bool braking=brakeBackUntil_&&now<brakeBackUntil_&&gait_==0;if(!braking)brakeBackUntil_=0;
-        if((held||gait_>0||braking)&&!manual_&&!userStick){
+        if((coach_?held>0:(held||gait_>0||braking))&&!manual_&&!userStick){
             float vx=0,vy=0;
-            if(gait_==0){ // HALT: (0,0), or the standing turn (yaw 90 deg > the sim's 75 deg on-spot threshold)
+            if(coach_){vx=std::clamp(s*t_.gain,-1.f,1.f);vy=0.f;spot_=false;spotArmNs_=0;} // MOVE_X = the steer; the pace = taps (GameXr)
+            else if(gait_==0){ // HALT: (0,0), or the standing turn (yaw 90 deg > the sim's 75 deg on-spot threshold)
                 // (seen: 12 standing turns alternating +.57 / -.59 / +.55 / -.56 after a HALT - the rider settling the
                 // reins spins the horse back and forth): only after |s| > .spotin (0.45) held for .spotms (200 ms); exit < .35
                 const float as=std::fabs(s);
@@ -1109,7 +1185,8 @@ public:
             }
             vy=std::fmax(vy,0.f); // never back (= a turn-around)
             if(braking&&mode==ModeHorseRel){vx=0.f;vy=-1.f;bump(stats.brakeBackFrames);} // the reins pulled - only horse-relative (back = back)
-            if(mode==ModeHorseRel){out.stick=true;out.x=vx;out.y=vy;bump(stats.horseRelFrames);}
+            if(mode==ModeCoach){out.stick=true;out.x=vx;out.y=0.f;bump(stats.coachFrames);}
+            else if(mode==ModeHorseRel){out.stick=true;out.x=vx;out.y=vy;bump(stats.horseRelFrames);}
             else if(mode==ModeCamRel){ // game stick heading h = atan2(-x, y) (left +); the game adds the control-vector heading
                 const float m=std::hypot(vx,vy),hh=std::atan2(-vx,vy)+horseMinusCam.load(std::memory_order_relaxed);
                 float rx=-std::sin(hh)*m,ry=std::cos(hh)*m;const float k=std::fmax(1.f,std::fmax(std::fabs(rx),std::fabs(ry)));rx/=k;ry/=k; // |v| up to
@@ -1118,7 +1195,7 @@ public:
             if(s!=0.f)bump(stats.steerFrames);
         }else{spot_=false;spotArmNs_=0;}
         { // BRAKE PULL: the pad brake (camera-relative while GameXr holds +0x638 = 0), raw (0, -1); a spin ends it
-            bool pulling=brakePullActive(now)&&gait_==0&&held&&!manual_&&!userStick;
+            bool pulling=!coach_&&brakePullActive(now)&&gait_==0&&held&&!manual_&&!userStick;
             if(pulling&&std::fabs(stats.rateDegS.load(std::memory_order_relaxed))>90.f){brakePullUntil.store(0,std::memory_order_relaxed);pulling=false;bump(brakePullSpinEnds);}
             if(pulling){bump(brakePullFrames);out.stick=true;out.x=0.f;out.y=-1.f;}}
         // ---- A: held from the first CANTER+ spur while a rein is held and the brain drives the stick; the player's A merges ----
@@ -1183,7 +1260,7 @@ inline std::string report() {
     out+=b;
     static constexpr const char* frames[3]{"HEAD","GRAB","HORSE"};
     std::snprintf(b,sizeof b,"\"gait\":\"%s\",\"manual\":%s,\"slowing\":%s,\"latCm\":[%.1f,%.1f],\"frame\":\"%s\",\"lastPeakMps\":%.2f,"
-        "\"out\":{\"mode\":\"%s\",\"stick\":%s,\"x\":%.3f,\"y\":%.3f,\"a\":%s},\"modeFrames\":{\"horseRel\":%llu,\"camRel\":%llu,\"none\":%llu},"
+        "\"out\":{\"mode\":\"%s\",\"stick\":%s,\"x\":%.3f,\"y\":%.3f,\"a\":%s},\"modeFrames\":{\"horseRel\":%llu,\"camRel\":%llu,\"none\":%llu,\"coach\":%llu,\"coachFollows\":%llu},"
         "\"horseRel\":{\"active\":%s,\"ageMs\":%lld},\"horseMinusCamDeg\":%.1f,\"horseMinusCamAgeMs\":%lld,\"horseMinusHeadAgeMs\":%lld,"
         "\"snaps\":{\"accepted\":%llu,\"rejected\":{\"weak\":%llu,\"shallow\":%llu,\"noUp\":%llu,\"refractory\":%llu,\"slowing\":%llu,\"yank\":%llu}},"
         "\"slowSteps\":%llu,\"halts\":%llu,\"spurTaps\":%llu,\"spurSkipped\":{\"userA\":%llu,\"off\":%llu},\"standingTurns\":%llu,"
@@ -1191,7 +1268,7 @@ inline std::string report() {
         gaitName(stats.level.load()),stats.manual.load()?"true":"false",stats.slowing.load()?"true":"false",f(stats.latL)*100.0,f(stats.latR)*100.0,
         frames[std::clamp(stats.frameSrc.load(),0,2)],f(stats.lastPeak),
         modeName(stats.mode.load()),stats.outStick.load()?"true":"false",f(stats.outX),f(stats.outY),stats.outA.load()?"true":"false",
-        u(stats.horseRelFrames),u(stats.rotated),u(stats.noneFrames),horseRelActive.load()?"true":"false",age(horseRelNs),
+        u(stats.horseRelFrames),u(stats.rotated),u(stats.noneFrames),u(stats.coachFrames),u(stats.coachFollows),horseRelActive.load()?"true":"false",age(horseRelNs),
         double(horseMinusCam.load())*57.29578,age(horseMinusCamNs),age(horseMinusHeadNs),
         u(stats.flicks),u(stats.rejectedSlow),u(stats.rejShallow),u(stats.rejNoUp),u(stats.rejRefractory),u(stats.rejSlowing),u(stats.rejYank),
         u(stats.slowSteps),u(stats.halts),u(stats.spurs),u(stats.spurUserA),u(stats.spurOff),u(stats.standingTurns),
@@ -1238,10 +1315,12 @@ inline std::string report() {
     const auto ht0=holsterTargets[0].load(std::memory_order_relaxed),ht1=holsterTargets[1].load(std::memory_order_relaxed);
     std::snprintf(b,sizeof b,"\"rezero\":{\"settle\":%llu,\"space\":%llu,\"resume\":%llu,\"handoff\":%llu},\"settling\":%s,\"frameSteps\":%llu,"
         "\"stillLeakFrames\":%llu,\"inwardFrames\":%llu,\"dismountResets\":%llu,\"suspendFrames\":%llu,\"relKept\":%llu,"
+        "\"oneHand\":{\"pull\":%d,\"strokeHoldFrames\":%llu},"
         "\"stopReject\":{\"low\":%llu,\"level\":%llu,\"sym\":%llu,\"arms\":%llu,\"windups\":%llu,\"holdStops\":%llu,\"fastStops\":%llu,\"dropStops\":%llu,\"brakeBackFrames\":%llu,\"brakePullFrames\":%llu,\"brakePullSpinEnds\":%llu,\"hardStopCalls\":%llu,\"hardStopNoHorse\":%llu,\"hardStopBitSeen\":%llu,\"simAd8\":%u,\"simAdc\":%u,\"horseGuid\":%u,\"playerGuid\":%u,\"sim\":%s,\"softDecel\":%.2f,\"hardDecel\":%.2f,\"hardUsed\":%.2f,\"tuneBoosts\":%llu,\"tuneBad\":%llu,\"decayDelay\":%.2f,\"decayTimerSeen\":%.2f,\"decayTimerZeroed\":%llu},\"holster\":{\"blocked\":%llu,\"armBlocked\":%llu,\"target\":[%u,%u],\"first\":%s,\"maskHeld\":%s},"
         "\"haptics\":{\"posted\":%llu,\"dropped\":%llu},\"nowMs\":%llu,\"events\":[",
         u(stats.settleRezeros),u(stats.spaceRezeros),u(stats.resumeRezeros),u(stats.handoffRezeros),stats.settling.load()?"true":"false",u(stats.frameSteps),
         u(stats.stillLeakFrames),u(stats.inwardFrames),u(stats.dismountResets),u(stats.suspendFrames),u(stats.relKept),
+        (stats.cfgBits.load(std::memory_order_relaxed)&4u)?1:0,u(stats.strokeHoldFrames),
         u(stats.stopLow),u(stats.stopLevel),u(stats.stopSym),u(stats.liftArms),u(stats.liftWindups),u(stats.holdStops),u(stats.fastStops),u(stats.dropStops),u(stats.brakeBackFrames),u(brakePullFrames),u(brakePullSpinEnds),u(hardStopCalls),u(hardStopNoHorse),u(hardStopBitSeen),unsigned(hsSimAd8.load()),unsigned(hsSimAdc.load()),unsigned(hsHorseGuid.load()),
         unsigned(hsPlayerGuid.load()),hsSim.load()?"true":"false",hsSoftDecel.load(),hsHardDecel.load(),hsHardUsed.load(),u(hsTuneBoosts),u(hsTuneBad),hsDecayDelay.load(),hsDecayTimerSeen.load(),u(hsDecayTimerZeroed),
         u(stats.holsterBlocked),u(stats.armBlocked),unsigned(ht0&3ull),unsigned(ht1&3ull),holsterFirst.load()?"true":"false",maskHeld.load()?"true":"false",
@@ -1256,6 +1335,14 @@ inline std::string report() {
         out+=b;
     }
     out+="]";
+    { // hand log (oldest first): [ms mod 1e8, kind, hand, f, d, r (cm), bits (1 zone, 2 socket, 4 holster target), x]
+        out+=",\"handLog\":{\"cols\":\"t,kind(1 press 2 grab 3 open 4 reclosed 5 released 6 bothRaisedStop 7 rope),hand(7: held bits),fCm,dCm,rCm,bits(1 zone 2 socket 4 target; 7: want),x(7: native*10+mode)\",\"rows\":[";
+        const auto rowsOf=[&](const auto& lg){const std::uint32_t hn=lg.n.load(std::memory_order_acquire),N=lg.size;
+            for(std::uint32_t i=hn>N?hn-N:0u,first=i;i<hn;++i){const auto& w=lg.rows[i%N];float v[7];for(unsigned k=0;k<7;++k)v[k]=w.v[k].load(std::memory_order_relaxed);
+                std::snprintf(b,sizeof b,"%s[%llu,%.0f,%.0f,%.1f,%.1f,%.1f,%.0f,%.2f]",i==first?"":",",(unsigned long long)(w.ms.load(std::memory_order_relaxed)%100000000ull),
+                    double(v[0]),double(v[1]),double(v[2]),double(v[3]),double(v[4]),double(v[5]),double(std::isfinite(v[6])?v[6]:0.f));out+=b;}};
+        rowsOf(handLog);out+="],\"rope\":[";rowsOf(ropeLog);out+="]}";
+    }
     // steering trace (10 Hz, oldest first)
     out+=",\"trace\":{\"cols\":\"t,gait,s,pullL,pullR,latL,latR,x,y,A(1 brain 2 user 4 cleared),rateDegS(+left),headRelDeg(+left),upL,upR,gripL,gripR,held\",\"rows\":[";
     const std::uint32_t tn=traceN.load(std::memory_order_acquire);

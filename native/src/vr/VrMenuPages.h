@@ -117,9 +117,11 @@ inline unsigned firstVisibleRow(unsigned selected,unsigned rows) noexcept {
 inline constexpr std::array<Key,18> movementKeys{Key::Locomotion,Key::MoveSpeed,Key::TurnMode,Key::TeleportFade,Key::TeleportRange,Key::Roomscale,Key::Camera,
     Key::Cutscenes,Key::CutsceneShadows,Key::CutsceneProps,Key::CutsceneLights,Key::CutsceneSun,Key::EyeHeight,Key::BodyUp,Key::BodyBack,Key::BumpReactions,Key::Stumble,Key::AutoCover}; // HORSE CAM UP / FWD -> HORSE
 // HORSE page
-inline constexpr std::array<Key,5> horseKeys{Key::RideView,Key::RideTurn,Key::RideShake,Key::RideUp,Key::RideFwd};
+inline constexpr std::array<Key,7> horseKeys{Key::RideView,Key::RideTurn,Key::CoachTurn,Key::RideShake,Key::RideUp,Key::RideFwd,Key::HorseTailFix};
 inline constexpr const char* horseTurnFooter="HOW FAR A HAND MOVES FOR A FULL TURN";
-inline constexpr const char* horseShakeFooter="ON: THE HORSE AND BODY BOUNCE AS IN THE GAME";
+inline constexpr const char* coachTurnFooter="COACH / WAGON: HOW FAR A HAND MOVES FOR A FULL TURN";
+inline constexpr const char* horseTailFooter="DOUBLE HORSE TAIL? TRY ON - SIMULATES NEAR TAILS";
+inline constexpr const char* horseShakeFooter="ON: HORSE BODY AND COACH SEAT BOUNCE AS IN THE GAME";
 // THROWING page (VrThrowable.h)
 inline constexpr std::array<Key,8> throwKeys{Key::ThrowMode,Key::ThrowPower,Key::ThrowAimSpeed,Key::ThrowGravity,Key::ThrowAssist,Key::ThrowSwing,
     Key::ThrowArc,Key::ThrowSpin};
@@ -132,9 +134,11 @@ inline constexpr const char* horseViewFooter="THIRD PERSON: THE VIEW BEHIND AND 
 // tp: MOVEMENT footer while LOCOMOTION is effectively TELEPORT and the cursor is on LOCOMOTION / TELEPORT FADE /
 // TELEPORT RANGE (44 glyphs; the save-state text SAVE FAILED always wins). The roomscale tip waits for the device confirmation (STATUS).
 inline constexpr const char* teleportFooter="L STICK FWD: AIM  RELEASE: GO  HOLD L3: WALK";
-inline constexpr std::array<Key,23> handsKeys{Key::Body,Key::Hands,Key::Holsters,Key::WeaponGrip,Key::HolsterMarkers,Key::TwoHandAim,
+inline constexpr std::array<Key,24> handsKeys{Key::Body,Key::Hands,Key::Holsters,Key::WeaponGrip,Key::HolsterMarkers,Key::TwoHandAim,
     Key::TwoHandFire,Key::DualWield,Key::ThrowWeapon,Key::GunSpin,Key::ReloadMode,Key::ShellEject,Key::CylinderClose,Key::Chambers,Key::Hammer,Key::FanSpread,Key::LassoThrow,Key::LassoAssist,Key::Laser,
-    Key::Melee,Key::MeleeSpeed,Key::MeleeFists,Key::FistBlock}; // 23 + WEAPON PRESET = one more than menuBodyRows, the page scrolls (VrPage::text); DEAD EYE rows -> HUD page
+    Key::Melee,Key::MeleeSpeed,Key::MeleeFists,Key::FistBlock,Key::HandPhysics}; // 24 + WEAPON PRESET = two more than menuBodyRows, the page scrolls (VrPage::text); DEAD EYE rows -> HUD page
+inline constexpr std::array<const char*,3> handPhysicsFooters{"THE HANDS PASS THROUGH THE WORLD","NO EFFECT  PHYSICS COST IN THE REPORT",
+    "EMPTY HANDS STOP AT WALLS  PUSH DOORS AND PROPS"};
 // SHELL EJECT: what the selected value does (panel glyphs, <= 52 columns)
 inline constexpr const char* shellAutoFooter="DOUBLE BARREL: OPENING THROWS THE SPENT SHELLS";
 inline constexpr const char* shellShakeOutFooter="DOUBLE BARREL: MUZZLE UP OR SHAKE TO DROP SHELLS";
@@ -283,6 +287,7 @@ struct VrPage {
                 store.requested().hammerStyle()?hammerRealisticFooter:hammerCasualFooter;return;}
         if(store.persistenceOk()&&page==PageHands&&sel==Key::Chambers&&!keyKilled(Key::Chambers)&&store.requested().realisticChambers()){
             out+=chambersRealisticFooter;return;}
+        if(store.persistenceOk()&&page==PageHands&&sel==Key::HandPhysics&&!keyKilled(Key::HandPhysics)){out+=handPhysicsFooters[store.requested().handPhysicsMode()];return;}
         if(store.persistenceOk()&&page==PageHands&&sel==Key::ShellEject&&!keyKilled(Key::ShellEject)){out+=store.requested().shellShakeOut()?shellShakeOutFooter:shellAutoFooter;return;}
         if(store.persistenceOk()&&page==PageHud&&(sel==Key::PerfRecord||sel==perfMarkRow)){out+=sel==perfMarkRow?perfMarkFooter:perfRecordFooter;return;}
         if(store.persistenceOk()&&page==PageHud&&sel==Key::GameMessages){out+=gameMessagesFooter;return;}
@@ -293,7 +298,7 @@ struct VrPage {
         if(store.persistenceOk()&&page==PageHud&&!keyKilled(Key::Hud)&&store.effective().hudMode()){
             out+=store.effective().hudMode()==2?hudHandFooter:hudHeadFooter;return;}
         if(store.persistenceOk()&&page==PageHorse){
-            if(sel==Key::RideTurn){out+=horseTurnFooter;return;}if(sel==Key::RideShake){out+=horseShakeFooter;return;}
+            if(sel==Key::RideTurn){out+=horseTurnFooter;return;}if(sel==Key::CoachTurn){out+=coachTurnFooter;return;}if(sel==Key::HorseTailFix){out+=horseTailFooter;return;}if(sel==Key::RideShake){out+=horseShakeFooter;return;}
             if(sel==Key::RideView){out+=horseViewFooter;return;}}
         if(store.persistenceOk()&&page==PageThrowing&&selected<throwFooters.size()){out+=throwFooters[selected];return;}
         out+=store.persistenceOk()?"SAVED  ":"SAVE FAILED - SESSION ONLY  ";
@@ -628,13 +633,16 @@ struct HelpPage {
 
 // ---- BUTTONS page: which Touch button does each action, on foot and on a horse ----
 struct ButtonsPage {
-    static constexpr unsigned reinsRow=controlmap::LayoutCount*controlmap::buttonCount,resetRow=reinsRow+1,rows=resetRow+1; // + REINS GESTURES
+    static constexpr unsigned reinsRow=controlmap::LayoutCount*controlmap::buttonCount,coachRow=reinsRow+1,gunDeadEyeRow=coachRow+1,resetRow=gunDeadEyeRow+1,
+        rows=resetRow+1; // + REINS GESTURES, COACH REINS, GUN DEAD EYE
     static constexpr std::array<const char*,controlmap::LayoutCount*controlmap::buttonCount> labels{
         "JUMP","RELOAD/INTERACT","WHISTLE / HOLD: SATCHEL","USE / MOUNT","SPRINT","CROUCH / GUN: DEAD EYE",
         "HORSE SPUR","HORSE JUMP","HORSE X / HOLD: SATCHEL","HORSE DISMOUNT","HORSE L3","HORSE DEAD EYE"};
     static void input(unsigned row,int adjust,bool activate) noexcept {
         if(row==resetRow){if(activate)controlmap::resetDefaults();return;}
         if(row==reinsRow){if(adjust||activate)controlmap::toggleReins();return;}
+        if(row==coachRow){if(adjust||activate)controlmap::toggleCoachReins();return;}
+        if(row==gunDeadEyeRow){if(adjust||activate)controlmap::toggleGunDeadEye();return;}
         if(adjust)controlmap::step(row,adjust);else if(activate)controlmap::step(row,1);
     }
     static void text(std::string& out,unsigned selected) {
@@ -643,9 +651,11 @@ struct ButtonsPage {
             if(r==controlmap::buttonCount)out+="  ON A HORSE\n";else if(r==0)out+="  ON FOOT\n";
             appendRow(out,r==selected,labels[r],controlmap::buttonNames[m.physical[l][b]],pageInks[PageButtons]);}
         appendRow(out,selected==reinsRow,"REINS GESTURES",reins::menuOn.load(std::memory_order_relaxed)?"ON":"OFF",pageInks[PageButtons]);
+        appendRow(out,selected==coachRow,"COACH REINS",coach::menuOn.load(std::memory_order_relaxed)?"ON":"OFF",pageInks[PageButtons]);
+        appendRow(out,selected==gunDeadEyeRow,"GUN DEAD EYE",controlmap::gunDeadEye.load(std::memory_order_relaxed)?"ON":"OFF",pageInks[PageButtons]);
         appendRow(out,selected==resetRow,"RESET DEFAULTS","PRESS A",pageInks[PageButtons]);
         for(unsigned r=rows+2;r<menuBodyRows;++r)out+='\n';
-        out+=selected==reinsRow?"GRIP REINS  SNAP: GO  PULL: TURN  BOTH: STOP":"TRIGGERS / A: CHANGE  TAKEN BUTTONS SWAP";
+        out+=selected==reinsRow?"GRIP REINS  SNAP: GO  PULL: TURN  BOTH: STOP":selected==coachRow?"DRIVER SEAT  SNAP: FASTER  PULL: TURN  LIFT: STOP":selected==gunDeadEyeRow?"OFF: BUTTON ALWAYS CROUCHES  DEAD EYE: LT + BUTTON":"TRIGGERS / A: CHANGE  TAKEN BUTTONS SWAP";
     }
 };
 

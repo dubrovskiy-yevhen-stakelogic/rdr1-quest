@@ -1,5 +1,101 @@
 # Changelog
 
+## 0.3.0
+
+### Physical interaction
+
+- Hand physics, ON by default (row HANDS > HAND PHYSICS): your empty hands
+  are physical objects in the world. The feature is experimental; if it
+  causes problems, turn it off with HANDS > HAND PHYSICS > OFF (the welcome
+  panel says the same). MEASURE only records the cost in the report.
+- Walls and furniture: your hands stop at them instead of passing through.
+- Doors: push a door with your palm from either side and it moves with your
+  hand and stops when your hand stops. Walking through a door with your body
+  still opens it.
+- Glass: punch a window with a bare hand to break it. The hand bleeds (the
+  game's own wound on John's hand).
+- Small props: cups, bottles and similar items are knocked over by your
+  hands. Pick a light prop up with one hand; it stays in the palm until you
+  open the hand, and you can throw it. A thrown cup does no damage.
+- Chairs and heavy props: lift them with both hands, carry them while
+  walking, hit people with them or throw them. A chair hit counts as an
+  attack. A heavy prop stays in your hands until you open them, also while
+  walking or swinging.
+- Pushing people: an open hand pushes people. A light push makes them step
+  back, a firm push makes them stagger, a hard push with one or both hands
+  knocks them down along the push, also people who normally only stagger.
+  Pushes never hurt anyone or make them hostile.
+- Walking up to someone with your hands down no longer pushes them.
+
+### Weapons and controls
+
+- The game's weapon wheel no longer opens. Weapons are chosen with the
+  holsters.
+- People react when you aim a gun at them.
+- The stock auto-aim no longer turns John or the camera when you take a
+  weapon or throwable.
+- A gun stays in your hand after Dead Eye and after a duel while you keep
+  holding it.
+- The gun fires on the first trigger press after a close-kill scene.
+- New row BUTTONS > GUN DEAD EYE (ON by default). OFF: R3 always crouches on
+  foot and Dead Eye is left trigger + R3.
+- Left trigger + R3 with empty hands crouches instead of turning the camera
+  around.
+- Dead Eye keeps the support hand on the barrel.
+- Steep overhand knife and tomahawk throws are thrown instead of put away.
+- Guns can be used from a stagecoach-type seat.
+- The REALISTIC weapon preset no longer turns TWO HAND FIRE on. The row stays
+  in the HANDS menu.
+
+### Body, horse and coach
+
+- Ride with one hand: move the rein hand to the side to turn, snaps with one
+  hand do not steer. The other hand is free for a gun.
+- Open the hand to drop the reins: half open is enough, the reins fall in
+  about 0.35 s and the horse keeps its pace, so you can shoot on the move.
+  An open hand never stops the horse; to stop, lift both hands with closed
+  fists.
+- Lifting one rein hand no longer stops the horse.
+- A squeeze close to the body in the middle takes the reins instead of the
+  lasso or a holster. Draw from the side as before.
+- Taking the second rein again starts straight.
+- The rein rope stays in your hand when the game lets go of it, for example
+  while you reach for the gun on your back.
+- Sitting in a coach no longer puts the reins in John's hand: take them
+  yourself. All reins of the coach rest until you grab them.
+- New row HORSE > COACH TURN: how far a hand moves for a full coach turn
+  (12 to 45 cm, 28 by default). TURN PULL stays for the horse.
+- Coach steering no longer sticks after a turn, and the reins drop as fast
+  as on a horse.
+- A snap at the top coach speed cracks the whip.
+- The coach no longer doubles at speed with SpaceWarp, and the view follows
+  the seat height instead of sinking into the coach.
+- John stays upright under the view on the coach seat: the driving and whip
+  animations no longer lean him into the camera, and his head no longer
+  pops into view.
+- New row BUTTONS > COACH REINS: drive a coach with the reins in your hands.
+  Snap them to go faster, pull one hand to turn, lift both to stop.
+- A steadier coach seat; HORSE SHAKE also brings back the seat bounce.
+- John's head is shown when the view is away from it, for example when you
+  are knocked down, so you no longer see a headless body.
+- The arms keep following the controllers when a mission locks movement.
+- Close-kill scenes hold the stereo view instead of flashing to the flat
+  screen.
+
+### HUD
+
+- The player arrow on the minimap points where you look, relative to the
+  map. The map itself still turns as in the game.
+
+### Graphics
+
+- New row HORSE > HORSE TAIL FIX (OFF by default): if a horse shows a second,
+  frozen tail, switch it ON. Tails and manes of horses within 40 m are then
+  simulated even when the game's own camera does not see them.
+- Object glows and the beam on flagged items stay visible with SMALL
+  OBJECTS on.
+- SpaceWarp: people falling over no longer smear.
+
 ## 0.2.0
 
 ### Weapons and reload

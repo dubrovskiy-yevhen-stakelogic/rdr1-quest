@@ -187,6 +187,60 @@ int main(){
         TB::config.aim=TB::AimMode::Off;Rig o;o.frame(0.f,1.f);now+=3'000'000'000ull;const auto s1=seq();o.run(1.f,1.f,150);o.run(0.f,1.f,300);
         CHECK(seq()==s1+1,"FORCE AIM off: a dynamite tap stays the quick throw");TB::config.aim=TB::AimMode::Trigger;now+=4'000'000'000ull;
     }
+    { // 20 THROWN forward exception (lever downfwd): a steep forward knife throw past the down rule still throws; put-aways stay DOWN
+        Rig g;g.kind=7;g.frame(0.f,1.f);now+=3'000'000'000ull;
+        const float d2r=3.14159265f/180.f;
+        const auto est=[&](float deg,float mps,float yawSideDeg=0.f){rdrvr::vr::throwing::ReleaseEstimator::Estimate e{};e.valid=true;e.speedPeak=mps;e.speedRelease=mps*.8f;
+            const float h=mps*std::cos(deg*d2r);e.v={h*std::sin(yawSideDeg*d2r),-mps*std::sin(deg*d2r),-h*std::cos(yawSideDeg*d2r)};return e;};
+        const auto fwdOf=[](const rdrvr::vr::throwing::ReleaseEstimator::Estimate& e){return -e.v[2];}; // head yaw forward = -z
+        auto& K=TB::perKind[0];const auto r0=K.downRescued.load(),d0=K.down.load();const auto n0=TB::swingNext.load();
+        auto e=est(50.f,5.f);int r=g.b.physical(1,g.in,e,false,false,false,7,now,fwdOf(e));
+        CHECK(r==1&&K.downRescued.load()==r0+1,"knife 50 deg down at 5 m/s, forward 3.2 m/s = a throw (DOWN_FWD)");
+        {TB::SwingRec x{};TB::swingRing[n0%TB::swingRing.size()].load(x);
+         CHECK(x.verdict==TB::SwDownFwd&&std::fabs(x.down-std::sin(50.f*d2r))<.01f&&std::fabs(x.fwd-3.21f)<.02f&&x.kind==7,"ring: DOWN_FWD, down share, fwd");}
+        TB::launchedNs.store(now);TB::launchedSeq.store(TB::requestSeq.load());now+=3'000'000'000ull;
+        e=est(75.f,8.f);r=g.b.physical(1,g.in,e,false,false,false,7,now,fwdOf(e));CHECK(r==0&&K.down.load()==d0+1,"75 deg down at 8 m/s = DOWN (above the 70 deg cap)");
+        e.v={0.f,-3.f,2.f};r=g.b.physical(1,g.in,e,false,false,false,7,now,-2.f);CHECK(r==0&&K.down.load()==d0+2,"toward the chest = DOWN");
+        e=est(50.f,5.f,70.f);r=g.b.physical(1,g.in,e,false,false,false,7,now,fwdOf(e));CHECK(r==0&&K.down.load()==d0+3,"50 deg down to the side (forward < MIN SWING) = DOWN");
+        e=est(50.f,5.f);r=g.b.physical(1,g.in,e,false,false,false,7,now);CHECK(r==0&&K.down.load()==d0+4,"no head forward (NaN) = DOWN");
+        {auto& KX=TB::perKind[1];const auto dx=KX.down.load();Rig x;x.frame(0.f,1.f);e=est(50.f,5.f);
+         r=x.b.physical(1,x.in,e,false,false,false,8,now,fwdOf(e));CHECK(r==0&&KX.down.load()==dx+1,"dynamite 50 deg down forward = DOWN (exploding unchanged)");}
+        TB::config.downFwd=false;e=est(50.f,5.f);r=g.b.physical(1,g.in,e,false,false,false,7,now,fwdOf(e));
+        CHECK(r==0&&K.down.load()==d0+5&&K.downRescued.load()==r0+1,"lever downfwd 0 = the old down rule");TB::config.downFwd=true;
+        CHECK(TB::thrownDownRescue(7,true,.9f,2.5f,2.f,.94f)&&!TB::thrownDownRescue(8,true,.9f,2.5f,2.f,.94f)&&!TB::thrownDownRescue(7,true,.95f,9.f,2.f,.94f)&&
+              !TB::thrownDownRescue(7,true,.8f,1.9f,2.f,.94f),"thrownDownRescue truth table");
+        // the not-allowed exit, the ring wraps after 16, the histogram adds up
+        const auto na=TB::notAllowed.load();TB::noteNotAllowed(1,7,now);CHECK(TB::notAllowed.load()==na+1,"not-allowed counted");
+        {TB::SwingRec x{};TB::swingRing[(TB::swingNext.load()-1u)%TB::swingRing.size()].load(x);CHECK(x.verdict==TB::SwNotAllowed&&x.kind==7,"ring: NOT_ALLOWED");}
+        const auto rep=TB::report();CHECK(rep.find("\"swings\":{\"downFwd\":1")!=std::string::npos&&rep.find("DOWN_FWD")!=std::string::npos&&
+            rep.find("\"notAllowed\":")!=std::string::npos,"report: swings block, ring verdicts, notAllowed");
+        for(int i=0;i<17;++i){e=est(20.f,1.f);g.b.physical(1,g.in,e,false,false,false,7,now,fwdOf(e));}
+        unsigned filled=0;for(auto& b:TB::swingRing){TB::SwingRec x{};if(b.load(x)&&x.ns)++filled;}CHECK(filled==16,"ring keeps 16");
+        std::uint64_t hist=0;for(unsigned i=0;i<18;++i)hist+=TB::downHist[i].load();
+        CHECK(hist==TB::perKind[0].releases.load()+TB::perKind[0].down.load(),"thrown histogram = releases + down");
+        TB::launchedNs.store(now);TB::launchedSeq.store(TB::requestSeq.load());g.settle();
+    }
+    { // 21 tapeVelocityAt: the nearest entry with the linear bit of the asked space
+        namespace TW=rdrvr::vr::throwing;
+        const auto push=[](std::uint64_t ns,std::uint64_t space,std::uint32_t valid,float vx){TW::TapeEntry t{};t.ns=ns;t.poseNs=ns;t.space=space;t.valid=valid;t.v[1]={vx,0.f,0.f};
+            const auto h=TW::tapeHead.load();TW::tapeRing[h%TW::tapeSize].store(t);TW::tapeHead.store(h+1);};
+        push(100'000'000,5,0x2u|TW::tapeLinear(1),1.f);push(110'000'000,5,0x2u,2.f);push(120'000'000,6,0x2u|TW::tapeLinear(1),3.f);push(130'000'000,5,0x2u|TW::tapeLinear(1),4.f);
+        TW::V3 v{};CHECK(TW::tapeVelocityAt(1,5,112'000'000,v)&&v[0]==1.f,"nearest linear entry (110 ms has no linear bit, 120 ms is another space)");
+        CHECK(TW::tapeVelocityAt(1,5,127'000'000,v)&&v[0]==4.f,"nearest entry");
+        CHECK(!TW::tapeVelocityAt(1,7,127'000'000,v),"other space: none");CHECK(!TW::tapeVelocityAt(1,5,900'000'000,v),"over 60 ms: none");
+    }
+    { // 22 the estimator on a synthetic overhand arc at the AppSW tape rate (27.8 ms) and at 72 Hz: the verdict with the forward exception
+        namespace TW=rdrvr::vr::throwing;int verdict[2]{};float downs[2]{};
+        for(int k=0;k<2;++k){const double dtS=k?1.0/72.0:0.0277778;TW::ReleaseEstimator est{};const double R=.6;
+            for(int i=0;i<60;++i){const double t=i*dtS,a=-0.6+30.0*t*t; // the hand speeding up on a vertical circle ahead of the shoulder, forward then down
+                if(a>1.25)break;
+                const TW::V3 p{0.f,float(R*std::cos(a)),float(-R*std::sin(a))};est.add(std::uint64_t(t*1e9)+1'000'000'000ull,p,{0.f,0.f,0.f,1.f});}
+            const auto e=est.estimate(TW::config.windowNs,1.f,TW::config.releaseWindowNs);const float len=TW::math::length(e.v);downs[k]=len>0.f?-e.v[1]/len:0.f;
+            Rig g;g.kind=7;g.frame(0.f,1.f);now+=3'000'000'000ull;verdict[k]=g.b.physical(1,g.in,e,false,false,false,7,now,-e.v[2]);
+            TB::launchedNs.store(now);TB::launchedSeq.store(TB::requestSeq.load());now+=3'000'000'000ull;}
+        std::printf("     overhand arc: down share 36 Hz %.2f, 72 Hz %.2f; verdicts %d / %d\n",double(downs[0]),double(downs[1]),verdict[0],verdict[1]);
+        CHECK(verdict[0]==verdict[1]&&verdict[0]==1,"the forward exception gives the same verdict (a throw) at both tape rates");
+    }
     std::printf("%s (%d failures)\n",fails?"FAILED":"ALL OK",fails);
     return fails?1:0;
 }

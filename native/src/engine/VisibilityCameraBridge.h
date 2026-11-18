@@ -34,6 +34,8 @@ private:
     // LOCAL->world yaw (psi) of the last prepared head-anchored plan, for the main-thread camera rig
     // (roomscale request direction, headYawWorld). Tiny seqlock over atomics: one writer (begin, under mutex_).
     std::atomic<std::uint32_t> yawSequence_{};std::atomic<float> yaw_{};std::atomic<std::uint64_t> yawNs_{},yawOrigin_{};
+    // Radar heading of the rendered view: atan2(c.x,c.z) of the eyes' summed back axis (column 2 of plan.world), same seqlock.
+    std::atomic<float> arrow_{};std::atomic<std::uint64_t> arrowNs_{},arrowOrigin_{};
     void publishYaw(const StereoCameraPlan& plan,std::uint64_t ns) noexcept;
 public:
     explicit VisibilityCameraBridge(runtime::TrackedViewsMailbox& v):views_(v){}
@@ -50,5 +52,8 @@ public:
     // world = R_y(psi) * local for horizontal vectors. originSerial = TrackingOrigin::serial of that plan (0 = own latch).
     // False when none was prepared within maxAgeNs. Any thread, lock-free.
     bool worldYaw(std::uint64_t now,float& psi,std::uint64_t& originSerial,std::uint64_t maxAgeNs=250'000'000) const noexcept;
+    // theta = atan2(c.x,c.z) of the last head-anchored plan's view (c = the eyes' back axis), the game's radar heading convention
+    // (CRadar+0xd0). False when none within maxAgeNs or the view looked nearly straight up / down. Any thread, lock-free.
+    bool viewHeading(std::uint64_t now,float& theta,std::uint64_t& originSerial,std::uint64_t maxAgeNs=250'000'000) const noexcept;
 };
 } // namespace rdrvr::engine

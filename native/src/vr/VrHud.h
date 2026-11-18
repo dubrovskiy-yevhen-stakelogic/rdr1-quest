@@ -101,6 +101,15 @@ void noteClearAlphaFingerprint(bool) noexcept;
 bool takeClearAlpha() noexcept;                 // PIXBegin ClearAlpha: drop it for the pending HUD frame?
 void clearAlphaDone(std::uint64_t dropped) noexcept; // PIXEnd ClearAlpha: draws dropped (0 = not dropped -> the frame is cancelled)
 
+// ---- PLAYER ARROW (always on): TraceEntry hooks hudStreamingMap::CalcRotation's jump slot and, on CRadar::Update's call
+// only, rewrites the radar's player heading (CRadar+0xd0, copied to the centre blip's +0x60) with the headset's heading. The map's turn
+// (the returned angle) stays stock. Written by the hook (update thread) and its install, read by report() as vr.hud.playerArrow.
+// lastGame / lastHead = the stock heading and the written one (radians, atan2(c.x,c.z)); fallback = writes from body::headYaw;
+// centre = a sample every 256 radar calls of the centre blip's own-rotation byte (+8; 1 = the arrow takes +0x60, -1 = unread).
+struct PlayerArrowStats {std::atomic<bool> hooked{};std::atomic<const char*> why{"NOT INSTALLED"};
+    std::atomic<std::uint64_t> calls{},substituted{},stale{},fallback{};std::atomic<float> lastGame{},lastHead{};std::atomic<int> centre{-1};};
+inline PlayerArrowStats playerArrow;
+
 // ---- optional coverage alpha (debug.rdrvr.vr.hud.alpha 1): every HUD draw flush to the cleared target ----
 struct AlphaApi {
     bool (*boundFramebuffer)(std::uintptr_t& out) noexcept{}; // gfx+0x158 of the render thread's GfxContext

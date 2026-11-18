@@ -37,6 +37,7 @@
 #include "TaaHook.h"     // ARC: taa::recordedEyeKey (gpu.split bucket)
 #include "VrTeleportLink.h" // TELEPORT: pair identity (fade::notePair) for the blink's hold
 #include "VrSettings.h"
+#include "VrHandBlood.h" // BLOOD ON THE KNUCKLES: the tint per hand (hands.frag)
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -1483,12 +1484,15 @@ bool recordEye(const EyeCall& call) noexcept {
         if(f.visible[0]||f.visible[1]){
             vkCmdBindPipeline(c,VK_PIPELINE_BIND_POINT_GRAPHICS,slot->hands);
             for(unsigned h=0;h<2;++h){if(!f.visible[h])continue;
-                struct Push {float clip[16];float weights[4];float light[4];float params[4];} push{};
-                static_assert(sizeof(Push)==112);
+                struct Push {float clip[16];float weights[4];float light[4];float params[4];float blood[4];} push{};
+                static_assert(sizeof(Push)==pushBytes);
                 const auto cf=narrow(clip[h]);std::memcpy(push.clip,cf.data(),sizeof push.clip);
                 std::memcpy(push.weights,f.weights[h].data(),sizeof push.weights);
                 push.light[0]=f.light[h][0];push.light[1]=f.light[h][1];push.light[2]=f.light[h][2];push.light[3]=ambient;
                 push.params[0]=bright;push.params[1]=worldTest;push.params[2]=encode;push.params[3]=depthEpsilon;
+                {namespace HB=::rdrvr::vr::handblood;const float bt=HB::intensity(h); // BLOOD ON THE KNUCKLES
+                    push.blood[0]=HB::centre[0];push.blood[1]=HB::centre[1];push.blood[2]=HB::centre[2];push.blood[3]=bt;
+                    if(bt>0.f&&eye==0)HB::drawnFrames.fetch_add(1,std::memory_order_relaxed);}
                 vkCmdPushConstants(c,b.layout,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof push,&push);
                 vkCmdBindVertexBuffers(c,0,1,&b.mesh,&b.vertexOffset[h]);
                 vkCmdBindIndexBuffer(c,b.mesh,b.indexOffset[h],VK_INDEX_TYPE_UINT16);

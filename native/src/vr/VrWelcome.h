@@ -1,6 +1,7 @@
 #pragma once
 // WELCOME: a one-time-per-launch message on the menu panel at the player's first steps in the stereo world (never during a
-// cutscene / menu): mod version, early-stage warning, charger advice, the GPU boost state, where the controls are, the Discord link. The first press of
+// cutscene / menu): mod version, early-stage warning, the experimental hand physics and where to turn it off, charger advice, the GPU
+// boost state, where the controls are, the Discord link (23 lines with the orange boost block). The first press of
 // any button / trigger / grip closes it; that press never reaches the game (the input stays masked until everything is released).
 // XR thread only. debug.rdrvr.vr.welcome 0 = never show.
 // compose() re-reads GpuBoost::on() on every panel redraw (2 Hz)
@@ -40,15 +41,16 @@ inline void compose(char* out,std::size_t size) noexcept {
         "  THE MOD IS IN AN EARLY STAGE:\n"
         "  EXPECT BUGS AND PERFORMANCE ISSUES.\n"
         "\n"
+        "  NEW: EXPERIMENTAL HAND PHYSICS\n"
+        "  PROBLEMS? MENU > HANDS > HAND PHYSICS > OFF\n"
+        "\n"
         "  FOR THE BEST EXPERIENCE:\n"
         "  - PLAY WITH THE CHARGER CONNECTED\n"
         "%s"
         "\n"
         "  CONTROLS: HOLD THE LEFT MENU BUTTON > CONTROLS\n"
-        "\n"
         "  DISCORD:\n"
         "  \x02https://discord.gg/5pUVuZVQj\n"
-        "\n"
         "  PRESS ANY BUTTON TO CLOSE\n",::rdrvr::runtime::modVersion,block);
 }
 enum class State : std::uint8_t {Waiting,Shown,Closing,Done};
